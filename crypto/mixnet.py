@@ -29,6 +29,13 @@ import os
 from dataclasses import dataclass
 
 CELL_SIZE = 4096  # fixed onion cell size in bytes; all payloads padded/split to this
+SEAL_OVERHEAD = 48  # nacl.public.SealedBox ciphertext expansion: crypto_box_SEALBYTES
+                     # (32-byte ephemeral pubkey + 16-byte Poly1305 MAC)
+LEN_PREFIX = 4       # _pad's own length-prefix, added once per _pad call
+ADDR_FIELD = 32      # fixed-width hop-address field (hostnames padded/truncated to
+                     # this) -- a variable-length address would itself be a
+                     # size side-channel, defeating the point of fixed cells
+WRAP_OVERHEAD = SEAL_OVERHEAD + LEN_PREFIX + ADDR_FIELD  # bytes added per hop of wrapping
 
 
 def _require_nacl():
@@ -75,6 +82,22 @@ def _unpad(padded: bytes) -> bytes:
     return padded[4 : 4 + length]
 
 
+def _encode_addr(addr: str) -> bytes:
+    """Fixed-width ADDR_FIELD encoding so every hop's routing-info field
+    is the same size regardless of the actual hostname -- otherwise the
+    length of `addr` itself would leak through the layer size, which is
+    exactly what the fixed-CELL_SIZE design is trying to prevent.
+    """
+    raw = addr.encode()
+    if len(raw) > ADDR_FIELD:
+        raise ValueError(f"hop address {addr!r} ({len(raw)} bytes) exceeds ADDR_FIELD={ADDR_FIELD}")
+    return raw + b"\x00" * (ADDR_FIELD - len(raw))
+
+
+def _decode_addr(field: bytes) -> str:
+    return field.rstrip(b"\x00").decode()
+
+
 def build_onion(payload: bytes, hop_public_keys: list, hop_addresses: list[str]) -> bytes:
     """Layer encryption from the INNERMOST hop outward, so the client
     produces a single blob that peels off one layer per hop.
@@ -83,24 +106,59 @@ def build_onion(payload: bytes, hop_public_keys: list, hop_addresses: list[str])
     hop_public_keys[0] is the first hop (adjacent to the client).
     len(hop_public_keys) == len(hop_addresses) == 3 for the committed
     3-hop design, but the function is written generally.
+
+    Each wrap adds exactly WRAP_OVERHEAD bytes (a fixed-width address
+    field + SealedBox's ciphertext expansion + this _pad call's own
+    length-prefix), so the budget for the CLIENT's actual payload has
+    to be CELL_SIZE minus n_hops * WRAP_OVERHEAD, reserved up front --
+    not CELL_SIZE itself. Padding the payload to the full CELL_SIZE
+    before wrapping (the earlier, broken version of this function)
+    leaves no room for any of the hop wrapping and overflows on the
+    very first wrap. Sizes are chosen so the FINAL (outermost,
+    client-to-hop1) ciphertext lands at exactly CELL_SIZE; inner,
+    already-peeled layers are smaller by design -- real mix nodes
+    re-pad after peeling before forwarding (see peel_layer's docstring)
+    so the shrinkage never appears on the wire.
     """
     _require_nacl()
     import nacl.public
 
-    layer = _pad(payload)
+    n_hops = len(hop_public_keys)
+    capacity = CELL_SIZE - n_hops * WRAP_OVERHEAD
+    if len(payload) > capacity:
+        raise ValueError(
+            f"payload {len(payload)} bytes exceeds max {capacity} bytes "
+            f"for a {n_hops}-hop onion with CELL_SIZE={CELL_SIZE}"
+        )
+
+    layer = _pad(payload, size=capacity)
     # work from last hop to first: each outer layer wraps
-    # (next_hop_address, inner_ciphertext_so_far)
+    # (next_hop_address, inner_ciphertext_so_far). layer's size grows by
+    # exactly WRAP_OVERHEAD on each iteration, by construction, so it
+    # reaches exactly CELL_SIZE after the final (i=0) wrap.
     for i in range(len(hop_public_keys) - 1, -1, -1):
         next_addr = hop_addresses[i + 1] if i + 1 < len(hop_addresses) else "__SERVER__"
-        plaintext_for_this_hop = next_addr.encode() + b"||" + layer
+        plaintext_for_this_hop = _encode_addr(next_addr) + layer
+        pad_target = len(plaintext_for_this_hop) + LEN_PREFIX  # minimum -- no slack needed, size is already exact
         box = nacl.public.SealedBox(hop_public_keys[i])
-        layer = box.encrypt(_pad(plaintext_for_this_hop))
+        layer = box.encrypt(_pad(plaintext_for_this_hop, size=pad_target))
+    assert len(layer) == CELL_SIZE, f"internal sizing bug: outermost cell is {len(layer)}, expected {CELL_SIZE}"
     return layer
 
 
 def peel_layer(onion: bytes, my_keypair: MixKeypair) -> tuple[str, bytes]:
     """One mix node's operation: decrypt the outer layer meant for it,
     return (next_hop_address_or___SERVER__, remaining_onion_bytes).
+
+    NOTE: `remaining` is smaller than CELL_SIZE by this hop's own
+    WRAP_OVERHEAD -- in a real deployment the mix node re-pads it back
+    up to CELL_SIZE with fresh random bytes before forwarding, so an
+    observer on the next hop's link can't tell how many layers remain
+    from the cell size alone. That re-padding is a network-layer
+    concern (left to fl/'s network simulator, same as
+    simulate_batch_delay below); this function returns the real
+    (unpadded-back-up) bytes so the next peel_layer/final_payload call
+    in a test or simulation can consume them directly.
     """
     _require_nacl()
     import nacl.public
@@ -108,8 +166,8 @@ def peel_layer(onion: bytes, my_keypair: MixKeypair) -> tuple[str, bytes]:
     box = nacl.public.SealedBox(my_keypair.private_key)
     decrypted_padded = box.decrypt(onion)
     decrypted = _unpad(decrypted_padded)
-    next_addr_bytes, remaining = decrypted.split(b"||", 1)
-    return next_addr_bytes.decode(), remaining
+    addr_field, remaining = decrypted[:ADDR_FIELD], decrypted[ADDR_FIELD:]
+    return _decode_addr(addr_field), remaining
 
 
 def final_payload(onion: bytes) -> bytes:
