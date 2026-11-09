@@ -86,13 +86,38 @@ if not os.path.exists('/content/FL-ZKP'):
 # should just work. pynacl gives libsodium/ristretto255 bindings;
 # torch/torchvision/flwr_datasets are for the later CASE notebooks but
 # installed here too so one setup pass covers everything.
-!pip install -q pynacl
+#
+# --upgrade matters here: Colab's base image ships an OLD pynacl
+# (pre-1.4.0, no ristretto255 bindings at all). `pip install pynacl`
+# with no --upgrade is a no-op if any version is already present, so
+# without this flag the next cell fails with
+# "AttributeError: module 'nacl.bindings' has no attribute
+# 'crypto_core_ristretto255_BYTES'" -- not a code bug, just a stale
+# preinstalled package. (Unrelated pip dependency-conflict warnings
+# about gradio/bigframes/pillow/rich here are pre-existing Colab
+# package noise -- ignore them, they don't touch this repo.)
+!pip install -q --upgrade "pynacl>=1.5.0"
 !pip install -q flwr-datasets[vision]
 !pip install -q torch torchvision --index-url https://download.pytorch.org/whl/cu121
 """),
 
+("md", """**If this is the first time this cell has run in this session,
+upgrading pynacl from an older version requires a kernel restart
+before the new version will actually load** (Python caches the old
+module). Go to **Runtime -> Restart session** now, then re-run from
+this cell (not from the very top -- Drive stays mounted and the repo
+stays cloned across a session restart, only the Python process
+resets).
+"""),
+
 ("code", """import sys
 sys.path.insert(0, '/content/FL-ZKP')
+import nacl
+print("pynacl version:", nacl.__version__)
+assert tuple(int(x) for x in nacl.__version__.split('.')[:2]) >= (1, 4), (
+    f"pynacl {nacl.__version__} is too old (need >= 1.4.0 for ristretto255). "
+    "Restart the runtime (Runtime -> Restart session) and re-run from the pip install cell above."
+)
 import nacl.bindings
 print("pynacl OK:", nacl.bindings.crypto_core_ristretto255_BYTES)
 import torch
