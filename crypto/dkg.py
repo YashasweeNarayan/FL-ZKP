@@ -56,19 +56,27 @@ def verify_sub_share(share: ShamirShare, commitments: list[Point]) -> bool:
     return lhs == rhs
 
 
-def finalize(contributions: list[DkgContribution], member_ids: list[int]) -> tuple[Point, dict[int, int]]:
-    """Combine verified contributions into (PK_trace, {member_id: final_share_value}).
+def finalize(contributions: list[DkgContribution], member_ids: list[int]) -> tuple[Point, dict[int, ShamirShare]]:
+    """Combine verified contributions into (PK_trace, {member_id: final_share}).
     Caller must have already run verify_sub_share on every (contribution,
     sub_share) pair and discarded any contribution that failed.
+
+    Returns ShamirShare objects (not plain ints) so that a post-DKG
+    final share and a post-reshare share (see reshare.py's
+    reshare_verifiable, which already returns dict[int, ShamirShare])
+    are the SAME type and can both be handed to
+    elgamal_threshold.py's compute_partial without the caller having
+    to remember which pipeline produced which share.
     """
     pk_trace = contributions[0].feldman_commitments[0]
     for contrib in contributions[1:]:
         pk_trace = pk_trace + contrib.feldman_commitments[0]
 
-    final_shares = {j: 0 for j in member_ids}
+    raw_values = {j: 0 for j in member_ids}
     for contrib in contributions:
         for j in member_ids:
-            final_shares[j] = (final_shares[j] + contrib.sub_shares[j].value) % L
+            raw_values[j] = (raw_values[j] + contrib.sub_shares[j].value) % L
+    final_shares = {j: ShamirShare(index=j, value=raw_values[j]) for j in member_ids}
     return pk_trace, final_shares
 
 
