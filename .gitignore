@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.zip
+/content/
+mnist_data/
+femnist_cache/
+.DS_Store
