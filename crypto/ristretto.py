@@ -34,6 +34,10 @@ def _require_nacl():
         )
 
 
+_SCALAR_ZERO = b"\x00" * 32   # canonical mod-L encoding of 0 (Scalar.from_int(0) produces exactly this)
+_POINT_IDENTITY = b"\x00" * 32  # ristretto255's identity element always encodes as 32 zero bytes (spec property)
+
+
 @dataclass(frozen=True)
 class Scalar:
     """An element of Z_L, as raw libsodium scalar bytes."""
@@ -102,6 +106,14 @@ class Point:
         return Point(_b.crypto_core_ristretto255_sub(self.b, other.b))
 
     def scalar_mul(self, s: Scalar) -> "Point":
+        if s.b == _SCALAR_ZERO:
+            # 0*P = identity for any valid P, trivially. libsodium's
+            # crypto_scalarmult_ristretto255 explicitly REJECTS a zero
+            # scalar (rc=-1, "invalid input to a real curve operation")
+            # since the result is the group identity and the API guards
+            # against silently producing it -- no real curve operation
+            # is needed for this degenerate case, so short-circuit it.
+            return Point(_POINT_IDENTITY)
         return Point(_b.crypto_scalarmult_ristretto255(s.b, self.b))
 
     def is_valid(self) -> bool:
@@ -115,8 +127,20 @@ class Point:
 
 
 def scalar_mul_base(s: Scalar) -> Point:
-    """s*G — the common case of a public key from a secret scalar."""
+    """s*G — the common case of a public key from a secret scalar.
+
+    s=0 is special-cased to the identity point directly: libsodium's
+    crypto_scalarmult_ristretto255_base rejects a zero scalar outright
+    (rc=-1) rather than returning the identity, since silently producing
+    the identity is usually a sign something upstream went wrong in a
+    DH-style protocol. Here it's a legitimate input -- e.g.
+    pedersen.py's commit(0, r) for a bit=0 range-proof branch, or any
+    Pedersen commitment to the value 0 -- so we compute it directly
+    instead of letting libsodium reject it.
+    """
     _require_nacl()
+    if s.b == _SCALAR_ZERO:
+        return Point(_POINT_IDENTITY)
     return Point(_b.crypto_scalarmult_ristretto255_base(s.b))
 
 
