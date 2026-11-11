@@ -25,7 +25,9 @@ from crypto.secagg import derive_pairwise_secret_via_x25519
 from crypto.sketch import seed_commitment
 from verifier.audit import independent_v5_check
 
-from .client import ClientKeys, ClientRoundContext, round_step_phase1, round_step_phase2
+from crypto.sketch import SketchProjector
+
+from .client import ClientKeys, ClientRoundContext, round_step_phase1, round_step_phase2, quantize, center_mod_p_mask
 from .server import run_round, apply_update
 from .norm_rule import bootstrap_from_server_root, update_threshold_ema
 from .models import flatten_state_dict, unflatten_to_state_dict
@@ -60,6 +62,53 @@ def precompute_pairwise_secrets(x25519_sks: list, x25519_pks: list) -> dict:
             for j in range(n) if j != i
         }
     return out
+
+
+def bootstrap_norms_from_model_dim(
+    model_dim: int,
+    sketch_dim: int,
+    sketch_seed: bytes,
+    quant_bits: int = 16,
+    n_samples: int = 50,
+    delta_scale: float = 0.1,
+    rng: np.random.Generator = None,
+) -> np.ndarray:
+    """Round-0 B_t bootstrap, STAND-IN for ARCHITECTURE.md ROADMAP
+    §3.4's real design ("server computes norms on its OWN root-set
+    data") -- still a placeholder (no real root-set data exists
+    here), but one that is at least dimensionally and scale-
+    consistent with what real client sketches will actually produce,
+    unlike the previous `N(5.0, 0.5)` magic-constant placeholder.
+
+    That old placeholder caused a real, confusing failure caught live
+    on Colab: once the two actual V3 wiring bugs were fixed (server.py
+    checking the wrong commitment; client.py sketching the
+    mask/mod-wrapped vector instead of the centered signed delta),
+    every client STILL got rejected as "V3_norm_bound_exceeded" --
+    this time because the hardcoded root_norms (~5) were simply the
+    wrong order of magnitude for a quantized-and-sketched delta
+    (which, at quant_bits=16, lands in the thousands-to-hundreds-of-
+    thousands range even for small models), not because of a bug.
+
+    This function closes that gap by running the SAME quantize ->
+    center -> sketch pipeline fl/client.py's round_step_phase2 uses,
+    over `n_samples` synthetic deltas drawn at the "typical gradient
+    magnitude" scale `quantize()`'s own docstring cites (~1e-2 to 1,
+    `delta_scale` here), so the resulting norms are in the right
+    ballpark for `bootstrap_from_server_root` to derive a usable B_t
+    from -- still not real root-set data, so still flagged in
+    STATUS.md as a placeholder, just no longer a mis-scaled one.
+    """
+    rng = rng or np.random.default_rng()
+    sketch = SketchProjector(seed=sketch_seed, m=sketch_dim, d=model_dim)
+    norms = np.empty(n_samples)
+    for i in range(n_samples):
+        delta = rng.normal(0.0, delta_scale, size=model_dim)
+        q = quantize(delta, bits=quant_bits)
+        signed_q = center_mod_p_mask(q)
+        y = sketch.project(signed_q.astype(np.float64))
+        norms[i] = np.linalg.norm(y)
+    return norms
 
 
 def run_training_loop(
@@ -111,12 +160,19 @@ def run_training_loop(
     running several pseudo-client local-train + sketch passes over
     server-root subsamples BEFORE round 0 -- itself bounded by the same
     sketch performance wall above, so it is not done inside this
-    function. If the caller passes synthetic/placeholder norms instead
-    (as both notebooks currently do), that is a real, flagged
-    simplification affecting only round 0's starting B_t (every
-    subsequent round's B_t is the real EMA-updated value from real
-    accepted submissions' real sketch norms) -- not a fabricated result
-    for the round loop itself.
+    function. If the caller passes synthetic/placeholder norms instead,
+    that is a real, flagged simplification affecting only round 0's
+    starting B_t (every subsequent round's B_t is the real EMA-updated
+    value from real accepted submissions' real sketch norms) -- not a
+    fabricated result for the round loop itself. Use
+    `bootstrap_norms_from_model_dim` (above) rather than an arbitrary
+    constant for this: a placeholder that isn't dimensionally/scale-
+    consistent with the real quantize->sketch pipeline will size B_t
+    (and therefore `n_bits`) wrong for round 0 regardless of how
+    correct the rest of the wiring is -- this is exactly what caused
+    "V3_norm_bound_exceeded" for every client even after the two real
+    V3 bugs (wrong commitment in server.py; mask/mod-wrapped sketch
+    input in client.py) were fixed.
     """
     n_clients = len(client_datasets)
     rounds = rounds if rounds is not None else CFG["mvp_scope"]["rounds_per_run"]

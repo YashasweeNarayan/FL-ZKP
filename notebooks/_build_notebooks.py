@@ -431,7 +431,7 @@ for the GPU/torch reimplementation this blocks on.
 """),
 
 ("code", """import numpy as np
-from fl.round_loop import run_training_loop
+from fl.round_loop import run_training_loop, bootstrap_norms_from_model_dim
 
 # SMOKE TEST first -- a handful of rounds over a SUBSET of clients,
 # to validate the protocol wiring (V1-V5, the independent V5 audit,
@@ -451,7 +451,16 @@ for model_name in CFG['mvp_scope']['models']:
     # would come from the server running its own pseudo-client
     # train+sketch passes over server_root data, which hits the same
     # sketch performance wall noted above, so it's deferred alongside it.
-    root_norms = np.random.default_rng(CFG['seed']).normal(5.0, 0.5, size=100)
+    # bootstrap_norms_from_model_dim at least makes this placeholder
+    # dimensionally/scale-consistent with the real quantize->sketch
+    # pipeline, instead of an arbitrary constant unrelated to model_dim.
+    root_norms = bootstrap_norms_from_model_dim(
+        model_dim=dim,
+        sketch_dim=CFG['sketch']['m'],
+        sketch_seed=f"bootstrap-{model_name}".encode(),
+        quant_bits=16,
+        rng=np.random.default_rng(CFG['seed']),
+    )
 
     final_w_t, history = run_training_loop(
         model=model,
@@ -585,7 +594,7 @@ sweep**).
 """),
 
 ("code", """import numpy as np
-from fl.round_loop import run_training_loop
+from fl.round_loop import run_training_loop, bootstrap_norms_from_model_dim
 
 SMOKE_ROUNDS = 2
 SMOKE_CLIENTS = 8  # must be >= K_MIN (8) in fl/server.py or every round aborts regardless of verification outcome
@@ -596,7 +605,13 @@ for model_name in CFG['mvp_scope']['models']:
     model = models[model_name]
     dim = flat_weights[model_name].numel()
 
-    root_norms = np.random.default_rng(CFG['seed']).normal(5.0, 0.5, size=100)
+    root_norms = bootstrap_norms_from_model_dim(
+        model_dim=dim,
+        sketch_dim=CFG['sketch']['m'],
+        sketch_seed=f"bootstrap-{model_name}".encode(),
+        quant_bits=16,
+        rng=np.random.default_rng(CFG['seed']),
+    )
 
     final_w_t, history = run_training_loop(
         model=model,
