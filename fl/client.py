@@ -83,7 +83,50 @@ def quantize(delta: np.ndarray, bits: int = 16) -> np.ndarray:
     per round.
     """
     scale = 2 ** bits
-    quantized = np.round(delta * scale).astype(np.int64)
+    scaled = delta * scale
+
+    # Caught live on Colab (resnet50, CASE2/FEMNIST real-model smoke
+    # test, round 1, 2026-11-12) -- round 0 was clean, so this is NOT
+    # the same failure as local_train_delta's own NaN/Inf check (which
+    # didn't fire here): a value can be entirely FINITE yet still
+    # overflow int64's representable range (~+-9.22e18) once multiplied
+    # by `scale` -- a diverging-but-not-yet-infinite float32 gradient
+    # step routinely produces finite-but-huge numbers (e.g. ~1e14+)
+    # before/instead of ever reaching actual inf. `np.round(...)
+    # .astype(np.int64)` on such a value is UNDEFINED, not an error --
+    # only a RuntimeWarning -- so this is the second, distinct way
+    # garbage silently reached the crypto layer that local_train_delta's
+    # isfinite-only check could not catch (it checked `delta` alone,
+    # before scaling, and finite-but-large passes that check easily).
+    # Checking HERE, at the actual cast, covers every caller
+    # (local_train_delta's output + DP noise, bootstrap synthetic
+    # deltas, any future caller) rather than trying to anticipate every
+    # upstream source of an out-of-range value.
+    if not np.all(np.isfinite(scaled)):
+        n_bad = int(np.sum(~np.isfinite(scaled)))
+        raise FloatingPointError(
+            f"quantize: {n_bad}/{scaled.size} values are non-finite "
+            f"(NaN/Inf) after scaling by 2**{bits} -- cannot safely "
+            f"cast to int64."
+        )
+    # int64's true range is roughly +-9.223e18; stay a bit under that
+    # so np.round()'s own rounding can't itself tip something right at
+    # the edge over the line.
+    int64_safe_max = 9.0e18
+    max_abs = float(np.max(np.abs(scaled))) if scaled.size else 0.0
+    if max_abs > int64_safe_max:
+        raise FloatingPointError(
+            f"quantize: scaled value magnitude {max_abs:.3e} exceeds "
+            f"the safe int64 cast range ({int64_safe_max:.1e}) -- "
+            f"np.round(...).astype(np.int64) would silently overflow "
+            f"rather than error. This means the pre-scale delta had an "
+            f"entry around {max_abs / scale:.3e} or larger -- almost "
+            f"certainly a diverging training step (finite but huge, "
+            f"not NaN/Inf, which is why an isfinite-only check upstream "
+            f"would miss it), not a crypto bug. Lower lr, add gradient "
+            f"clipping, or mini-batch instead of one full-batch step."
+        )
+    quantized = np.round(scaled).astype(np.int64)
     return np.mod(quantized, P_MASK)
 
 
@@ -199,7 +242,10 @@ def round_step_phase1(
     nu_k = noise_shares[0]
 
     # Step 3: quantize.
-    q_k = quantize(delta + nu_k, bits=ctx.quant_bits)
+    try:
+        q_k = quantize(delta + nu_k, bits=ctx.quant_bits)
+    except FloatingPointError as e:
+        raise FloatingPointError(f"client {ctx.keys.index}: {e}") from e
 
     # Step 4: double-masking.
     masked = q_k.copy()
