@@ -34,6 +34,37 @@ from .norm_rule import bootstrap_from_server_root, update_threshold_ema
 from .models import flatten_state_dict, unflatten_to_state_dict
 
 
+def release_gpu_memory() -> None:
+    """Free cached-but-idle GPU memory and run a GC pass.
+
+    Call this between models/rounds in a long-lived notebook kernel --
+    PyTorch's caching allocator holds onto freed tensors' memory for
+    reuse rather than returning it to the driver, so running several
+    models back-to-back in the same process (e.g. mobilenet_v2 then
+    resnet50 in one smoke-test loop, or CASE1 then CASE2 in the same
+    session) can accumulate enough cached-but-unused memory to starve
+    a later, larger allocation even though nothing from the earlier
+    model is actually still needed. `torch.cuda.empty_cache()` doesn't
+    reduce PyTorch's memory *usage*, only returns what's unused back to
+    the driver for other allocations (including this process's own
+    next ones) to claim -- it does not fix memory truly still held by
+    live references (e.g. a model or optimizer object still in scope).
+
+    Safe to call with no GPU / no torch installed (no-op then); this
+    is a cleanup hygiene helper, not a leak detector -- it won't help
+    if the memory is still referenced somewhere (del the model/results
+    dict entry first if that's the actual intent).
+    """
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
 def build_x25519_keys(n_clients: int):
     """One long-term X25519 keypair per client, for secure-aggregation's
     pairwise masking -- a DIFFERENT curve from the ristretto255 signing
