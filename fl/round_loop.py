@@ -18,6 +18,7 @@ itself) -- the only new risk surface here is ORDERING/WIRING.
 from __future__ import annotations
 
 import os
+import time
 
 import numpy as np
 
@@ -69,9 +70,10 @@ def bootstrap_norms_from_model_dim(
     sketch_dim: int,
     sketch_seed: bytes,
     quant_bits: int = 16,
-    n_samples: int = 50,
+    n_samples: int = 10,
     delta_scale: float = 5.0,
     rng: np.random.Generator = None,
+    verbose: bool = True,
 ) -> np.ndarray:
     """Round-0 B_t bootstrap, STAND-IN for ARCHITECTURE.md ROADMAP
     §3.4's real design ("server computes norms on its OWN root-set
@@ -113,16 +115,45 @@ def bootstrap_norms_from_model_dim(
     the same "V3_norm_bound_exceeded" message, now showing the actual
     numbers (see fl/server.py's verify_submission diagnostics) so the
     gap is immediately visible rather than requiring another guess.
+
+    *** `n_samples` COST SCALES WITH `model_dim`, SAME AS EVERY OTHER
+    SKETCH CALL -- caught live on Colab the first time this was run
+    against a REAL model (mobilenet_v2, model_dim~2.24M) ***. Each
+    sample calls `sketch.project()` over the full `model_dim`, the
+    exact same O(m*d) cost `sketch.py`'s own PERFORMANCE NOTE already
+    flags (~20s at d=500K on CPU). At the tiny debug model's d=7850
+    this was negligible regardless of n_samples; at mobilenet_v2's
+    real d~2.24M, one sample alone extrapolates to ~90s, so the
+    original default (n_samples=50) meant calling this function once
+    cost ~75 MINUTES, with nothing printed while it ran, before the
+    round loop's own (comparatively modest) per-round sketch cost
+    even started -- indistinguishable from a hang. Default lowered to
+    10 (~15 min at mobilenet_v2 scale, still real but no longer
+    absurd) -- callers working with a real, large model should pass
+    an even smaller n_samples explicitly (3-5 is plenty for a rough
+    median/MAD estimate; this is a placeholder bootstrap, not a
+    precision statistic, and update_threshold_ema corrects B_t with
+    REAL observed norms from round 1 onward regardless). Rule of
+    thumb: budget n_samples * 20*(model_dim/500_000) seconds before
+    calling this against anything bigger than a few hundred thousand
+    parameters.
     """
     rng = rng or np.random.default_rng()
     sketch = SketchProjector(seed=sketch_seed, m=sketch_dim, d=model_dim)
     norms = np.empty(n_samples)
+    if verbose:
+        est_per_sample = 20.0 * (model_dim / 500_000)
+        print(f"bootstrap_norms_from_model_dim: {n_samples} samples at model_dim={model_dim} "
+              f"(~{est_per_sample:.1f}s/sample estimated, ~{est_per_sample * n_samples / 60:.1f} min total)")
     for i in range(n_samples):
+        t0 = time.time() if verbose else None
         delta = rng.normal(0.0, delta_scale, size=model_dim)
         q = quantize(delta, bits=quant_bits)
         signed_q = center_mod_p_mask(q)
         y = sketch.project(signed_q.astype(np.float64))
         norms[i] = np.linalg.norm(y)
+        if verbose:
+            print(f"  sample {i+1}/{n_samples} done ({time.time()-t0:.1f}s)")
     return norms
 
 
