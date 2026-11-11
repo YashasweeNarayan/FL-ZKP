@@ -123,6 +123,7 @@ def local_train_delta(model, w_t, local_data, lr: float, epochs: int):
     optimizer = torch.optim.SGD(model.parameters(), lr=lr)
     criterion = torch.nn.CrossEntropyLoss()
 
+    last_loss = None
     for _ in range(epochs):
         images, labels = local_data.images, local_data.labels
         optimizer.zero_grad()
@@ -130,9 +131,37 @@ def local_train_delta(model, w_t, local_data, lr: float, epochs: int):
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
+        last_loss = float(loss.detach().cpu())
 
     new_flat, _ = flatten_state_dict(model)
     delta = (new_flat - w_t).detach().cpu().numpy().astype(np.float64)
+
+    # Caught live on Colab (mobilenet_v2, real-model smoke test,
+    # 2026-11-12): without this check, a non-finite delta silently
+    # reaches fl/client.py's quantize() (`np.round(delta * scale)
+    # .astype(np.int64)`), which NumPy casts to an UNDEFINED int64
+    # value for NaN/Inf (just a RuntimeWarning, not an error) -- the
+    # crypto layer then happily commits to, masks, sketches, and
+    # verifies that garbage, so a round can print accepted=8/8,
+    # V5=PASS while actually aggregating a corrupted update for that
+    # client. This is a training-stability failure (e.g. lr too high
+    # for this model/data/batch-size combination -- note local_data
+    # is trained as ONE full-batch step per `epochs`, not mini-
+    # batched), not a crypto bug, but it must not be allowed to pass
+    # through silently -- raise loudly instead.
+    n_bad = int(np.sum(~np.isfinite(delta)))
+    if n_bad:
+        raise FloatingPointError(
+            f"local_train_delta: {n_bad}/{delta.size} elements of the "
+            f"trained delta are non-finite (NaN/Inf) after {epochs} "
+            f"epoch(s) at lr={lr} (final loss={last_loss}) -- training "
+            f"diverged. Lower lr, add gradient clipping, or mini-batch "
+            f"this client's {len(labels)}-sample shard instead of one "
+            f"full-batch step, then retry. (Caught here deliberately: "
+            f"letting this reach quantize() would silently cast NaN/Inf "
+            f"to an undefined int64 value and corrupt this client's "
+            f"contribution without any visible error.)"
+        )
     return delta
 
 
@@ -158,7 +187,10 @@ def round_step_phase1(
 
     # Step 1: train or contribute zero.
     if b_k:
-        delta = local_train_delta(model, w_t, local_data, lr, epochs)
+        try:
+            delta = local_train_delta(model, w_t, local_data, lr, epochs)
+        except FloatingPointError as e:
+            raise FloatingPointError(f"client {ctx.keys.index}: {e}") from e
     else:
         delta = np.zeros(ctx.model_dim, dtype=np.float64)
 
