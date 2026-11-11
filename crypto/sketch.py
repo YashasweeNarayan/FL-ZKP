@@ -157,26 +157,49 @@ class TorchSketchProjector:
         self.scale = 1.0 / np.sqrt(m * density)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
+    def _default_chunk(self) -> int:
+        """Pick a chunk size from actually-available memory rather than a
+        fixed guess. A fixed 200_000 on CUDA assumed ~16GB of headroom
+        for the transient (m, chunk) `u` and `signs` float32 tensors
+        (~2 * m * chunk * 4 bytes together), but a real T4 only exposes
+        ~14.6GB usable, and whatever's already resident (other chunks'
+        cached allocations, other processes sharing the GPU, plain
+        fragmentation) can push even that over the edge -- confirmed via
+        a live CUDA OOM on Colab at chunk=200_000 with only ~1.1GB free
+        at the time. CPU has no `mem_get_info`, so it keeps the earlier
+        fixed 20_000 default (~1.3GB transient, safe on typical RAM).
+        """
+        torch = self.torch
+        if self.device != "cuda":
+            return 20_000
+        free_bytes, _ = torch.cuda.mem_get_info()
+        # Use only a fraction of currently-free memory: leaves room for
+        # the output accumulator, the q_t tensor, allocator fragmentation,
+        # and anything else already sharing this GPU.
+        safe_bytes = free_bytes * 0.25
+        chunk = int(safe_bytes / (2 * self.m * 4))
+        return max(2_000, min(200_000, chunk))
+
     def project(self, q, chunk: int = None):
         """Same chunking discipline as `SketchProjector.project` (never
-        materialize the full (m, d) sign matrix at once), but on CUDA
-        a much larger chunk than the NumPy reference is affordable and
-        faster (fewer, larger kernel launches): GPU memory and matmul
-        throughput favor it over the NumPy reference's chunk=4_000,
-        which was sized for CPU cache/memory, not GPU occupancy.
+        materialize the full (m, d) sign matrix at once), but on CUDA a
+        larger chunk than the NumPy reference is generally affordable
+        and faster (fewer, larger kernel launches) -- GPU memory and
+        matmul throughput favor it over the NumPy reference's
+        chunk=4_000, which was sized for CPU cache/memory, not GPU
+        occupancy.
 
-        `chunk` now defaults to device-aware if left as None: 200_000 on
-        CUDA (a (8192, 200_000) float32 sign tensor there is ~6.4 GB --
-        fits comfortably on any modern training GPU; lower `chunk` on a
-        memory-constrained GPU), but only 20_000 on CPU -- the project()
-        call allocates roughly 2x that chunk-tensor size transiently (the
-        `u` and `signs` tensors are both (m, chunk) float32), so at
-        m=8192 the old 200_000 default meant ~13 GB of transient CPU RAM
-        per chunk, which thrashed/hung rather than erroring on a
-        GPU-less Colab CPU runtime (this is what the earlier apparent
-        "hang" in test_torch_sketch_timing_at_real_scale actually was --
-        not an infinite loop). At m=8192, chunk=20_000, transient memory
-        is ~1.3 GB, which is safe on typical Colab CPU RAM.
+        Leaving `chunk=None` (the default) picks a size via
+        `_default_chunk()`: on CUDA, adaptively from currently-free GPU
+        memory (see that method's docstring for why a fixed guess was
+        wrong); on CPU, a fixed 20_000 (~1.3GB transient memory, safe on
+        typical RAM -- the old fixed 200_000 default meant ~13GB of
+        transient CPU RAM per chunk, which thrashed/hung rather than
+        erroring on a GPU-less runtime; that was the earlier apparent
+        "hang" in test_torch_sketch_timing_at_real_scale, not an
+        infinite loop). Even the adaptive CUDA estimate is a prediction,
+        not a guarantee, so an actual OOM mid-call still triggers one
+        retry at a quarter the chunk size, after freeing the cache.
 
         Accepts a NumPy array or a torch tensor for `q`; always
         returns a NumPy array, so callers (`fl/client.py`,
@@ -186,7 +209,7 @@ class TorchSketchProjector:
         """
         torch = self.torch
         if chunk is None:
-            chunk = 200_000 if self.device == "cuda" else 20_000
+            chunk = self._default_chunk()
         if q.shape[0] != self.d:
             raise ValueError(f"expected d={self.d}, got {q.shape[0]}")
         if isinstance(q, np.ndarray):
@@ -194,6 +217,16 @@ class TorchSketchProjector:
         else:
             q_t = q.to(device=self.device, dtype=torch.float32)
 
+        try:
+            return self._project_chunked(q_t, chunk)
+        except torch.cuda.OutOfMemoryError:
+            if chunk <= 2_000:
+                raise
+            torch.cuda.empty_cache()
+            return self._project_chunked(q_t, max(2_000, chunk // 4))
+
+    def _project_chunked(self, q_t, chunk: int):
+        torch = self.torch
         out = torch.zeros(self.m, dtype=torch.float32, device=self.device)
         for start in range(0, self.d, chunk):
             end = min(start + chunk, self.d)
