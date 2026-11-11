@@ -157,16 +157,26 @@ class TorchSketchProjector:
         self.scale = 1.0 / np.sqrt(m * density)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    def project(self, q, chunk: int = 200_000):
+    def project(self, q, chunk: int = None):
         """Same chunking discipline as `SketchProjector.project` (never
-        materialize the full (m, d) sign matrix at once), but with a
-        much larger default chunk -- GPU memory and matmul throughput
-        make a bigger chunk both affordable and faster (fewer, larger
-        kernel launches) than the NumPy reference's chunk=4_000, which
-        was sized for CPU cache/memory, not GPU occupancy. At
-        m=8192, chunk=200_000: a (8192, 200_000) float32 sign tensor
-        is ~6.4 GB -- fits comfortably on any modern training GPU;
-        lower `chunk` on a memory-constrained GPU.
+        materialize the full (m, d) sign matrix at once), but on CUDA
+        a much larger chunk than the NumPy reference is affordable and
+        faster (fewer, larger kernel launches): GPU memory and matmul
+        throughput favor it over the NumPy reference's chunk=4_000,
+        which was sized for CPU cache/memory, not GPU occupancy.
+
+        `chunk` now defaults to device-aware if left as None: 200_000 on
+        CUDA (a (8192, 200_000) float32 sign tensor there is ~6.4 GB --
+        fits comfortably on any modern training GPU; lower `chunk` on a
+        memory-constrained GPU), but only 20_000 on CPU -- the project()
+        call allocates roughly 2x that chunk-tensor size transiently (the
+        `u` and `signs` tensors are both (m, chunk) float32), so at
+        m=8192 the old 200_000 default meant ~13 GB of transient CPU RAM
+        per chunk, which thrashed/hung rather than erroring on a
+        GPU-less Colab CPU runtime (this is what the earlier apparent
+        "hang" in test_torch_sketch_timing_at_real_scale actually was --
+        not an infinite loop). At m=8192, chunk=20_000, transient memory
+        is ~1.3 GB, which is safe on typical Colab CPU RAM.
 
         Accepts a NumPy array or a torch tensor for `q`; always
         returns a NumPy array, so callers (`fl/client.py`,
@@ -175,6 +185,8 @@ class TorchSketchProjector:
         projector's output interchangeably.
         """
         torch = self.torch
+        if chunk is None:
+            chunk = 200_000 if self.device == "cuda" else 20_000
         if q.shape[0] != self.d:
             raise ValueError(f"expected d={self.d}, got {q.shape[0]}")
         if isinstance(q, np.ndarray):
