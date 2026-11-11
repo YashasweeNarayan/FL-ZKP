@@ -24,7 +24,7 @@ from crypto.secagg import pairwise_mask, self_mask, P_MASK
 from crypto.pedersen import commit as pedersen_commit
 from crypto.elgamal_threshold import encrypt as elgamal_encrypt
 from crypto.clsag import sign as clsag_sign, h_p as clsag_h_p
-from crypto.sketch import SketchProjector  # correctness-reference; see sketch.py's PERFORMANCE NOTE
+from crypto.sketch import TorchSketchProjector  # GPU/torch (STATUS.md TODO #3); SketchProjector (NumPy) is the correctness reference used by tests, not the real training path
 from crypto.rangeproof import prove_range
 from crypto.r_cons import prove_identity_binding
 from crypto.vector_commit import weighted_digest
@@ -259,7 +259,7 @@ def round_step_phase2(
     quantity that actually does shrink, instead of P_MASK-scale
     wrap-noise that wouldn't.
     """
-    sketch = SketchProjector(seed=sketch_seed, m=sketch_dim, d=ctx.model_dim)
+    sketch = TorchSketchProjector(seed=sketch_seed, m=sketch_dim, d=ctx.model_dim)
     signed_q = center_mod_p_mask(phase1._secret_q)
     y_k = sketch.project(signed_q.astype(np.float64))
 

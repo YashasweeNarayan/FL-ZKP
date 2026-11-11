@@ -112,3 +112,91 @@ def empirical_jl_distortion(q: np.ndarray, seed: bytes, m: int, trials: int = 1)
     proj = SketchProjector(seed, m, d)
     y = proj.project(q)
     return float(np.linalg.norm(y) / np.linalg.norm(q))
+
+
+class TorchSketchProjector:
+    """GPU/torch reimplementation of `SketchProjector`, per this
+    module's own long-standing instruction not to port the NumPy class
+    verbatim into the training loop. SAME algorithm (streaming
+    Achlioptas-style +-1/0/+1 sketch, seeded per-chunk exactly like the
+    NumPy reference's `seed_commitment(seed + start_bytes)` scheme, so
+    the construction is equally auditable), reimplemented with torch
+    tensors and `torch.Generator` so chunks run as batched GPU matmuls
+    instead of a NumPy `rng.random` + Python-level loop.
+
+    NOT bit-identical to `SketchProjector` for the same seed (torch's
+    RNG stream differs from NumPy's) -- this does NOT matter for
+    correctness here: nothing in this repo recomputes a client's
+    sketch independently to cross-check it bit-for-bit. `fl/server.py`
+    trusts `phase2.sketch` as sent (verified only via the V3 range
+    proof tying it to a specific committed norm, fixed earlier this
+    session) and never re-derives the projection itself; the sketch
+    is purely a client-side computation whose output is consumed as
+    data. What DOES matter, and what this class preserves: (1)
+    determinism given the same seed (so a client's own repeated calls,
+    or any future auditing need, are reproducible), and (2) a valid JL
+    embedding that approximately preserves the L2 norm, which V3's
+    norm bound actually depends on.
+
+    *** WRITTEN, NOT RUN -- see STATUS.md ***. torch isn't installed
+    in the sandbox this was written in (same constraint as every other
+    torch-dependent module in this repo), so this has been reviewed
+    carefully against the NumPy reference's semantics and against
+    documented torch API behavior, but not executed. Validate on Colab
+    (tests/test_sketch_gpu.py) before trusting it for a real run,
+    exactly like every other 🟡 module in STATUS.md.
+    """
+
+    def __init__(self, seed: bytes, m: int, d: int, density: float = 1.0 / 3.0, device: str = None):
+        import torch
+        self.torch = torch
+        self.seed = seed
+        self.m = m
+        self.d = d
+        self.density = density
+        self.scale = 1.0 / np.sqrt(m * density)
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    def project(self, q, chunk: int = 200_000):
+        """Same chunking discipline as `SketchProjector.project` (never
+        materialize the full (m, d) sign matrix at once), but with a
+        much larger default chunk -- GPU memory and matmul throughput
+        make a bigger chunk both affordable and faster (fewer, larger
+        kernel launches) than the NumPy reference's chunk=4_000, which
+        was sized for CPU cache/memory, not GPU occupancy. At
+        m=8192, chunk=200_000: a (8192, 200_000) float32 sign tensor
+        is ~6.4 GB -- fits comfortably on any modern training GPU;
+        lower `chunk` on a memory-constrained GPU.
+
+        Accepts a NumPy array or a torch tensor for `q`; always
+        returns a NumPy array, so callers (`fl/client.py`,
+        `fl/server.py`'s `np.linalg.norm(phase2.sketch)`,
+        `verifier/audit.py`) need no changes to consume either
+        projector's output interchangeably.
+        """
+        torch = self.torch
+        if q.shape[0] != self.d:
+            raise ValueError(f"expected d={self.d}, got {q.shape[0]}")
+        if isinstance(q, np.ndarray):
+            q_t = torch.as_tensor(q, dtype=torch.float32, device=self.device)
+        else:
+            q_t = q.to(device=self.device, dtype=torch.float32)
+
+        out = torch.zeros(self.m, dtype=torch.float32, device=self.device)
+        for start in range(0, self.d, chunk):
+            end = min(start + chunk, self.d)
+            width = end - start
+            sub_seed = int.from_bytes(
+                seed_commitment(self.seed + start.to_bytes(8, "little"))[:8], "little"
+            )
+            # torch.Generator's seed is a signed 64-bit int internally;
+            # masking to 63 bits keeps this valid across torch versions
+            # without relying on unsigned-seed support.
+            gen = torch.Generator(device=self.device)
+            gen.manual_seed(sub_seed & ((1 << 63) - 1))
+            u = torch.rand((self.m, width), generator=gen, device=self.device, dtype=torch.float32)
+            signs = torch.zeros((self.m, width), dtype=torch.float32, device=self.device)
+            signs[u < self.density / 2] = -1.0
+            signs[u > 1.0 - self.density / 2] = 1.0
+            out += signs @ q_t[start:end]
+        return (out * self.scale).cpu().numpy()

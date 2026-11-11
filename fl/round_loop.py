@@ -26,7 +26,7 @@ from crypto.secagg import derive_pairwise_secret_via_x25519
 from crypto.sketch import seed_commitment
 from verifier.audit import independent_v5_check
 
-from crypto.sketch import SketchProjector
+from crypto.sketch import TorchSketchProjector
 
 from .client import ClientKeys, ClientRoundContext, round_step_phase1, round_step_phase2, quantize, center_mod_p_mask
 from .server import run_round, apply_update
@@ -139,12 +139,19 @@ def bootstrap_norms_from_model_dim(
     parameters.
     """
     rng = rng or np.random.default_rng()
-    sketch = SketchProjector(seed=sketch_seed, m=sketch_dim, d=model_dim)
+    sketch = TorchSketchProjector(seed=sketch_seed, m=sketch_dim, d=model_dim)
     norms = np.empty(n_samples)
     if verbose:
+        # Rough estimate only, now using TorchSketchProjector (STATUS.md
+        # TODO #3) instead of the NumPy reference this estimate was
+        # originally calibrated against -- GPU timing is expected to beat
+        # this estimate substantially; it's printed as an upper bound, not
+        # a tight prediction, since actual speedup depends on the
+        # available device (see TorchSketchProjector.device).
         est_per_sample = 20.0 * (model_dim / 500_000)
-        print(f"bootstrap_norms_from_model_dim: {n_samples} samples at model_dim={model_dim} "
-              f"(~{est_per_sample:.1f}s/sample estimated, ~{est_per_sample * n_samples / 60:.1f} min total)")
+        print(f"bootstrap_norms_from_model_dim: {n_samples} samples at model_dim={model_dim}, "
+              f"device={sketch.device} (NumPy-CPU upper-bound estimate ~{est_per_sample:.1f}s/sample, "
+              f"~{est_per_sample * n_samples / 60:.1f} min total -- should be much faster on GPU)")
     for i in range(n_samples):
         t0 = time.time() if verbose else None
         delta = rng.normal(0.0, delta_scale, size=model_dim)
@@ -189,15 +196,18 @@ def run_training_loop(
     without re-deriving it from scratch.
 
     *** PERFORMANCE NOTE -- READ BEFORE LAUNCHING A FULL RUN ***
-    crypto/sketch.py's SketchProjector is a CPU/NumPy CORRECTNESS
-    reference (see its own PERFORMANCE NOTE): measured at ~16
-    min/client/round extrapolated to ResNet-50's real d~23.5M. A full
-    45-round x 50-client run at that scale, with this reference
-    implementation, would take on the order of DAYS, not hours. This
-    function is for validating the PROTOCOL WIRING is correct (call
-    it with a small `rounds`, a handful of clients, or a reduced
-    model_dim first) -- not for launching the real MVP-scale run until
-    sketch.py's GPU/torch reimplementation lands (STATUS.md TODO #3).
+    This function now calls `crypto/sketch.py`'s `TorchSketchProjector`
+    (STATUS.md TODO #3's GPU/torch reimplementation, done but WRITTEN,
+    NOT YET COLAB-RUN as of 2026-11-11), not the NumPy
+    `SketchProjector` reference (~16 min/client/round extrapolated to
+    ResNet-50's real d~23.5M, which would make a full 45-round x
+    50-client run take DAYS). Validate `TorchSketchProjector` on Colab
+    (`tests/test_sketch_gpu.py`) before trusting this performance note
+    is actually resolved -- it is expected to be dramatically faster,
+    but "expected" is not the same as "confirmed", and this function
+    is still for validating PROTOCOL WIRING with a small `rounds` /
+    handful of clients first, not yet confirmed safe for the real
+    MVP-scale sweep until that Colab run happens.
 
     *** ONE REMAINING HONEST PLACEHOLDER: `server_root_norms` ***
     The caller is expected to pass real norms computed from the
