@@ -156,27 +156,45 @@ class TorchSketchProjector:
         self.density = density
         self.scale = 1.0 / np.sqrt(m * density)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        # Computed ONCE here, from the device's fixed total memory, and
+        # reused for every project() call on this instance -- see
+        # _compute_default_chunk's docstring for why this must NOT be
+        # recomputed per-call from currently-free memory.
+        self._default_chunk_size = self._compute_default_chunk()
 
-    def _default_chunk(self) -> int:
-        """Pick a chunk size from actually-available memory rather than a
-        fixed guess. A fixed 200_000 on CUDA assumed ~16GB of headroom
-        for the transient (m, chunk) `u` and `signs` float32 tensors
-        (~2 * m * chunk * 4 bytes together), but a real T4 only exposes
-        ~14.6GB usable, and whatever's already resident (other chunks'
-        cached allocations, other processes sharing the GPU, plain
-        fragmentation) can push even that over the edge -- confirmed via
-        a live CUDA OOM on Colab at chunk=200_000 with only ~1.1GB free
-        at the time. CPU has no `mem_get_info`, so it keeps the earlier
-        fixed 20_000 default (~1.3GB transient, safe on typical RAM).
+    def _compute_default_chunk(self) -> int:
+        """Pick a chunk size from the device's fixed TOTAL memory, not
+        currently-free memory. This distinction matters for correctness,
+        not just performance: chunk size determines where the (m, d)
+        sign matrix gets split, and each chunk's RNG is seeded from its
+        own start offset (`seed_commitment(self.seed + start_bytes)`).
+        Two instances with the *same* seed must produce the *same*
+        chunk boundaries to produce the *same* output -- that's exactly
+        what test_torch_sketch_is_deterministic_given_seed checks, and
+        it failed when this was computed from `torch.cuda.mem_get_info()`
+        (currently-free memory drifts between calls -- allocator
+        caching, fragmentation -- so two instances built moments apart
+        picked different chunk sizes and produced completely different
+        sign matrices from the identical seed; not a performance
+        regression, an actual reproducibility bug). `total_memory` is a
+        static property of the GPU itself, so it's the same every time
+        for every instance on this device, restoring determinism.
+
+        A fixed 200_000 on CUDA regardless of device (the original
+        default) assumed ~16GB of headroom for the transient (m, chunk)
+        `u` and `signs` float32 tensors (~2 * m * chunk * 4 bytes
+        together); a real T4 only exposes ~14.6GB usable, and confirmed
+        OOM'd. Sizing from 25% of total_memory instead adapts to the
+        actual GPU without depending on transient allocator state.
+        CPU has no `mem_get_info`/`get_device_properties`, so it keeps a
+        fixed 20_000 (~1.3GB transient, safe on typical RAM).
         """
         torch = self.torch
         if self.device != "cuda":
             return 20_000
-        free_bytes, _ = torch.cuda.mem_get_info()
-        # Use only a fraction of currently-free memory: leaves room for
-        # the output accumulator, the q_t tensor, allocator fragmentation,
-        # and anything else already sharing this GPU.
-        safe_bytes = free_bytes * 0.25
+        device_idx = torch.cuda.current_device()
+        total_bytes = torch.cuda.get_device_properties(device_idx).total_memory
+        safe_bytes = total_bytes * 0.25
         chunk = int(safe_bytes / (2 * self.m * 4))
         return max(2_000, min(200_000, chunk))
 
@@ -189,17 +207,27 @@ class TorchSketchProjector:
         chunk=4_000, which was sized for CPU cache/memory, not GPU
         occupancy.
 
-        Leaving `chunk=None` (the default) picks a size via
-        `_default_chunk()`: on CUDA, adaptively from currently-free GPU
-        memory (see that method's docstring for why a fixed guess was
-        wrong); on CPU, a fixed 20_000 (~1.3GB transient memory, safe on
-        typical RAM -- the old fixed 200_000 default meant ~13GB of
-        transient CPU RAM per chunk, which thrashed/hung rather than
+        Leaving `chunk=None` (the default) uses `self._default_chunk_size`,
+        computed once at construction time from the device's fixed total
+        memory (see `_compute_default_chunk`'s docstring for why it must
+        be fixed per-instance rather than recomputed from live free
+        memory -- that was an actual determinism bug, not just a sizing
+        one). On CPU it's a fixed 20_000 (~1.3GB transient memory, safe
+        on typical RAM -- the earlier fixed 200_000 default meant ~13GB
+        of transient CPU RAM per chunk, which thrashed/hung rather than
         erroring on a GPU-less runtime; that was the earlier apparent
         "hang" in test_torch_sketch_timing_at_real_scale, not an
-        infinite loop). Even the adaptive CUDA estimate is a prediction,
-        not a guarantee, so an actual OOM mid-call still triggers one
-        retry at a quarter the chunk size, after freeing the cache.
+        infinite loop).
+
+        Even sizing from total device memory is a prediction, not a
+        guarantee (other processes, fragmentation), so an actual OOM
+        mid-call still triggers one retry at a quarter the chunk size,
+        after freeing the cache. This retry path is explicitly a
+        degraded-conditions fallback and does NOT preserve the
+        determinism guarantee above (a run that hits it will not match
+        a run that didn't) -- acceptable because it only triggers under
+        genuine external memory pressure, which already makes bit-exact
+        reproducibility impossible to promise.
 
         Accepts a NumPy array or a torch tensor for `q`; always
         returns a NumPy array, so callers (`fl/client.py`,
@@ -209,7 +237,7 @@ class TorchSketchProjector:
         """
         torch = self.torch
         if chunk is None:
-            chunk = self._default_chunk()
+            chunk = self._default_chunk_size
         if q.shape[0] != self.d:
             raise ValueError(f"expected d={self.d}, got {q.shape[0]}")
         if isinstance(q, np.ndarray):
