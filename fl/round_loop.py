@@ -70,7 +70,7 @@ def bootstrap_norms_from_model_dim(
     sketch_seed: bytes,
     quant_bits: int = 16,
     n_samples: int = 50,
-    delta_scale: float = 0.1,
+    delta_scale: float = 5.0,
     rng: np.random.Generator = None,
 ) -> np.ndarray:
     """Round-0 B_t bootstrap, STAND-IN for ARCHITECTURE.md ROADMAP
@@ -92,12 +92,27 @@ def bootstrap_norms_from_model_dim(
 
     This function closes that gap by running the SAME quantize ->
     center -> sketch pipeline fl/client.py's round_step_phase2 uses,
-    over `n_samples` synthetic deltas drawn at the "typical gradient
-    magnitude" scale `quantize()`'s own docstring cites (~1e-2 to 1,
-    `delta_scale` here), so the resulting norms are in the right
-    ballpark for `bootstrap_from_server_root` to derive a usable B_t
-    from -- still not real root-set data, so still flagged in
-    STATUS.md as a placeholder, just no longer a mis-scaled one.
+    over `n_samples` synthetic deltas drawn at scale `delta_scale`,
+    so the resulting norms are in the right ballpark for
+    `bootstrap_from_server_root` to derive a usable B_t from -- still
+    not real root-set data, so still flagged in STATUS.md as a
+    placeholder, just no longer a mis-scaled one.
+
+    `delta_scale`'s default was RAISED from an initial 0.1 (the
+    "typical gradient magnitude" `quantize()`'s own docstring cites,
+    ~1e-2 to 1) to 5.0 after live Colab testing against the tiny
+    debug model found the REAL achieved norm (~14.5M) was ~24x
+    larger than what 0.1 predicted (~601K) -- plausibly because
+    CASE1's MNIST pixels aren't normalized to [0,1] (raw 0-255
+    values feeding a single linear layer produce much larger
+    gradients than the 0.1 guess assumed). 5.0 gives a comfortable
+    ~2x safety margin above that one observed data point, but it is
+    still just an empirically-nudged guess, not a principled bound --
+    if a different model/dataset/lr combination produces a real norm
+    bigger than this bootstrap's B_t, round 0 will abort again with
+    the same "V3_norm_bound_exceeded" message, now showing the actual
+    numbers (see fl/server.py's verify_submission diagnostics) so the
+    gap is immediately visible rather than requiring another guess.
     """
     rng = rng or np.random.default_rng()
     sketch = SketchProjector(seed=sketch_seed, m=sketch_dim, d=model_dim)
