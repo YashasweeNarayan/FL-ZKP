@@ -29,19 +29,19 @@ reset).
 | `shamir.py` | ✅ TESTED | `python3 tests/test_shamir.py` — includes the critical `test_reshare_preserves_the_secret_pk_trace_invariant` |
 | `sketch.py` | ✅ TESTED (correctness only, NOT performance) | `python3 tests/test_sketch.py`. **See its own PERFORMANCE NOTE**: this CPU/NumPy reference extrapolates to ~16 min/client/round at ResNet-50's real d=23.5M. MUST be reimplemented in torch/GPU before the real CASE1/CASE2 runs — do not port this class verbatim into the training loop. |
 | `dp.py` | ✅ TESTED | `python3 tests/test_dp.py` |
-| `secagg.py` | ✅ TESTED (masking algebra) / 🟡 (the one X25519 ECDH helper function at the bottom) | `python3 tests/test_secagg.py` — includes `test_false_dropout_does_not_unmask`, the actual guardrail test for the R5 finding. The `derive_pairwise_secret_via_x25519` function needs `pynacl`, untested here. |
-| `ristretto.py` | 🟡 WRITTEN, NOT RUN | Needs `pynacl`. First real test: `00_Setup_and_Crypto_Tests.ipynb`'s basic sanity cell. |
-| `pedersen.py` | 🟡 WRITTEN, NOT RUN | Homomorphism claim untested until Colab (`00_Setup...ipynb` has a 1000-random-pair check). |
-| `schnorr_nizk.py` | 🟡 WRITTEN, NOT RUN | The AND/OR composition toolkit. Closing-equation algebra for AND was traced by hand; OR composition (both `or_prove_branch0_true` and the added `or_prove_branch1_true`) traced by hand but not executed. |
-| `elgamal_threshold.py` | 🟡 WRITTEN, NOT RUN | 7-of-10 recovery / 6-of-10 failure is in `00_Setup...ipynb`. |
-| `dkg.py` | 🟡 WRITTEN, NOT RUN | Pedersen DKG, Feldman verification. |
-| `committee.py` | 🟡 WRITTEN, NOT RUN | **The single most important guardrail** (per its own docstring) — the consent-rule test (`admin alone cannot install a roster`) is in `00_Setup...ipynb` and should be the FIRST thing you check if anything here fails. |
-| `reshare.py` | 🟡 WRITTEN, NOT RUN (EC wrapper) | The underlying field-math `reshare()` in `shamir.py` IS fully tested; this file only adds the Feldman-commitment publishing on top, untested. |
-| `vrf.py` | 🟡 WRITTEN, NOT RUN | Empirical sampling-rate check (`±0.02` of `p=0.25` over 10^4 trials) is in `00_Setup...ipynb`. |
-| `clsag.py` | 🟡 WRITTEN, NOT RUN | **Rewritten once already** after catching a broken `verify()`/dead-code first draft during authoring — see the file's own history in conversation. Closing-equation algebra traced by hand for the signer index. All-signers + tamper + key-image tests are in `00_Setup...ipynb`. |
-| `mixnet.py` | 🟡 WRITTEN, NOT RUN | 3-hop round-trip test is in `00_Setup...ipynb`. |
-| `rangeproof.py` | 🟡 WRITTEN, NOT RUN | Bit-decomposition OR-composition, built on `schnorr_nizk.py`. In-range accept / out-of-range reject tests are in `00_Setup...ipynb`. |
-| `r_cons.py` | 🟡 WRITTEN, NOT RUN | The compound AND-binding (pk, round tag, epoch tag, VRF point) is the core identity-laundering fix. **The sampling-disjunction OR statement is left generic** (see the module's own docstring) — the exact noise-cover-commitment encoding is an `fl/`-layer decision not yet finalized. |
+| `secagg.py` | ✅ TESTED (masking algebra + X25519 ECDH helper) | `python3 tests/test_secagg.py` for the masking algebra, including `test_false_dropout_does_not_unmask` (the R5 guardrail). `derive_pairwise_secret_via_x25519` passed on Colab Gate 1 (2026-11-10/11): both sides derive the same pairwise secret. |
+| `ristretto.py` | ✅ TESTED on Colab Gate 1 (2026-11-10/11) | Basic group-law sanity passed. **One real bug found and fixed here**: `scalar_mul_base`/`Point.scalar_mul` didn't special-case a zero scalar, and libsodium's underlying C functions reject a zero scalar outright (rc=-1) instead of returning the identity — this broke `rangeproof.py`'s `prove_range` on any value with a zero bit (i.e. almost every value). Fixed by short-circuiting `0*P = identity` directly before calling libsodium (commit `ebdf2a9`). |
+| `pedersen.py` | ✅ TESTED on Colab Gate 1 | Homomorphism check (1000 random pairs) passed, after the `ristretto.py` zero-scalar fix above (pedersen commitments to 0 go through this same code path). |
+| `schnorr_nizk.py` | ✅ TESTED on Colab Gate 1 | AND/OR composition toolkit, including the added `or_prove_branch1_true`, exercised transitively by `rangeproof.py`'s and `r_cons.py`'s passing tests. |
+| `elgamal_threshold.py` | ✅ TESTED on Colab Gate 1 | 7-of-10 recovery / 6-of-10 failure both passed, after the `dkg.py` fix below. |
+| `dkg.py` | ✅ TESTED on Colab Gate 1 | **One real bug found and fixed here**: `finalize()` returned `dict[int, int]` (plain share values), but `elgamal_threshold.py`'s `compute_partial()` needs a full `ShamirShare` (both `.value` and `.index` — the latter flows into `PartialDecryption.holder_id`, used by `combine_partials`' Lagrange step). `reshare.py` already returned proper `ShamirShare`s for the same consumer; `dkg.py` was the inconsistent one. Fixed to wrap final shares as `ShamirShare(index=j, value=...)` (commit `cc9a59b`). |
+| `committee.py` | ✅ TESTED on Colab Gate 1 | **The single most important guardrail** (per its own docstring) — the consent-rule test (admin alone cannot install a roster; t-of-n_c consent can) passed. |
+| `reshare.py` | ✅ TESTED on Colab Gate 1 | PK_trace invariant across resharing confirmed (EC wrapper on top of `shamir.py`'s already-tested field math), after the `dkg.py` fix above (old/new shares are now the same `ShamirShare` type everywhere). |
+| `vrf.py` | ✅ TESTED on Colab Gate 1 | Empirical sampling-rate check (`±0.02` of `p=0.25` over 10^4 trials) passed. |
+| `clsag.py` | ✅ TESTED on Colab Gate 1 | All-signers + tamper + key-image consistency tests passed. |
+| `mixnet.py` | ✅ TESTED on Colab Gate 1 | **One real bug found and fixed here**: `build_onion` padded the client payload to the full `CELL_SIZE` before wrapping it through 3 more layers of address+encryption overhead, so the very first wrap always overflowed the cell budget. Fixed by reserving `n_hops * WRAP_OVERHEAD` bytes up front and using fixed-width hop-address fields (commit `7f111af`). 3-hop round-trip now passes. |
+| `rangeproof.py` | ✅ TESTED on Colab Gate 1 | In-range accept / out-of-range reject passed, after the `ristretto.py` zero-scalar fix above (every zero bit in the decomposition hit that bug directly). |
+| `r_cons.py` | ✅ TESTED on Colab Gate 1 | Identity-binding proof verifies. **The sampling-disjunction OR statement is still left generic** (see the module's own docstring) — the exact noise-cover-commitment encoding is an `fl/`-layer decision not yet finalized; this is a scope gap, not a bug. |
 
 ## circuits/ — camera-ready PLONK upgrade path
 
@@ -67,21 +67,30 @@ reset).
 
 All 🟡 WRITTEN, NOT RUN — each is a thin, direct exercise of already-listed EC-dependent crypto calls (no new primitives), written to assert the SPECIFIC defense ARCHITECTURE.md's Table in §10 claims for that attack. Run these in a dedicated notebook cell after Gate 1 passes, before trusting the attack-rejection numbers in any figure.
 
+## Gate 1 — PASSED (2026-11-11, Colab)
+
+`00_Setup_and_Crypto_Tests.ipynb` ran end to end with no errors. Three real bugs were found and fixed live against the actual Colab run (not environment/install issues — genuine code defects), all pushed to `main`:
+- `ebdf2a9` — `ristretto.py`: zero-scalar case in `scalar_mul`/`scalar_mul_base` (broke `pedersen.py` commitments-to-0 and `rangeproof.py`'s bit=0 branches).
+- `cc9a59b` — `dkg.py`: `finalize()` returning plain ints instead of `ShamirShare` objects (broke `elgamal_threshold.py`/`reshare.py`'s shared consumer `compute_partial`).
+- `7f111af` — `mixnet.py`: `build_onion` not reserving wrapping overhead before padding the payload (broke the 3-hop round trip).
+
+Every EC-dependent crypto/ module above is now ✅ TESTED, not 🟡. The only remaining 🟡/🔴 items are the torch-dependent `fl/` modules (untested until CASE1/CASE2 actually run) and the `circuits/` specification stubs.
+
 ## notebooks/ and configs/
 
-- `00_Setup_and_Crypto_Tests.ipynb` — the Gate 1 notebook. **Run this first.** Generated via `notebooks/_build_notebooks.py` (kept so the cell content is reviewable as plain Python rather than raw notebook JSON).
+- `00_Setup_and_Crypto_Tests.ipynb` — the Gate 1 notebook. **Passed, 2026-11-11.** Generated via `notebooks/_build_notebooks.py` (kept so the cell content is reviewable as plain Python rather than raw notebook JSON).
 - `CASE1_IID_MNIST.ipynb` — **contains a known, explicitly-flagged gap**: the round loop is a scaffold that sets up keys/models/committee correctly but stops before wiring in real per-client pairwise ECDH secrets and the full phase1/phase2 client call sequence. The notebook's own markdown cell spells out the exact 6 steps needed to finish it. Do this on Colab, interactively, rather than guessing at it blind.
 - `CASE2_NONIID_FEMNIST.ipynb` — same round-loop gap as CASE1 (intentionally not duplicated — see its markdown cell), plus a working seen-writer vs. unseen-writer evaluation cell once models are trained.
 - `configs/mvp_3day.yaml` — single source of truth for every MVP parameter; both notebooks and `fl/*` should read from this rather than hardcoding numbers.
 
 ## Top TODO list, in priority order, for the Colab session
 
-1. **Run `00_Setup_and_Crypto_Tests.ipynb` end to end first.** If anything fails, fix it before touching CASE1/CASE2 — every ML number downstream depends on these primitives being correct.
+1. ~~Run `00_Setup_and_Crypto_Tests.ipynb` end to end first.~~ **DONE — Gate 1 passed 2026-11-11.**
 2. **Finish `fl/client.py` step 5's vector commitment scheme** (currently a scalar-digest placeholder) and update `fl/server.py`'s V5 check and `verifier/audit.py` to match. This is the one piece of real cryptographic design work still open, not just wiring.
 3. **Reimplement `sketch.py`'s `SketchProjector.project()` on GPU/torch** before running real CASE1/CASE2 rounds — the NumPy reference is correctness-only and far too slow at real model scale (see its own PERFORMANCE NOTE).
 4. **Finish the CASE1/CASE2 round-loop wiring** per each notebook's "Known gap" markdown cell (pairwise ECDH secrets, phase1/phase2 calls, V1-V5, apply_update).
-5. Once 1-4 pass on a small scale (few rounds, few clients), scale up to the full MVP parameters in `configs/mvp_3day.yaml` and run the 5-attack grid in `attacks/`.
-6. Update this file's status table as each 🟡 item actually gets exercised and passes (or fails and gets fixed) on Colab.
+5. Once 2-4 pass on a small scale (few rounds, few clients), scale up to the full MVP parameters in `configs/mvp_3day.yaml` and run the 5-attack grid in `attacks/`.
+6. Update this file's status table as each remaining 🟡 item actually gets exercised and passes (or fails and gets fixed) on Colab.
 
 ## What is NOT cut, scope-wise (for context when reading the above)
 
