@@ -100,6 +100,37 @@ def build_mobilenet_v2(num_classes: int, in_channels: int = 1):
     return model
 
 
+def build_tiny_debug_model(num_classes: int, in_channels: int = 1):
+    """A tiny (~8K-param) single-linear-layer model for validating the
+    ROUND-LOOP WIRING (fl/round_loop.py) quickly -- NOT a real MVP
+    backbone, and deliberately NOT in MVP_MODEL_BUILDERS so it can
+    never be mistaken for one or accidentally used in a real
+    CASE1/CASE2 experiment run.
+
+    Why this exists: ResNet-50/MobileNetV2's real d~23.5M is fixed by
+    the architecture regardless of how few clients/rounds a "smoke
+    test" uses -- crypto/sketch.py's SketchProjector AND
+    crypto/vector_commit.py's weighted_digest both do an O(d) pass in
+    slow NumPy/Python reference code (see each module's own
+    PERFORMANCE NOTE), so a round-loop smoke test against the real
+    model dimension can still take many minutes to hours per client.
+    This model's d is small enough (784*10+10 = 7850 for MNIST's
+    28x28x1 input) that the SAME O(d) passes finish in well under a
+    second, making it possible to validate the PROTOCOL correctness
+    (V1-V5, the independent V5 audit, B_t evolution, apply_update) in
+    seconds rather than discovering a wiring bug after a 40-minute
+    wait. Swap back to a real MVP_MODEL_BUILDERS entry once the smoke
+    test passes clean against this.
+    """
+    _require_torch()
+    import torch.nn as nn
+
+    return nn.Sequential(
+        nn.Flatten(),
+        nn.Linear(28 * 28 * in_channels, num_classes),
+    )
+
+
 MVP_MODEL_BUILDERS = {
     "resnet50": build_resnet50,
     "mobilenet_v2": build_mobilenet_v2,
