@@ -87,11 +87,23 @@ def quantize(delta: np.ndarray, bits: int = 16) -> np.ndarray:
     return np.mod(quantized, P_MASK)
 
 
+def center_mod_p_mask(q: np.ndarray) -> np.ndarray:
+    """Un-wrap a Z_{P_MASK}-reduced integer array back to the signed
+    representation it had before `np.mod(_, P_MASK)` was applied --
+    e.g. `quantize()`'s own output, or `_secret_q`. Needed anywhere a
+    quantized-but-not-yet-masked value's TRUE magnitude matters (norm
+    bounding, dequantization): `np.mod` wraps every negative entry to
+    a value near P_MASK, so a naive norm over the wrapped array is
+    dominated by those near-P_MASK entries regardless of how small
+    the real values are -- this undoes exactly that wrap.
+    """
+    half = P_MASK // 2
+    return np.where(q > half, q - P_MASK, q)
+
+
 def dequantize(q: np.ndarray, bits: int = 16) -> np.ndarray:
     scale = 2 ** bits
-    # map back from [0, P_MASK) to a signed range before descaling
-    half = P_MASK // 2
-    signed = np.where(q > half, q - P_MASK, q)
+    signed = center_mod_p_mask(q)
     return signed.astype(np.float64) / scale
 
 
@@ -213,9 +225,43 @@ def round_step_phase2(
     rho_e: bytes,
     vrf_alpha: bytes,
 ) -> ClientSubmissionPhase2:
-    """Steps 8-10, run AFTER the server reveals sigma_t."""
+    """Steps 8-10, run AFTER the server reveals sigma_t.
+
+    Sketches the SIGNED, centered form of `phase1._secret_q` (the
+    quantized, PRE-masking delta -- ARCHITECTURE.md line 289's
+    "correctly quantized vector" that `R_norm` bounds), not
+    `_secret_masked_vector`. Two separate reasons the masked vector
+    is wrong here:
+
+    1. `_secret_masked_vector` is `q_k + m_k mod P_MASK`: the mask
+       `m_k` is drawn to look uniform over Z_{P_MASK} (so individual
+       masked values reveal nothing -- only the SUM across all
+       clients cancels it). Its norm is dominated by the mask term
+       (~sqrt(d)*P_MASK/2) regardless of how small or large the real
+       update is, which would make V3 incapable of distinguishing an
+       honest update from a model-replacement attack (A1, line 499)
+       -- both get swamped by the same mask-scale noise.
+    2. `_secret_q` ALONE isn't enough either: `quantize()` already
+       reduces into Z_{P_MASK} via `np.mod`, so any coordinate with a
+       negative delta wraps to a value near P_MASK -- same
+       representation problem as (1), just without the extra mask on
+       top. `center_mod_p_mask` undoes exactly that wrap (the same
+       operation `dequantize` already needed), giving back the true
+       signed, small-magnitude quantized value the norm bound is
+       actually meant to see.
+
+    Together these explain a real symptom hit live on Colab: every
+    client, every round, rejected as "V3_norm_bound_exceeded"
+    regardless of model, because whatever got sketched was always
+    far outside any B_t sized for real gradient magnitudes. This also
+    makes `update_threshold_ema`'s round-to-round B_t adaptation
+    (which assumes norms shrink as training converges) track a
+    quantity that actually does shrink, instead of P_MASK-scale
+    wrap-noise that wouldn't.
+    """
     sketch = SketchProjector(seed=sketch_seed, m=sketch_dim, d=ctx.model_dim)
-    y_k = sketch.project(phase1._secret_masked_vector.astype(np.float64))
+    signed_q = center_mod_p_mask(phase1._secret_q)
+    y_k = sketch.project(signed_q.astype(np.float64))
 
     norm_estimate = int(np.linalg.norm(y_k))
     n_bits = max(8, int(np.ceil(np.log2(max(B_t * 4, 2)))))
