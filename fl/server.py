@@ -18,7 +18,8 @@ import numpy as np
 from crypto.clsag import verify_with_scopes, same_round_same_signer
 from crypto.rangeproof import verify_range, verify_recomposition
 from crypto.r_cons import verify_identity_binding
-from crypto.pedersen import commit_sum, verify_opening, Commitment
+from crypto.pedersen import commit_sum, verify_opening, commit as pedersen_commit, Commitment
+from crypto.ristretto import Scalar
 from crypto.secagg import aggregate_masked, P_MASK
 from crypto.vector_commit import weighted_digest
 
@@ -58,10 +59,43 @@ def check_V2_no_double_submission(submission, seen_key_images_this_round: set) -
     return tag not in seen_key_images_this_round
 
 
-def check_V3_norm_bound(phase2, commitment_point, B_t: float) -> bool:
+def check_V3_norm_bound(phase2, B_t: float) -> bool:
+    """Checks the client's range proof is well-formed AND is bound to
+    the ACTUAL norm of its publicly-sent sketch `phase2.sketch` --
+    not, as an earlier version of this function did, to `c_k`
+    (`submission.commitment_point`). `c_k` is a Pedersen commitment to
+    `weighted_digest(masked, rho_t)` with an independent random
+    blinding (see fl/client.py step 5) -- a different value AND a
+    different blinding than `prove_range`'s (norm_estimate,
+    agg_blinding). Checking recomposition against `c_k` therefore
+    compared two unrelated commitments and could only ever succeed by
+    astronomical coincidence, rejecting every honest client every
+    round (caught via live Colab testing: "0 accepted" for all 5-8
+    clients regardless of model).
+
+    The server independently recomputes the claimed norm from
+    `phase2.sketch` (sent in cleartext in this reference
+    implementation -- crypto/sketch.py and crypto/rangeproof.py are
+    both explicitly flagged elsewhere as correctness references, not
+    a production norm-hiding Bulletproofs-over-vector-commitment
+    construction) and re-derives the SAME commitment the client's
+    `prove_range` call is tied to via `agg_blinding`, so recomposition
+    is a real check again: it fails if the client's range proof does
+    not actually decompose to the sketch's own norm.
+    """
     if not verify_range(phase2.range_proof):
         return False
-    claimed_commitment = Commitment(commitment_point)
+    n_bits = phase2.range_proof.n_bits
+    norm_estimate = int(np.linalg.norm(phase2.sketch))
+    if norm_estimate < 0 or norm_estimate >= (1 << n_bits):
+        # Genuinely outside what this proof can attest to. fl/client.py's
+        # round_step_phase2 clamps its OWN prove_range call to avoid a
+        # crash when norm_estimate >= 2**n_bits; rejecting that case here
+        # (rather than independently re-clamping to match) prevents a
+        # client whose real norm exceeds the provable range from having
+        # it silently capped-and-accepted.
+        return False
+    claimed_commitment = pedersen_commit(Scalar.from_int(norm_estimate), phase2.range_proof_aggregate_blinding)
     return verify_recomposition(phase2.range_proof, claimed_commitment)
 
 
@@ -76,7 +110,7 @@ def verify_submission(submission, phase2, rho_t: bytes, rho_e: bytes, vrf_alpha:
         reasons.append("V1_ring_signature_failed")
     if not check_V2_no_double_submission(submission, seen_key_images_this_round):
         reasons.append("V2_double_submission")
-    if not check_V3_norm_bound(phase2, submission.commitment_point, B_t):
+    if not check_V3_norm_bound(phase2, B_t):
         reasons.append("V3_norm_bound_exceeded")
     if not check_V4_consistency(phase2, rho_t, rho_e, vrf_alpha, submission.commitment_point):
         reasons.append("V4_consistency_failed")
