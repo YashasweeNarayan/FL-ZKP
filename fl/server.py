@@ -139,7 +139,7 @@ class RoundOutcome:
     abort_reason: str = ""
     v5_check_passed: bool = None
     sum_commitment_check: "object" = None
-    published_sum_value: int = None       # weighted_digest(aggregate_masked_vector, rho_t) -- what the server publishes for V5
+    published_sum_value: int = None       # exact sum of each accepted client's own weighted_digest(masked_k, rho_t) -- what the server publishes for V5; may exceed P_MASK (see run_round's comment on why it must not be re-reduced mod P_MASK)
     published_sum_blinding: "object" = None  # Scalar: sum of revealed r_k's for the accepted set
     rejected_reasons: dict = field(default_factory=dict)  # client_index -> list[str], e.g. ["V3_norm_bound_exceeded"]
 
@@ -192,17 +192,33 @@ def run_round(
     # published aggregate-opening. `expected` is the LHS (product of the
     # publicly posted per-client commitments); `published_sum_value` /
     # `published_sum_blinding` are what the server PUBLISHES as the
-    # claimed opening of that product -- using the identical
-    # weighted_digest(..., seed=rho_t) scheme each client used in
-    # client.py's step 5, so the two sides are computed the same way
-    # (see crypto/vector_commit.py for why a plain coordinate sum isn't
-    # sound here, and why this one still is). Independent verification
-    # (not trusting that the server computed this honestly) is
+    # claimed opening of that product. Independent verification (not
+    # trusting that the server computed this honestly) is
     # verifier/audit.py's independent_v5_check, deliberately a separate
     # implementation -- see that module's docstring.
+    #
+    # published_sum_value is the EXACT sum of each accepted client's
+    # own digest (sum(weighted_digest(masked_k, rho_t) for k in A)),
+    # NOT weighted_digest(aggregate_masked_vector, rho_t) -- those two
+    # are only CONGRUENT mod P_MASK, not equal as integers, and
+    # Pedersen's binding property needs exact equality. Pi(c_k) commits
+    # to the EC-group sum of each client's digest d_k as a plain
+    # integer (EC/Pedersen addition never reduces mod P_MASK, only mod
+    # the much larger group order L, and N*P_MASK << L for any
+    # realistic client count, so no wraparound happens there). But
+    # `aggregate_masked_vector` is already reduced mod P_MASK
+    # COORDINATE-WISE by `aggregate_masked` -- required for SecAgg's
+    # masks to cancel correctly -- so digesting it afterward reduces
+    # the *weighted sum of already-wrapped coordinates*, which differs
+    # from the exact sum(d_k) by a multiple of P_MASK as soon as more
+    # than one client's raw digest would have summed past P_MASK (near
+    # certain with >=2 clients, each d_k ~uniform over [0, P_MASK)).
+    # Caught live on Colab: V3 finally passed (8/8 accepted) once the
+    # earlier norm-bound bugs were fixed, only for V5 to fail every
+    # round with exactly this "does not open to Pi(c_k)" mismatch.
     commitments = [Commitment(sub.commitment_point) for _, sub in accepted]
     expected = commit_sum(commitments)
-    published_sum_value = weighted_digest(aggregate_masked_vector, seed=rho_t)
+    published_sum_value = sum(weighted_digest(sub._secret_masked_vector, seed=rho_t) for _, sub in accepted)
     published_sum_blinding = None
     for _, sub in accepted:
         r_k = sub._secret_blinding

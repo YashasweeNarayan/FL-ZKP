@@ -51,10 +51,17 @@ def independent_v5_check(
     commitments = [Commitment(p) for p in published_commitments]
     product = commit_sum(commitments)
 
-    # published_sum_value is already a well-defined small int (< P_MASK
-    # ~ 2^61) from crypto/vector_commit.py's weighted_digest -- no
-    # truncation needed here; Scalar.from_int reduces mod L correctly
-    # for any non-negative int regardless of size.
+    # published_sum_value is the EXACT sum of each accepted client's own
+    # weighted_digest(masked_k, rho_t) (fl/server.py's run_round) -- it
+    # can exceed P_MASK (~2^61) once more than one client's digest is
+    # summed, and must NOT be reduced mod P_MASK here: Pi(c_k) commits
+    # to that same unreduced sum (EC/Pedersen addition only reduces mod
+    # the much larger group order L), so re-reducing mod P_MASK before
+    # this comparison would reintroduce the exact mismatch this
+    # function exists to catch. Scalar.from_int reduces mod L
+    # correctly for any non-negative int regardless of size, and
+    # N*P_MASK << L for any realistic client count, so no wraparound
+    # happens there.
     claimed_value_scalar = Scalar.from_int(published_sum_value)
     matches = verify_opening(product, claimed_value_scalar, published_sum_blinding)
 
