@@ -27,6 +27,7 @@ from crypto.clsag import sign as clsag_sign, h_p as clsag_h_p
 from crypto.sketch import SketchProjector  # correctness-reference; see sketch.py's PERFORMANCE NOTE
 from crypto.rangeproof import prove_range
 from crypto.r_cons import prove_identity_binding
+from crypto.vector_commit import weighted_digest
 
 
 @dataclass
@@ -163,17 +164,19 @@ def round_step_phase1(
         masked = (masked + pairwise_mask(secret, rho_t, ctx.model_dim, sign)) % P_MASK
     masked = (masked + self_mask(ctx.self_mask_secret_int.to_bytes(32, "little"), rho_t, ctx.model_dim)) % P_MASK
 
-    # Step 5: Pedersen-commit the masked vector. NOTE: a real
-    # deployment commits a compressed/hashed representative of `masked`
-    # (d can be tens of millions of int64 entries), not one scalar
-    # commitment per coordinate -- the exact vector-commitment scheme
-    # (e.g. a Pedersen vector commitment or a per-chunk commitment tree)
-    # is an implementation detail of fl/server.py's V5 check, finalized
-    # alongside it; here we commit a scalar digest placeholder (the sum
-    # mod L) so the WIRING (commit -> escrow -> sign -> verify order)
-    # is exercised even though the real per-coordinate commitment
-    # scheme is a Colab/Task-10-followup concern. See STATUS.md.
-    masked_digest = Scalar.from_int(int(np.sum(masked)) % (2**252))
+    # Step 5: Pedersen-commit the masked vector, via a single scalar
+    # DIGEST rather than one commitment per coordinate (d can be tens
+    # of millions of int64 entries) -- see crypto/vector_commit.py for
+    # why a plain coordinate-sum digest is unsound and how the
+    # randomized-weight fix restores a real binding property (sound
+    # under the Schwartz-Zippel argument, and still homomorphic the
+    # same way a plain sum would be, which is what fl/server.py's V5
+    # check needs). Weights are derived from rho_t, which is already
+    # public to every client at the START of this round -- before the
+    # server has aggregated anything -- so this is sound against the
+    # actual V5 threat model (a server misreporting the aggregate),
+    # not merely a notation change from the old placeholder.
+    masked_digest = Scalar.from_int(weighted_digest(masked, seed=rho_t))
     blinding = Scalar.random()
     commitment = pedersen_commit(masked_digest, blinding)
 

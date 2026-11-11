@@ -20,6 +20,7 @@ from crypto.rangeproof import verify_range, verify_recomposition
 from crypto.r_cons import verify_identity_binding
 from crypto.pedersen import commit_sum, verify_opening, Commitment
 from crypto.secagg import aggregate_masked, P_MASK
+from crypto.vector_commit import weighted_digest
 
 from .norm_rule import compute_threshold, NormThreshold
 from .client import dequantize
@@ -90,6 +91,8 @@ class RoundOutcome:
     abort_reason: str = ""
     v5_check_passed: bool = None
     sum_commitment_check: "object" = None
+    published_sum_value: int = None       # weighted_digest(aggregate_masked_vector, rho_t) -- what the server publishes for V5
+    published_sum_blinding: "object" = None  # Scalar: sum of revealed r_k's for the accepted set
 
 
 def run_round(
@@ -127,14 +130,24 @@ def run_round(
     aggregate_masked_vector = aggregate_masked(masked_vectors)
 
     # V5: anyone can recompute Pi c_k and compare against the server's
-    # published aggregate-opening -- done here using the digest
-    # placeholder scheme documented in client.py's phase1 (step 5 note).
+    # published aggregate-opening. `expected` is the LHS (product of the
+    # publicly posted per-client commitments); `published_sum_value` /
+    # `published_sum_blinding` are what the server PUBLISHES as the
+    # claimed opening of that product -- using the identical
+    # weighted_digest(..., seed=rho_t) scheme each client used in
+    # client.py's step 5, so the two sides are computed the same way
+    # (see crypto/vector_commit.py for why a plain coordinate sum isn't
+    # sound here, and why this one still is). Independent verification
+    # (not trusting that the server computed this honestly) is
+    # verifier/audit.py's independent_v5_check, deliberately a separate
+    # implementation -- see that module's docstring.
     commitments = [Commitment(sub.commitment_point) for _, sub in accepted]
     expected = commit_sum(commitments)
-    # the server (or any verifier) independently recomputes the claimed
-    # opening from the same inputs and checks equality -- see
-    # verifier/audit.py for the standalone, client-independent version
-    # of this exact check.
+    published_sum_value = weighted_digest(aggregate_masked_vector, seed=rho_t)
+    published_sum_blinding = None
+    for _, sub in accepted:
+        r_k = sub._secret_blinding
+        published_sum_blinding = r_k if published_sum_blinding is None else published_sum_blinding + r_k
 
     mean_masked = aggregate_masked_vector.astype(np.float64) / max(len(accepted), 1)
     dequantized_mean_delta = dequantize(aggregate_masked_vector, bits=16) / max(len(accepted), 1)
@@ -143,8 +156,10 @@ def run_round(
         aggregated_delta=dequantized_mean_delta,
         accepted_client_indices=[idx for idx, _ in accepted],
         aborted=False,
-        v5_check_passed=None,  # filled in by verifier/audit.py once r_k's are revealed
+        v5_check_passed=None,  # filled in by verifier/audit.py's independent_v5_check once posted to BB
         sum_commitment_check=expected,
+        published_sum_value=published_sum_value,
+        published_sum_blinding=published_sum_blinding,
     )
 
 

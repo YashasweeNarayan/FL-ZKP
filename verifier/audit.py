@@ -51,7 +51,11 @@ def independent_v5_check(
     commitments = [Commitment(p) for p in published_commitments]
     product = commit_sum(commitments)
 
-    claimed_value_scalar = Scalar.from_int(published_sum_value % (2**252))
+    # published_sum_value is already a well-defined small int (< P_MASK
+    # ~ 2^61) from crypto/vector_commit.py's weighted_digest -- no
+    # truncation needed here; Scalar.from_int reduces mod L correctly
+    # for any non-negative int regardless of size.
+    claimed_value_scalar = Scalar.from_int(published_sum_value)
     matches = verify_opening(product, claimed_value_scalar, published_sum_blinding)
 
     return AuditReport(
