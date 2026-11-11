@@ -111,7 +111,21 @@ def verify_submission(submission, phase2, rho_t: bytes, rho_e: bytes, vrf_alpha:
     if not check_V2_no_double_submission(submission, seen_key_images_this_round):
         reasons.append("V2_double_submission")
     if not check_V3_norm_bound(phase2, B_t):
-        reasons.append("V3_norm_bound_exceeded")
+        # Diagnostic detail, not just the bare check name -- computed
+        # independently here (cheap, read-only) purely for the
+        # rejected_reasons message, so a future "every client fails
+        # V3" report is immediately diagnosable instead of requiring
+        # another round of guessing: which of range-well-formed /
+        # out-of-provable-range / recomposition-mismatch it was, and
+        # the actual numbers involved.
+        range_ok = verify_range(phase2.range_proof)
+        n_bits = phase2.range_proof.n_bits
+        norm_estimate = int(np.linalg.norm(phase2.sketch))
+        reasons.append(
+            f"V3_norm_bound_exceeded (range_proof_valid={range_ok}, "
+            f"norm_estimate={norm_estimate}, B_t={B_t:.3f}, n_bits={n_bits}, "
+            f"provable_cap={(1 << n_bits) - 1})"
+        )
     if not check_V4_consistency(phase2, rho_t, rho_e, vrf_alpha, submission.commitment_point):
         reasons.append("V4_consistency_failed")
     return VerificationResult(accepted=(len(reasons) == 0), reasons_rejected=reasons)
