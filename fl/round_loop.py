@@ -177,7 +177,12 @@ def run_training_loop(
         if outcome.aborted:
             if verbose:
                 print(f"round {t_round}: ABORTED -- {outcome.abort_reason}")
-            history.append({"round": t_round, "aborted": True, "reason": outcome.abort_reason})
+                for client_idx, reasons in outcome.rejected_reasons.items():
+                    print(f"  client {client_idx} rejected: {reasons}")
+            history.append({
+                "round": t_round, "aborted": True, "reason": outcome.abort_reason,
+                "rejected_reasons": outcome.rejected_reasons,
+            })
             continue
 
         accepted_commitments = [phase1_by_client[i].commitment_point for i in outcome.accepted_client_indices]

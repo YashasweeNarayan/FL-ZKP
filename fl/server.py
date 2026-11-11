@@ -93,6 +93,7 @@ class RoundOutcome:
     sum_commitment_check: "object" = None
     published_sum_value: int = None       # weighted_digest(aggregate_masked_vector, rho_t) -- what the server publishes for V5
     published_sum_blinding: "object" = None  # Scalar: sum of revealed r_k's for the accepted set
+    rejected_reasons: dict = field(default_factory=dict)  # client_index -> list[str], e.g. ["V3_norm_bound_exceeded"]
 
 
 def run_round(
@@ -107,18 +108,28 @@ def run_round(
 ) -> RoundOutcome:
     seen_key_images: set = set()
     accepted = []
+    rejected_reasons = {}
     for client_index, submission in submissions:
         phase2 = phase2s[client_index]
         result = verify_submission(submission, phase2, rho_t, rho_e, vrf_alpha, B_t, seen_key_images)
         if result.accepted:
             seen_key_images.add(submission.key_image_round.b)
             accepted.append((client_index, submission))
+        else:
+            rejected_reasons[client_index] = result.reasons_rejected
         # rejected submissions are logged (transcript, verdict) to BB in
         # the real pipeline -- audit logging is verifier/audit.py's job,
         # not re-implemented here to avoid duplicating that concern.
+        # rejected_reasons above is the minimal in-memory version of
+        # that, so a round loop's caller can actually see WHY a
+        # submission failed instead of just a bare accepted/rejected count.
 
     if len(accepted) < K_MIN:
-        return RoundOutcome(aborted=True, abort_reason=f"only {len(accepted)} accepted, k_min={K_MIN}")
+        return RoundOutcome(
+            aborted=True,
+            abort_reason=f"only {len(accepted)} accepted, k_min={K_MIN}",
+            rejected_reasons=rejected_reasons,
+        )
 
     # Clients reveal r_k only AFTER acceptance (see client.py's
     # reveal_blinding_after_acceptance) -- this function assumes the
@@ -160,6 +171,7 @@ def run_round(
         sum_commitment_check=expected,
         published_sum_value=published_sum_value,
         published_sum_blinding=published_sum_blinding,
+        rejected_reasons=rejected_reasons,
     )
 
 
