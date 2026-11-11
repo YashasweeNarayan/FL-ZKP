@@ -384,6 +384,7 @@ print("global_val size:", len(case1_data['global_val'].labels))
 
 ("code", """from crypto.ristretto import Scalar, scalar_mul_base
 from crypto.dkg import generate_contribution, finalize, pk_share_for
+from fl.round_loop import build_x25519_keys, precompute_pairwise_secrets
 
 n_clients = CFG['protocol']['n_clients']
 t = CFG['protocol']['threshold']
@@ -392,10 +393,17 @@ n_c = CFG['protocol']['n_key_holders']
 client_sks = [Scalar.random() for _ in range(n_clients)]
 ring = [scalar_mul_base(sk) for sk in client_sks]
 
+# Separate X25519 keypairs for secure-aggregation's pairwise masking --
+# a DIFFERENT curve from the ristretto255 signing keys above (see
+# crypto/secagg.py's own note). Long-term, computed once here.
+x25519_sks, x25519_pks = build_x25519_keys(n_clients)
+pairwise_secrets = precompute_pairwise_secrets(x25519_sks, x25519_pks)
+
 key_holder_ids = list(range(1, n_c + 1))
 dkg_contributions = [generate_contribution(h, t, key_holder_ids) for h in key_holder_ids]
 PK_trace, key_holder_shares = finalize(dkg_contributions, key_holder_ids)
 print(f"ring of {len(ring)} published, PK_trace established among {n_c} key holders (t={t})")
+print(f"{n_clients} X25519 keypairs + {n_clients*(n_clients-1)} pairwise secrets precomputed")
 """),
 
 ("md", "## Build models (2 backbones, from scratch, GroupNorm)"),
@@ -409,85 +417,92 @@ for name, w in flat_weights.items():
     print(name, "param count:", w.numel())
 """),
 
-("md", "## Round loop (per model) -- orchestrates fl/client.py + fl/server.py over configs/mvp_3day.yaml's rounds_per_run"),
+("md", """## Round loop (per model) -- orchestrates fl/client.py + fl/server.py over configs/mvp_3day.yaml's rounds_per_run
 
-("code", """import numpy as np
-from fl.client import ClientKeys, ClientRoundContext, round_step_phase1, round_step_phase2, reveal_blinding_after_acceptance
-from fl.server import derive_B_t, run_round, apply_update, K_MIN
-from fl.norm_rule import bootstrap_from_server_root
-from fl.evidence import EvidenceAccumulator, calibrate_theta
-from crypto.sketch import seed_commitment
-
-ROUNDS = CFG['mvp_scope']['rounds_per_run']
-sampling_rate = CFG['protocol']['sampling_rate']
-sketch_m = CFG['sketch']['m']
-
-for model_name in CFG['mvp_scope']['models']:
-    print(f"\\n==== {model_name} ====")
-    model = models[model_name]
-    w_t, model_shapes = flatten_state_dict(model)
-    dim = w_t.numel()
-
-    # round-0 bootstrap for B_t from server_root (placeholder norms --
-    # real pipeline computes these from the root set's own forward/backward pass)
-    root_norms = np.random.default_rng(CFG['seed']).normal(5.0, 0.5, size=100)
-    threshold = bootstrap_from_server_root(root_norms, k=CFG['norm_rule']['k'])
-
-    accumulator = EvidenceAccumulator(epoch=0)
-
-    for t_round in range(ROUNDS):
-        rho_t = f"round-{t_round}".encode()
-        rho_e = f"epoch-{t_round // CFG['protocol']['epoch_rounds']}".encode()
-        vrf_alpha = rho_t
-
-        phase1_by_client = {}
-        for client_idx in range(n_clients):
-            ctx = ClientRoundContext(
-                keys=ClientKeys(sk=client_sks[client_idx], pk=ring[client_idx], index=client_idx),
-                ring=ring,
-                pairwise_secrets={},  # TODO: real ECDH pairwise secrets -- see secagg.py Gate-1 cell
-                self_mask_secret_int=int.from_bytes(__import__('os').urandom(32), 'little'),
-                model_dim=dim,
-            )
-            # NOTE: this loop still needs real local_data wiring per
-            # client (case1_data['client_train'][client_idx]) passed
-            # into round_step_phase1 -- left as the next notebook edit
-            # once Gate-1 is confirmed clean on your Colab run, so this
-            # cell's structure can be reviewed before the full (slow)
-            # 45-round x 50-client x 2-model loop is launched.
-            pass
-
-        print(f"round {t_round}: scaffold executed (wire in real per-client training+submission before the real run)")
-        break  # remove this break once the per-client wiring above is completed
+**Read this before running the next cell.** `crypto/sketch.py`'s
+`SketchProjector` is a CPU/NumPy CORRECTNESS reference, not a
+performance one (see its own PERFORMANCE NOTE): measured at ~16
+min/client/round extrapolated to ResNet-50's real d~23.5M. The full
+45-round x 50-client x 2-model run would take DAYS with this
+reference implementation. **Start with the smoke test below** (a
+handful of rounds/clients) to validate the wiring, not the full
+`CFG['mvp_scope']['rounds_per_run']` sweep -- see STATUS.md TODO #3
+for the GPU/torch reimplementation this blocks on.
 """),
 
-("md", """## Known gap, flagged honestly
+("code", """import numpy as np
+from fl.round_loop import run_training_loop
 
-The round-loop cell above is a **scaffold**, not a finished run: it
-sets up keys, models, and the committee, then stops before the actual
-per-client train -> mask -> commit -> sign -> sketch -> prove sequence
-(fl/client.py's two phase functions) because that wiring needs the
-real per-client pairwise ECDH secrets (50x49 pairs) and real local
-data batches threaded through, which is mechanical but long, and is
-exactly the kind of step that benefits from being run and debugged
-interactively on Colab rather than finished blind in this sandbox.
-Finish the loop by:
+# SMOKE TEST first -- a handful of rounds over a SUBSET of clients,
+# to validate the protocol wiring (V1-V5, the independent V5 audit,
+# B_t evolution) runs end to end before committing to the full,
+# much slower, MVP-scale sweep. Bump these up once this passes clean.
+SMOKE_ROUNDS = 2
+SMOKE_CLIENTS = 5
 
-1. Deriving `pairwise_secrets` for each client via
-   `crypto.secagg.derive_pairwise_secret_via_x25519` against every
-   other client's X25519 public key (generate one `nacl.public.PrivateKey`
-   per client alongside its ristretto255 signing key).
-2. Calling `fl.client.round_step_phase1(...)` with
-   `case1_data['client_train'][client_idx]` as `local_data`.
-3. After the server reveals `sigma_t` (use `crypto.sketch.seed_commitment`
-   / reveal pattern), calling `round_step_phase2(...)`.
-4. Collecting all phase1+phase2 pairs and calling `fl.server.run_round(...)`.
-5. On acceptance, calling `reveal_blinding_after_acceptance` and running
-   `verifier/audit.py`'s `independent_v5_check`.
-6. Applying the update with `fl.server.apply_update` and repeating.
+results = {}
+for model_name in CFG['mvp_scope']['models']:
+    print(f"\\n==== {model_name} (smoke test: {SMOKE_ROUNDS} rounds, {SMOKE_CLIENTS} clients) ====")
+    model = models[model_name]
+    dim = flat_weights[model_name].numel()
 
-This is explicitly logged in `STATUS.md` as the top item to finish on
-Colab, not silently left out.
+    # round-0 bootstrap for B_t from server_root. NOTE: still a
+    # placeholder (see fl/round_loop.py's own docstring) -- real norms
+    # would come from the server running its own pseudo-client
+    # train+sketch passes over server_root data, which hits the same
+    # sketch performance wall noted above, so it's deferred alongside it.
+    root_norms = np.random.default_rng(CFG['seed']).normal(5.0, 0.5, size=100)
+
+    final_w_t, history = run_training_loop(
+        model=model,
+        model_dim=dim,
+        client_datasets=case1_data['client_train'][:SMOKE_CLIENTS],
+        ring=ring[:SMOKE_CLIENTS],
+        client_sks=client_sks[:SMOKE_CLIENTS],
+        pairwise_secrets={i: {j: pairwise_secrets[i][j] for j in range(SMOKE_CLIENTS) if j != i} for i in range(SMOKE_CLIENTS)},
+        pk_trace=PK_trace,
+        server_root_norms=root_norms,
+        CFG=CFG,
+        rounds=SMOKE_ROUNDS,
+    )
+    results[model_name] = {'final_w_t': final_w_t, 'history': history}
+"""),
+
+("md", """## Known gaps, flagged honestly
+
+Resolved in this version (was a scaffold that stopped before any real
+per-client wiring; now a complete `fl/round_loop.py::run_training_loop`
+covering the full VRF-sample -> train -> mask -> commit -> escrow ->
+sign -> sketch -> range-proof -> R_cons -> V1-V5 -> independent V5
+audit -> apply_update -> B_t-EMA-update sequence, shared between CASE1
+and CASE2 so they can't drift apart):
+
+- Real per-client pairwise ECDH secrets (`fl.round_loop.build_x25519_keys`
+  + `precompute_pairwise_secrets`), not an empty placeholder dict.
+- Real local data threaded through (`case1_data['client_train'][client_idx]`).
+- The sketch-seed reveal ordering (`sigma_t` picked and committed to
+  via `seed_commitment` BEFORE phase 1, "revealed" for phase 2 after).
+- V1-V5 verification, the INDEPENDENT V5 re-check
+  (`verifier/audit.py::independent_v5_check`, deliberately a separate
+  implementation from `fl/server.py`'s own computation), and
+  `apply_update`.
+- `B_t` evolving round to round via `fl/norm_rule.py`'s EMA update,
+  not recomputed from scratch each time.
+
+Still open, not silently hidden:
+
+1. **The sketch performance wall above.** Run the smoke test first;
+   do not launch the full MVP-scale sweep before
+   `crypto/sketch.py`'s GPU/torch reimplementation (STATUS.md TODO #3).
+2. **`server_root_norms` is still a placeholder** (see the round-loop
+   cell's own comment) -- affects only round 0's starting `B_t`; every
+   later round's `B_t` comes from real submissions' real sketch norms.
+3. **Evidence accumulation / calibration (`fl/evidence.py`) is not
+   wired into the round loop yet** -- it needs per-client loss deltas
+   that `fl/client.py::local_train_delta` doesn't currently return, and
+   a per-round median-reference vector across all submissions. This is
+   its own piece of wiring, separate from the V1-V5/aggregation loop
+   above, and is tracked as a follow-up, not assumed done.
 """),
 ]
 
@@ -530,20 +545,72 @@ print("unseen_test writers (headline metric source):", len(case2_data['split'].u
 ("code", """from fl.models import build_model, flatten_state_dict
 
 models = {name: build_model(name, num_classes=62, in_channels=1) for name in CFG['mvp_scope']['models']}
+flat_weights = {}
 for name, m in models.items():
     flat, _ = flatten_state_dict(m)
+    flat_weights[name] = flat
     print(name, "param count:", flat.numel())
+"""),
+
+("md", "## Build the ring (one keypair per client) and the trace committee"),
+
+("code", """from crypto.ristretto import Scalar, scalar_mul_base
+from crypto.dkg import generate_contribution, finalize, pk_share_for
+from fl.round_loop import build_x25519_keys, precompute_pairwise_secrets
+
+n_clients = len(case2_data['client_train'])
+t = CFG['protocol']['threshold']
+n_c = CFG['protocol']['n_key_holders']
+
+client_sks = [Scalar.random() for _ in range(n_clients)]
+ring = [scalar_mul_base(sk) for sk in client_sks]
+
+x25519_sks, x25519_pks = build_x25519_keys(n_clients)
+pairwise_secrets = precompute_pairwise_secrets(x25519_sks, x25519_pks)
+
+key_holder_ids = list(range(1, n_c + 1))
+dkg_contributions = [generate_contribution(h, t, key_holder_ids) for h in key_holder_ids]
+PK_trace, key_holder_shares = finalize(dkg_contributions, key_holder_ids)
+print(f"ring of {len(ring)} published, PK_trace established among {n_c} key holders (t={t})")
 """),
 
 ("md", """## Round loop
 
-Identical structure to `CASE1_IID_MNIST.ipynb`'s round loop -- reuse
-that notebook's completed wiring (once finished there) by importing
-the same `fl.client` / `fl.server` calls against
-`case2_data['client_train'][client_idx]` instead of CASE1's MNIST
-client datasets. Not duplicated verbatim here to avoid the two
-notebooks silently drifting out of sync; see CASE1's "Known gap"
-section for the exact steps to wire in.
+Same `fl/round_loop.py::run_training_loop` CASE1 uses (shared, not
+duplicated, specifically so the two notebooks can't drift apart --
+see that module's docstring and CASE1's "Known gaps" cell for the full
+list of what this covers and what's still open, including the sketch
+performance wall: **run the smoke test below before any full-scale
+sweep**).
+"""),
+
+("code", """import numpy as np
+from fl.round_loop import run_training_loop
+
+SMOKE_ROUNDS = 2
+SMOKE_CLIENTS = 5
+
+results = {}
+for model_name in CFG['mvp_scope']['models']:
+    print(f"\\n==== {model_name} (smoke test: {SMOKE_ROUNDS} rounds, {SMOKE_CLIENTS} clients) ====")
+    model = models[model_name]
+    dim = flat_weights[model_name].numel()
+
+    root_norms = np.random.default_rng(CFG['seed']).normal(5.0, 0.5, size=100)
+
+    final_w_t, history = run_training_loop(
+        model=model,
+        model_dim=dim,
+        client_datasets=case2_data['client_train'][:SMOKE_CLIENTS],
+        ring=ring[:SMOKE_CLIENTS],
+        client_sks=client_sks[:SMOKE_CLIENTS],
+        pairwise_secrets={i: {j: pairwise_secrets[i][j] for j in range(SMOKE_CLIENTS) if j != i} for i in range(SMOKE_CLIENTS)},
+        pk_trace=PK_trace,
+        server_root_norms=root_norms,
+        CFG=CFG,
+        rounds=SMOKE_ROUNDS,
+    )
+    results[model_name] = {'final_w_t': final_w_t, 'history': history}
 """),
 
 ("md", "## Evaluation: seen-writer vs. unseen-writer accuracy"),
