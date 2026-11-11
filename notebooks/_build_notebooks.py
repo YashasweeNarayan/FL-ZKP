@@ -438,7 +438,7 @@ from fl.round_loop import run_training_loop
 # B_t evolution) runs end to end before committing to the full,
 # much slower, MVP-scale sweep. Bump these up once this passes clean.
 SMOKE_ROUNDS = 2
-SMOKE_CLIENTS = 5
+SMOKE_CLIENTS = 8  # must be >= K_MIN (8) in fl/server.py or every round aborts regardless of verification outcome
 
 results = {}
 for model_name in CFG['mvp_scope']['models']:
@@ -588,7 +588,7 @@ sweep**).
 from fl.round_loop import run_training_loop
 
 SMOKE_ROUNDS = 2
-SMOKE_CLIENTS = 5
+SMOKE_CLIENTS = 8  # must be >= K_MIN (8) in fl/server.py or every round aborts regardless of verification outcome
 
 results = {}
 for model_name in CFG['mvp_scope']['models']:
