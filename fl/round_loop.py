@@ -288,6 +288,19 @@ def run_training_loop(
         sigma_t = os.urandom(32)
         h_sigma = seed_commitment(sigma_t)
 
+        # Timing instrumentation added 2026-11-12: a real-model
+        # (resnet50) round was taking tens of minutes with no visibility
+        # into WHERE the time went (local training vs. the per-client EC
+        # crypto -- ring signature, Shamir shares, Pedersen commitments,
+        # and a range proof with ~n_bits Sigma-protocol components, all
+        # real elliptic-curve operations, not numpy). Printing per-round
+        # wall time for phase 1 (dominated by local training + most of
+        # the crypto) and phase 2 (sketch + range proof) separately turns
+        # "it's slow" into an actual number to act on -- e.g. whether the
+        # full MVP sweep (45 rounds x 50 clients x 2 models) is hours or
+        # days at this rate, and which half of the pipeline to optimize
+        # first if it needs to be faster.
+        _t_phase1_start = time.time()
         ctx_by_client = {}
         phase1_by_client = {}
         for client_idx in range(n_clients):
@@ -303,19 +316,30 @@ def run_training_loop(
                 ctx, w_t, rho_t, rho_e, vrf_alpha, sampling_rate, sigma_dp,
                 n_clients, client_datasets[client_idx], model, lr, epochs, pk_trace,
             )
+        _t_phase1 = time.time() - _t_phase1_start
 
         # sigma_t "revealed" now that every c_k is committed -- reuse
         # each client's OWN ctx from phase 1 (not a fresh one), since
         # round_step_phase2 needs the SAME ctx.keys.sk for R_cons.
+        _t_phase2_start = time.time()
         phase2_by_client = {}
         for client_idx in range(n_clients):
             phase2_by_client[client_idx] = round_step_phase2(
                 ctx_by_client[client_idx], phase1_by_client[client_idx],
                 sigma_t, sketch_m, threshold.B_t, rho_t, rho_e, vrf_alpha,
             )
+        _t_phase2 = time.time() - _t_phase2_start
 
+        _t_verify_start = time.time()
         submissions = [(i, phase1_by_client[i]) for i in range(n_clients)]
         outcome = run_round(submissions, phase2_by_client, rho_t, rho_e, vrf_alpha, threshold.B_t, n_clients, model_dim)
+        _t_verify = time.time() - _t_verify_start
+
+        if verbose:
+            print(f"  round {t_round} timing: phase1(train+most-crypto)={_t_phase1:.1f}s, "
+                  f"phase2(sketch+rangeproof)={_t_phase2:.1f}s, verify={_t_verify:.1f}s, "
+                  f"total={_t_phase1 + _t_phase2 + _t_verify:.1f}s "
+                  f"(n_clients={n_clients}, ~{(_t_phase1 + _t_phase2 + _t_verify) / n_clients:.2f}s/client)")
 
         if outcome.aborted:
             if verbose:
