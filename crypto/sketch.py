@@ -24,6 +24,51 @@ def seed_commitment(seed: bytes) -> bytes:
     return hashlib.sha256(seed).digest()
 
 
+# ---------------------------------------------------------------------------
+# Exact INTEGER sketch (FIX.md F7b).
+#
+# The float sketch above is enough to *estimate* a norm. The F7 norm
+# proof needs more: the client commits to its sketch y = S q, and the
+# verifier later checks that the committed sketches add up to the sketch
+# of the aggregate, sum_k y_k == S (sum_k q_k). That is an equation, not
+# an estimate, so S q has to be computed exactly, over the integers,
+# with the unscaled sign matrix S in {-1, 0, +1}^(m x d), and every
+# party has to derive the SAME S.
+#
+# Two consequences for how S is generated:
+#   * the columns are generated in fixed blocks of INT_SKETCH_BLOCK,
+#     each seeded from its own start offset. The block width is a
+#     constant, NOT derived from device memory as the float projector's
+#     chunk is: there, two GPUs with different memory split the matrix
+#     at different places and produce different matrices from one seed.
+#   * nothing may silently change the block layout (the float path's
+#     out-of-memory retry at a quarter chunk does exactly that).
+#
+# The norm it estimates: E ||S q||^2 = m * density * ||q||^2, so
+# ||q|| ~ sqrt(||S q||^2 / (m * density)) -- `int_sketch_norm` below.
+# ---------------------------------------------------------------------------
+
+INT_SKETCH_BLOCK = 16384   # columns per independently seeded block. FIXED: part of the definition of S.
+_LIMB_BITS = 8             # torch path: 16384 * 255 < 2^24, so float32 sums of one block are exact
+
+
+def _int_block_seed(seed: bytes, start: int) -> int:
+    import hashlib
+    h = hashlib.sha256(b"janus-int-sketch:" + seed + start.to_bytes(8, "little")).digest()
+    return int.from_bytes(h[:8], "little")
+
+
+def int_sketch_norm(norm_sq: int, m: int, density: float = 1.0 / 3.0) -> float:
+    """||q||_2 estimate from v = ||S q||_2^2 (an exact integer)."""
+    return float(np.sqrt(norm_sq / (m * density)))
+
+
+def int_sketch_norm_sq_bound(B: float, m: int, density: float = 1.0 / 3.0) -> int:
+    """Largest integer v with int_sketch_norm(v) <= B, so the server's
+    acceptance test is an exact integer comparison on the public v."""
+    return int(np.floor(B * B * m * density))
+
+
 def make_sketch_matrix(seed: bytes, m: int, d: int, density: float = 1.0 / 3.0) -> "ScipyOrDenseSketch":
     """Sparse Achlioptas-style +-1/sqrt(m) projection, seeded deterministically
     so every party (prover, verifier, auditor) derives the identical matrix
@@ -99,6 +144,50 @@ class SketchProjector:
             signs[u > 1.0 - self.density / 2] = 1.0
             out += signs @ q32[start:end]
         return out * self.scale
+
+    def _int_signs(self, start: int, width: int) -> np.ndarray:
+        """Block `start` of the integer sign matrix, shape (m, width),
+        float64 entries in {-1, 0, +1}."""
+        rng = np.random.default_rng(_int_block_seed(self.seed, start))
+        u = rng.random(size=(self.m, width), dtype=np.float32)
+        signs = np.zeros((self.m, width), dtype=np.float64)
+        signs[u < self.density / 2] = -1.0
+        signs[u > 1.0 - self.density / 2] = 1.0
+        return signs
+
+    def project_int_batch(self, qs) -> np.ndarray:
+        """EXACT integer sketch (FIX.md F7b): rows of `qs` (int64, signed
+        and centered -- NOT reduced mod P_MASK) -> S q as int64, shape
+        (n, m). Uses the unscaled sign matrix and fixed blocks, see the
+        note above INT_SKETCH_BLOCK.
+
+        float64 BLAS is used for speed and is exact here: one block's
+        partial sums are bounded by INT_SKETCH_BLOCK * max|q|, which is
+        checked to stay below 2^53.
+        """
+        qs = np.asarray(qs)
+        if qs.ndim == 1:
+            qs = qs[None, :]
+        if qs.shape[1] != self.d:
+            raise ValueError(f"expected d={self.d}, got {qs.shape[1]}")
+        if not np.issubdtype(qs.dtype, np.integer):
+            raise TypeError("project_int_batch needs an integer array (the centered quantized update)")
+        max_abs = int(np.max(np.abs(qs))) if qs.size else 0
+        if INT_SKETCH_BLOCK * max_abs >= 2 ** 53:
+            raise OverflowError(
+                f"max |q| = {max_abs} is too large for an exact float64 block sum; "
+                f"an update this large is far outside any norm bound"
+            )
+        out = np.zeros((qs.shape[0], self.m), dtype=np.int64)
+        for start in range(0, self.d, INT_SKETCH_BLOCK):
+            end = min(start + INT_SKETCH_BLOCK, self.d)
+            signs = self._int_signs(start, end - start)
+            part = qs[:, start:end].astype(np.float64) @ signs.T
+            out += np.rint(part).astype(np.int64)
+        return out
+
+    def project_int(self, q) -> np.ndarray:
+        return self.project_int_batch(np.asarray(q)[None, :])[0]
 
     def project_batch(self, qs: list, chunk: int = 4_000) -> list:
         """Projects several vectors under this SAME seed in one pass
@@ -379,3 +468,76 @@ class TorchSketchProjector:
             signs[u > 1.0 - self.density / 2] = 1.0
             out += qs_t[:, start:end] @ signs.T  # (n, width) @ (width, m) -> (n, m)
         return out * self.scale
+
+    # -- exact integer sketch (FIX.md F7b) ------------------------------
+
+    def project_int_batch(self, qs) -> np.ndarray:
+        """Torch counterpart of `SketchProjector.project_int_batch`:
+        rows of `qs` (int64, signed, centered) -> S q exactly, as a
+        NumPy int64 array of shape (n, m).
+
+        GPU matmul is float32, which is exact only up to 2^24, and
+        float64 is not an option (a T4 runs it at ~1/32 the speed). So
+        each block of q is split into base-256 limbs: one block's limb
+        sum is at most 16384 * 255 < 2^24, hence exact in float32; the
+        limbs are recombined in int64. An update with |q| < 2^23 costs
+        three matmuls per block instead of one.
+
+        The block layout and seeding are fixed (INT_SKETCH_BLOCK), so
+        this matrix does not depend on GPU memory and there is no
+        out-of-memory retry that could change it. It is still generated
+        by torch's RNG, so it is NOT the NumPy projector's matrix, and a
+        CUDA generator does not reproduce a CPU one: every party to one
+        round must use the same projector class on the same device type.
+        That holds in this single-process simulation; a deployment with
+        mixed hardware needs a portable generator (see FIX.md F7,
+        "known limits").
+
+        *** WRITTEN, NOT RUN in the sandbox (no torch). The NumPy method
+        with the same block scheme is tested in tests/test_sketch.py;
+        tests/test_sketch_gpu.py checks this one against exact integer
+        arithmetic on Colab. ***
+        """
+        torch = self.torch
+        qs = np.asarray(qs)
+        if qs.ndim == 1:
+            qs = qs[None, :]
+        if qs.shape[1] != self.d:
+            raise ValueError(f"expected d={self.d}, got {qs.shape[1]}")
+        if not np.issubdtype(qs.dtype, np.integer):
+            raise TypeError("project_int_batch needs an integer array (the centered quantized update)")
+        n = qs.shape[0]
+        max_abs = int(np.max(np.abs(qs))) if qs.size else 0
+        # top limb is signed and must fit in [-128, 127]
+        n_limbs = 1
+        while max_abs >= (1 << (_LIMB_BITS * n_limbs - 1)):
+            n_limbs += 1
+        if _LIMB_BITS * n_limbs > 48:
+            raise OverflowError(
+                f"max |q| = {max_abs} needs {n_limbs} limbs; an update this large "
+                f"is far outside any norm bound"
+            )
+        mask = (1 << _LIMB_BITS) - 1
+        out = torch.zeros((n, self.m), dtype=torch.int64, device=self.device)
+        for start in range(0, self.d, INT_SKETCH_BLOCK):
+            end = min(start + INT_SKETCH_BLOCK, self.d)
+            width = end - start
+            gen = torch.Generator(device=self.device)
+            gen.manual_seed(_int_block_seed(self.seed, start) & ((1 << 63) - 1))
+            u = torch.rand((self.m, width), generator=gen, device=self.device, dtype=torch.float32)
+            signs_t = torch.zeros((width, self.m), dtype=torch.float32, device=self.device)
+            u = u.T
+            signs_t[u < self.density / 2] = -1.0
+            signs_t[u > 1.0 - self.density / 2] = 1.0
+            del u
+            qb = torch.as_tensor(np.ascontiguousarray(qs[:, start:end]), dtype=torch.int64, device=self.device)
+            for limb_idx in range(n_limbs):
+                shifted = qb >> (_LIMB_BITS * limb_idx)          # arithmetic shift: floor division
+                limb = shifted if limb_idx == n_limbs - 1 else (shifted & mask)
+                part = limb.to(torch.float32) @ signs_t           # (n, width) @ (width, m), exact
+                out += torch.round(part).to(torch.int64) << (_LIMB_BITS * limb_idx)
+            del qb, signs_t
+        return out.cpu().numpy()
+
+    def project_int(self, q) -> np.ndarray:
+        return self.project_int_batch(np.asarray(q)[None, :])[0]

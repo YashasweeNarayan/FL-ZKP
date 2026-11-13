@@ -13,6 +13,7 @@ cryptography.
 """
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -25,9 +26,12 @@ from crypto.pedersen import commit as pedersen_commit
 from crypto.elgamal_threshold import encrypt as elgamal_encrypt
 from crypto.clsag import sign as clsag_sign, h_p as clsag_h_p
 from crypto.sketch import TorchSketchProjector  # GPU/torch (STATUS.md TODO #3); SketchProjector (NumPy) is the correctness reference used by tests, not the real training path
-from crypto.rangeproof import prove_range
+from crypto.rangeproof import prove_range, recompose_commitment
 from crypto.r_cons import prove_identity_binding
 from crypto.vector_commit import weighted_digest
+from crypto.norm_proof import (
+    commit_sketch, subset_sum_challenge, wraparound_window, prove_wraparound_binding,
+)
 
 
 @dataclass
@@ -59,7 +63,8 @@ class ClientSubmissionPhase1:
     key_image_round: Point           # I_k^t
     key_image_epoch: Point           # P_k^e
     ring_signature: object           # sigma_k (RingSignature)
-    was_sampled: bool                # b_k (kept client-side; not revealed directly)
+    masked_vector_hash: bytes = b""  # FIX.md F7a: sha256 of `masked`, bound into the signed message
+    was_sampled: bool = False        # b_k (kept client-side; not revealed directly)
     _secret_q: np.ndarray = field(repr=False, default=None)   # q_k, kept until phase 2
     _secret_blinding: Scalar = field(repr=False, default=None)  # r_k, revealed only after acceptance
     _secret_masked_vector: np.ndarray = field(repr=False, default=None)  # q_k + m_k
@@ -67,10 +72,24 @@ class ClientSubmissionPhase1:
 
 @dataclass
 class ClientSubmissionPhase2:
-    sketch: np.ndarray               # y_k
-    range_proof: object
-    range_proof_aggregate_blinding: Scalar
+    """FIX.md F7 (V3 redesign): the sketch `y_k` itself is NEVER on this
+    submission in the clear any more -- `sketch_commitment` is a
+    `crypto.norm_proof.SketchCommitment` (per-coordinate Pedersen
+    commitments + per-coordinate square proofs + the one PUBLIC scalar
+    v = <y_k,y_k>). `wraparound_bindings`/`wraparound_range_proofs` are
+    F7d's cheap probabilistic wraparound-catching test, also hidden
+    (crypto.norm_proof.prove_wraparound_binding + rangeproof.py reused
+    on the small, FEW shifted test values -- NOT on the m=8192-dim
+    sketch, which is what keeps this cheap).
+    """
+    sketch_commitment: object        # crypto.norm_proof.SketchCommitment
+    wraparound_bindings: list        # list[SchnorrProof], one per subset-sum test; ties
+                                      # recompose_commitment(wraparound_range_proofs[j]) to
+                                      # sketch_commitment.y_commitments under that test's weights
+    wraparound_range_proofs: list    # list[RangeProof] -- NO aggregate_blinding on the submission,
+                                      # see round_step_phase2's comment on why revealing it would leak
     identity_binding_proof: object   # R_cons AND-proof
+    _secret_y_blindings: list = field(repr=False, default=None)   # F7e: per-coordinate r_i, revealed only as a SUM after acceptance (see FIX.md F7, "wiring")
 
 
 def quantize(delta: np.ndarray, bits: int = 16) -> np.ndarray:
@@ -357,9 +376,24 @@ def round_step_phase1(
     escrow_ct = elgamal_encrypt(plaintext_point, pk_trace)
 
     # Step 7: dual-scope ring signature.
+    #
+    # FIX.md F7a: the signed message now also binds a hash of the
+    # MASKED vector itself (`masked`), not just c_k and the escrow
+    # ciphertext. Before this, nothing in the signature tied c_k to
+    # any particular masked vector -- a client (or a server replaying
+    # a captured submission) could pair a valid c_k/signature with a
+    # DIFFERENT masked vector than the one c_k's digest was actually
+    # computed over, since c_k is a commitment to a scalar digest, not
+    # to the vector itself. Hashing `masked` into the signed message
+    # closes that: V1 (clsag verification, unchanged) now also attests
+    # "this specific masked vector belongs with this c_k and this
+    # signature", which is the premise F7e's aggregate check relies on
+    # (it only makes sense to compare "the vector this client actually
+    # submitted" against a sketch of that same vector).
+    masked_hash = hashlib.sha256(b"janus-f7a-masked:" + masked.tobytes()).digest()
     base_t = clsag_h_p(rho_t)
     base_e = clsag_h_p(rho_e)
-    message = commitment.point.b + escrow_ct.c1.b + escrow_ct.c2.b
+    message = commitment.point.b + escrow_ct.c1.b + escrow_ct.c2.b + masked_hash
     sig = clsag_sign(ctx.keys.sk, ctx.keys.index, ctx.ring, message, rho_t, rho_e)
 
     # FIX.md F5: hand the two full-length arrays to the round's store
@@ -376,6 +410,7 @@ def round_step_phase1(
         key_image_round=sig.key_image_round,
         key_image_epoch=sig.key_image_epoch,
         ring_signature=sig,
+        masked_vector_hash=masked_hash,
         was_sampled=b_k,
         _secret_q=q_k,
         _secret_blinding=blinding,
@@ -387,32 +422,30 @@ def sketch_phase1_batch(
     client_indices, q_provider, sketch_seed: bytes, sketch_dim: int, model_dim: int,
     batch_size: int = 8,
 ) -> dict:
-    """Simulation-only optimization (FIX.md F4). sigma_t (`sketch_seed`)
-    is the same for every client this round, so `TorchSketchProjector`'s
-    (m, d) sign chunks are identical across clients -- only the vector
-    being projected differs. `SketchProjector.project_batch` /
-    `TorchSketchProjector.project_batch` generate each chunk once and
-    apply it to every client's vector in the same pass, instead of once
-    per client (`round_step_phase2` calling `.project()` n times). A
-    real client still pays for exactly one project() call -- it has no
-    other client's vector to batch with, so this must not be used when
-    reporting per-client cost.
+    """SUPERSEDED by FIX.md F7: this batched the FLOAT sketch
+    (`SketchProjector.project_batch`) across clients for the old
+    cleartext-norm V3 check. `round_step_phase2` no longer calls
+    `.project()` at all -- it calls `.project_int()` and commits the
+    result coordinate by coordinate (`crypto.norm_proof.commit_sketch`),
+    and takes no precomputed-sketch argument any more, so this
+    function's output has nowhere to plug in. Left in place (not
+    deleted) only because `crypto.sketch.SketchProjector.project_batch`
+    /`TorchSketchProjector.project_batch` and the batching PATTERN
+    (regenerate each (m,d) sign chunk once, apply across a small group
+    of clients) are still real and still correct for the FLOAT
+    estimator path those methods serve -- an analogous batched
+    `project_int_batch` already exists in crypto/sketch.py for a future
+    pass that wires batching into the committed-sketch path (that
+    wiring is NOT done here: see FIX.md F7, "wiring"). Do not call this
+    from `fl/round_loop.py`'s phase-2 step any more.
 
-    FIX.md F5: batched in groups of `batch_size`, NOT across all n
-    clients at once -- an n-wide stack would be exactly the
-    O(n * model_dim) residency F5 exists to remove. The sign chunks are
-    regenerated once per batch instead of once per client, so batch
-    size 8 already captures 7/8 of F4's saving at bounded memory;
-    `fl/vector_store.py::suggested_batch_size` picks it from a byte
-    budget so it does not grow with client count.
-
-    `q_provider(client_index)` returns that client's `_secret_q`; each
-    is read once, converted into its row of the batch, and released
-    before the next is read.
-
-    Returns `{client_idx: y_k}`, the same per-client sketch
-    `round_step_phase2` would otherwise compute itself; pass each value
-    in as that call's `_sim_precomputed_sketch`.
+    Original docstring, for the float path this still serves:
+    sigma_t (`sketch_seed`) is the same for every client this round, so
+    `TorchSketchProjector`'s (m, d) sign chunks are identical across
+    clients -- only the vector being projected differs. Batched in
+    groups of `batch_size` (FIX.md F5), not across all n clients at
+    once, to bound memory; `fl/vector_store.py::suggested_batch_size`
+    picks it from a byte budget so it does not grow with client count.
     """
     sketch = TorchSketchProjector(seed=sketch_seed, m=sketch_dim, d=model_dim)
     indices = list(client_indices)
@@ -443,9 +476,17 @@ def round_step_phase2(
     rho_t: bytes,
     rho_e: bytes,
     vrf_alpha: bytes,
-    _sim_precomputed_sketch: np.ndarray | None = None,
+    _secret_q_override: np.ndarray | None = None,
 ) -> ClientSubmissionPhase2:
     """Steps 8-10, run AFTER the server reveals sigma_t.
+
+    `_secret_q_override`: FIX.md F5 handed `q_k` to a `vector_sink` in
+    phase 1 (`phase1._secret_q is None` on this submission) so n
+    submissions do not pin O(n*model_dim) RAM; the caller (e.g.
+    `fl/round_loop.py`, which stashed it in its `VectorStore`) passes
+    it back in here instead of this function reading `phase1._secret_q`
+    directly. Leave as `None` when phase 1 was NOT called with a
+    `vector_sink` (a single client in isolation, or a test).
 
     Sketches the SIGNED, centered form of `phase1._secret_q` (the
     quantized, PRE-masking delta -- ARCHITECTURE.md line 289's
@@ -484,33 +525,93 @@ def round_step_phase2(
     cost -- this builds and uses its own `TorchSketchProjector` exactly
     as before.
     """
-    if _sim_precomputed_sketch is not None:
-        y_k = _sim_precomputed_sketch
-    else:
-        if phase1._secret_q is None:
-            raise ValueError(
-                "phase 1 handed q_k to a vector_sink (FIX.md F5), so this "
-                "submission carries no q_k to sketch -- pass the sketch in as "
-                "_sim_precomputed_sketch (see sketch_phase1_batch) or call "
-                "round_step_phase1 without a vector_sink"
-            )
-        sketch = TorchSketchProjector(seed=sketch_seed, m=sketch_dim, d=ctx.model_dim)
-        signed_q = center_mod_p_mask(phase1._secret_q)
-        y_k = sketch.project(signed_q.astype(np.float64))
+    secret_q = _secret_q_override if _secret_q_override is not None else phase1._secret_q
+    if secret_q is None:
+        raise ValueError(
+            "phase 1 handed q_k to a vector_sink (FIX.md F5), so this "
+            "submission carries no q_k on it -- pass it back in as "
+            "_secret_q_override (e.g. from the same VectorStore the sink "
+            "wrote to), or call round_step_phase1 without a vector_sink"
+        )
+    signed_q = center_mod_p_mask(secret_q).astype(np.int64)
+    sketch = TorchSketchProjector(seed=sketch_seed, m=sketch_dim, d=ctx.model_dim)
+    y_k = sketch.project_int(signed_q)  # exact integers (FIX.md F7b), not the float estimate
 
-    norm_estimate = int(np.linalg.norm(y_k))
-    n_bits = max(8, int(np.ceil(np.log2(max(B_t * 4, 2)))))
-    range_proof, agg_blinding = prove_range(min(norm_estimate, (1 << n_bits) - 1), n_bits)
+    transcript = b"norm_proof:" + phase1.commitment_point.b
+    sketch_commitment, y_blindings, sq_blindings = commit_sketch(list(int(v) for v in y_k), transcript)
 
-    transcript = b"r_cons:" + phase1.commitment_point.b
-    identity_proof = prove_identity_binding(ctx.keys.sk, rho_t, rho_e, vrf_alpha, transcript)
+    density = sketch.density
+
+    n_tests = 8
+    weights_list = subset_sum_challenge(seed=sketch_seed, m=sketch_dim, n_tests=n_tests)
+    # PUBLIC window -- derived only from (sketch_dim, model_dim, density,
+    # quant_bits), never from this client's own data, so the server can
+    # recompute the identical value. See wraparound_window's docstring
+    # for why it must be quant_bits-derived, not P_MASK-derived.
+    window = wraparound_window(sketch_dim, ctx.model_dim, density, ctx.quant_bits)
+    n_bits = max(8, int(np.ceil(np.log2(max(2 * window + 2, 2)))))
+    wraparound_bindings = []
+    wraparound_range_proofs = []
+    y_list = list(int(v) for v in y_k)
+    for j, w in enumerate(weights_list):
+        tx = transcript + b":wrap:" + j.to_bytes(4, "little")
+        s = sum(wi * yi for wi, yi in zip(w, y_list))
+        shifted = s + window
+        if shifted < 0 or shifted >= (1 << n_bits):
+            # Outside what prove_range can attest to -- clamp so phase2
+            # still builds; check_V3 on the server re-derives n_bits/window
+            # itself and rejects a submission whose real value needed clamping,
+            # mirroring the old norm-estimate clamp's rejection rule.
+            shifted = min(max(shifted, 0), (1 << n_bits) - 1)
+        range_proof, agg_blinding = prove_range(shifted, n_bits)
+        # agg_blinding is NEVER put on the submission: shifted is small
+        # enough to be brute-force-recoverable from a revealed blinding
+        # (the same oracle-attack shape F7e's reveal has to avoid -- see
+        # that section's comment), so it stays client-side, used only to
+        # build the Schnorr binding proof below. `recompose_commitment`
+        # is a public function of `range_proof.bit_proofs` alone --
+        # exactly the commitment agg_blinding opens -- so the server
+        # recomputes the SAME point from the published range proof
+        # without ever being told agg_blinding.
+        bind_proof = prove_wraparound_binding(
+            y_list, y_blindings, w, window, tx,
+            recompose_commitment(range_proof), agg_blinding,
+        )
+        wraparound_bindings.append(bind_proof)
+        wraparound_range_proofs.append(range_proof)
+
+    identity_proof = prove_identity_binding(ctx.keys.sk, rho_t, rho_e, vrf_alpha, b"r_cons:" + phase1.commitment_point.b)
 
     return ClientSubmissionPhase2(
-        sketch=y_k,
-        range_proof=range_proof,
-        range_proof_aggregate_blinding=agg_blinding,
+        sketch_commitment=sketch_commitment,
+        wraparound_bindings=wraparound_bindings,
+        wraparound_range_proofs=wraparound_range_proofs,
         identity_binding_proof=identity_proof,
+        _secret_y_blindings=y_blindings,
     )
+
+
+def reveal_y_blindings_after_acceptance(phase2: "ClientSubmissionPhase2") -> list:
+    """F7e's per-client half: mirrors `reveal_blinding_after_acceptance`'s
+    gating (only after an accept verdict is posted), but -- UNLIKE that
+    function -- this return value must never reach the server as a
+    per-client list in a real deployment. A sketch coordinate's value
+    range is small enough (bounded by the norm check itself) that
+    revealing C_{y_i} and a single client's own r_i together lets a
+    verifier recover y_i by brute-force discrete log; `r_k`'s reveal in
+    `reveal_blinding_after_acceptance` does not have this problem
+    because `weighted_digest`'s range is the full ~2^61 P_MASK space.
+    So in a real deployment each coordinate's r_i must be additively
+    secret-shared across the accepted set via the SAME Shamir/pairwise
+    mechanism `crypto/secagg.py` already uses for q_k's masks, and only
+    the SUM ever reconstructed -- not this function's return value
+    handed to the server directly. This simulation does not yet wire
+    that sharing (see FIX.md F7, "wiring"); `fl/server.py`'s F7e check
+    sums these lists itself, which is correct ONLY because this
+    simulation's "server" is not an adversary with respect to this
+    specific data path -- it must not be read as the deployment design.
+    """
+    return phase2._secret_y_blindings
 
 
 def reveal_blinding_after_acceptance(phase1: ClientSubmissionPhase1) -> Scalar:

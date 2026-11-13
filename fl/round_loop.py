@@ -26,14 +26,14 @@ from crypto.secagg import (
     derive_pairwise_secret_via_x25519, new_self_mask_secret, pairwise_round_seed,
     ShareReleasePolicy, aggregate_masked,
 )
-from crypto.sketch import seed_commitment
+from crypto.sketch import seed_commitment, int_sketch_norm
 from verifier.audit import independent_v5_check
 
 from crypto.sketch import TorchSketchProjector
 
 from .client import (
     ClientKeys, ClientRoundContext, round_step_phase1, round_step_phase2, quantize, center_mod_p_mask,
-    share_self_mask_secret, sketch_phase1_batch,
+    share_self_mask_secret,
 )
 from .server import run_round, apply_update, UnmaskingMaterial
 from .vector_store import (
@@ -394,24 +394,19 @@ def run_training_loop(
             # each client's OWN ctx from phase 1 (not a fresh one), since
             # round_step_phase2 needs the SAME ctx.keys.sk for R_cons.
             _t_phase2_start = time.time()
-            # FIX.md F4: sigma_t is the same for every client this round, so
-            # TorchSketchProjector's (m, d) sign chunks are identical across
-            # clients too. sketch_phase1_batch generates each chunk once and
-            # applies it to every client's vector in the same pass, instead
-            # of rebuilding the chunks once per client -- again a
-            # simulation-only saving (a real client has only its own vector
-            # to project).
-            sketches_by_client = sketch_phase1_batch(
-                range(n_clients), lambda k: store.get(("q", k)),
-                sigma_t, sketch_m, model_dim,
-                batch_size=suggested_batch_size(model_dim, sketch_batch_budget_bytes),
-            )
+            # FIX.md F7: the sketch is committed coordinate-by-coordinate
+            # (crypto.norm_proof.commit_sketch) and never sent in the clear,
+            # so F4's cleartext-float-sketch cross-client batching
+            # (sketch_phase1_batch) no longer applies to this step -- see
+            # that function's updated docstring. Each client pays its own
+            # real per-client cost: one project_int() call plus sketch_m
+            # per-coordinate square proofs plus the wraparound bindings.
             phase2_by_client = {}
             for client_idx in range(n_clients):
                 phase2_by_client[client_idx] = round_step_phase2(
                     ctx_by_client[client_idx], phase1_by_client[client_idx],
                     sigma_t, sketch_m, threshold.B_t, rho_t, rho_e, vrf_alpha,
-                    _sim_precomputed_sketch=sketches_by_client[client_idx],
+                    _secret_q_override=store.get(("q", client_idx)),
                 )
             _t_phase2 = time.time() - _t_phase2_start
 
@@ -438,7 +433,8 @@ def run_training_loop(
 
             outcome = run_round(submissions, phase2_by_client, rho_t, rho_e, vrf_alpha, threshold.B_t, n_clients, model_dim,
                                 unmask_provider=unmask_provider,
-                                masked_vector_provider=lambda k: store.get(("x", k)))
+                                masked_vector_provider=lambda k: store.get(("x", k)),
+                                sketch_dim=sketch_m, sigma_t=sigma_t)
             _t_verify = time.time() - _t_verify_start
 
             if verbose:
@@ -480,8 +476,16 @@ def run_training_loop(
 
             w_t = apply_update(w_t, outcome.aggregated_delta)
 
+            # FIX.md F7: the sketch is never in the clear any more, but
+            # the committed norm-squared v = <y_k,y_k> IS public
+            # (`phase2.sketch_commitment.v`), so B_t's next-round median
+            # still comes from the same public quantity it always did --
+            # just recovered via int_sketch_norm instead of np.linalg.norm
+            # on an array that no longer exists on the submission.
+            _sketch_density = TorchSketchProjector(seed=sigma_t, m=sketch_m, d=model_dim).density
             next_round_norms = np.array([
-                np.linalg.norm(phase2_by_client[i].sketch) for i in outcome.accepted_client_indices
+                int_sketch_norm(phase2_by_client[i].sketch_commitment.v, sketch_m, _sketch_density)
+                for i in outcome.accepted_client_indices
             ])
             threshold = update_threshold_ema(threshold, next_round_norms, k=k, alpha=ema_alpha)
 

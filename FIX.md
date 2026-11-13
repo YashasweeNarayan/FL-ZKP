@@ -624,9 +624,14 @@ now pass across the repo (16 files).
 
 ## F7 — V3 norm check
 
-**Status: OPEN. Design chosen 2026-11-13, algebra checked in NumPy and a toy group; no EC code yet.**
+**Status: F7a/b/c/d IMPLEMENTED and wired into `fl/client.py` + `fl/server.py`,
+tested under the test-only pure-Python ristretto255 backend (`tests/test_f7_norm_proof.py`,
+`tests/test_ristretto_backend.py`). F7e/F7f are real, independently-tested
+primitives in `crypto/norm_proof.py` but NOT YET wired into `fl/server.py::run_round`
+-- see "wiring" below. Not yet run on Colab (needs real `rbcl`; see F8).**
 
-Three gaps between `ARCHITECTURE.md` and the implementation:
+Cause (unchanged from the original diagnosis): three gaps between
+`ARCHITECTURE.md` and the implementation --
 
 1. The sketch `y_k` is sent in the clear and the server computes its norm.
 2. Nothing binds `y_k` to the update inside the masked vector: a client can
@@ -634,18 +639,100 @@ Three gaps between `ARCHITECTURE.md` and the implementation:
 3. `c_k` commits to a linear digest with weights public before the round,
    so it does not bind the client to its vector before σ_t is revealed.
 
-Chosen design, in implementation order:
+**Design correction made during implementation (2026-11-13/14), replacing the
+plan below as originally written.** The original F7b/F7c pairing ("vector
+Pedersen commitment to the sketch" + "Sigma protocol for ⟨y,y⟩=v on that
+commitment") doesn't fit together: proving an inner product of a vector held
+in ONE multi-generator commitment needs an inner-product argument
+(Bulletproofs-class), which `schnorr_nizk.py`'s own docstring already ruled
+out under the 3-day deadline. Fix: commit each sketch coordinate SEPARATELY
+(m ordinary Pedersen commitments, not one aggregated point), each paired
+with a commitment to its square and a real Sigma-protocol "square proof"
+(the standard Pedersen multiplicative-relation construction, derived and
+algebra-checked in `crypto/norm_proof.py`'s module docstring). Cost: roughly
+8x the scalar multiplications of today's `rangeproof.py` per client (m=8192
+square proofs vs. one ~16-32 bit range proof) -- not yet measured on Colab.
 
-| Part | Change | Closes |
-|---|---|---|
-| F7a | Hash of the masked vector inside the signed phase-1 message | gap 3 |
-| F7b | Exact integer sketch; vector Pedersen commitment to it | gap 1 |
-| F7c | Sigma protocol for ⟨y, y⟩ = v on the committed sketch, v public | gap 1 |
-| F7d | Random subset-sum range tests against field wraparound (reuses `rangeproof.py`) | collusion via wraparound |
-| F7e | Aggregate check: product of sketch commitments opens to the sketch of the aggregate | gap 2 |
-| F7f | Blame step when F7e fails | abort without attribution |
+A second, independent design bug was caught and fixed before shipping (not
+after): F7e's "reveal the aggregate blinding" and F7d's original "reveal the
+flooded test value in the clear" both have the SAME oracle-attack shape --
+a sketch coordinate's (or a flooded linear combination's) value range is
+small enough to be recovered by brute-force discrete log once its blinding
+is known, UNLIKE V5's existing `r_k` reveal (safe there only because
+`weighted_digest`'s range is the full ~2^61 P_MASK space). Fix for F7d:
+`prove_wraparound_binding`/`verify_wraparound_binding` -- a Schnorr proof
+(on base H) that a FRESH range-proof commitment and the homomorphic sum of
+already-published per-coordinate commitments open to the same value, so
+neither the flooded sum nor any blinding is ever revealed. F7e's equivalent
+fix is noted below (not yet wired).
 
-Depends on F1 (F7e needs the true aggregate).
+A third bug, in the first draft of `wraparound_window`: it took its bound
+on a sketch coordinate's magnitude from the client's OWN array (not
+independently recomputable by the server) and from P_MASK//2 (a bound ~2^61,
+vastly looser than an honest coordinate's real magnitude, ~2^(quant_bits-1)
+times the number of nonzero sketch-row entries -- for model_dim in the
+millions, still tens of orders of magnitude below P_MASK). Both were wrong:
+the first breaks client/server agreement entirely; the second would make a
+P_MASK-sized wraparound attack invisible against an "honest" window already
+that loose. Fixed: `wraparound_window(m, model_dim, density, quant_bits)` is
+a pure function of PUBLIC config only, tight enough that a P_MASK-sized shift
+in even one coordinate dwarfs the honest window (verified in
+`tests/test_f7_norm_proof.py::test_wraparound_window_is_tight_against_pmask`
+and `test_wraparound_catches_pmask_sized_shift`).
+
+Final design, in implementation order:
+
+| Part | Change | Closes | Status |
+|---|---|---|---|
+| F7a | Hash of the masked vector inside the signed phase-1 CLSAG message (`fl/client.py::round_step_phase1`, `ClientSubmissionPhase1.masked_vector_hash`) | gap 3 | DONE, wired into `check_V1_ring_signature` |
+| F7b | Exact integer sketch (`crypto/sketch.py::project_int`/`project_int_batch`); m PER-COORDINATE Pedersen commitments, not one vector commitment | gap 1 | DONE (`crypto/norm_proof.py::commit_sketch`) |
+| F7c | Real Sigma-protocol "square proof" per coordinate; only Σ(square commitments) is opened, to the public v=⟨y,y⟩ | gap 1 | DONE (`SquareProof`/`prove_square`/`verify_square`) |
+| F7d | Cheap random subset-sum wraparound test, HIDDEN (reworked from the original bit-decomposition-reuse plan into a Schnorr binding + `rangeproof.py` reuse on the few flooded values) | wraparound collusion | DONE (`prove_wraparound_binding`/`verify_wraparound_binding`) |
+| F7e | Aggregate check: per-coordinate sum of accepted clients' sketches == sketch of the true aggregate, blinding sums only (never individual) | gap 2 | Primitive DONE and tested (`verify_aggregate_sketch`); NOT wired into `run_round` |
+| F7f | Group-testing blame (bisect the accepted set on a public, round-seeded partition) when F7e fails, instead of abort-only | abort-without-attribution DoS | Primitive DONE and tested (`localize_fault`/`partition_group`); NOT wired into `run_round` |
+
+**Wiring done:**
+- `fl/client.py::round_step_phase1`: computes `masked_hash = sha256(masked)`,
+  includes it in the CLSAG-signed message, stores it as
+  `ClientSubmissionPhase1.masked_vector_hash`.
+- `fl/client.py::round_step_phase2`: rewritten. Uses `sketch.project_int`
+  (exact integers, not the float estimate), builds a `SketchCommitment` via
+  `commit_sketch`, runs F7d's 8 wraparound tests, returns a
+  `ClientSubmissionPhase2` carrying the commitment + proofs and NO cleartext
+  sketch. `sketch_phase1_batch`/`_sim_precomputed_sketch` (F4's cross-client
+  float-sketch batching) are retired from this path -- they batched the
+  wrong (float, cleartext) computation; `fl/round_loop.py` now calls
+  `round_step_phase2` per client directly, at real per-client cost.
+- `fl/server.py::check_V1_ring_signature`: includes `masked_vector_hash` in
+  the reconstructed message.
+- `fl/server.py::check_V3_norm_bound`: fully rewritten -- verifies the
+  `SketchCommitment` (never sees y), re-derives the SAME public weights and
+  window the client used (needs `sigma_t`, now threaded through
+  `verify_submission`/`run_round` as an explicit required parameter -- a
+  caller passing the wrong seed, or omitting it, fails loudly rather than
+  silently mis-verifying), and checks each wraparound binding + range proof.
+- `fl/round_loop.py`: next-round `B_t` norms now come from
+  `int_sketch_norm(phase2.sketch_commitment.v, ...)` (the public scalar),
+  not `np.linalg.norm(phase2.sketch)` (no longer exists on the submission).
+
+**Wiring NOT done (explicit TODO, do not assume this runs):**
+- `fl/server.py::run_round` does not call `verify_aggregate_sketch` (F7e) or
+  `localize_fault` (F7f) at all. The per-client V3 check above is real and
+  blocks a malicious INDIVIDUAL submission from the norm check itself; the
+  cross-client aggregate check that would also catch coordinated
+  wraparound-style collusion across several accepted clients is not yet
+  invoked anywhere in the round loop.
+- F7e's blinding-sum reveal (`y_blindings` summed across accepted clients)
+  is specified to go through `crypto/secagg.py`'s existing Shamir/pairwise
+  secret-sharing (the same mechanism `q_k`'s masks already use), NOT a
+  direct per-client reveal to the server (that would be the same
+  oracle-attack shape F7d's fix avoids). `fl/client.py::reveal_y_blindings_after_acceptance`
+  exists but its docstring says plainly that handing its return value to the
+  server directly is a simulation-only stand-in, not the deployment design;
+  the actual secret-sharing wiring is not built.
+- No test exercises F7e/F7f end-to-end inside `run_round` (only the standalone
+  primitives, in `tests/test_f7_norm_proof.py`).
+- Depends on F1 (F7e needs the true aggregate) -- satisfied, F1 is fixed.
 
 ## F8 — ristretto255 bindings: wrong library entirely, not a version problem
 

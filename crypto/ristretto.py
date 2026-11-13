@@ -30,6 +30,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import os
+
+_BACKEND = None
 try:
     import rbcl as _b
     if not hasattr(_b, "crypto_core_ristretto255_from_hash"):
@@ -38,8 +41,27 @@ try:
         # fall back to that before giving up.
         import rbcl.rbcl as _b  # type: ignore[import]
     _HAVE_RBCL = hasattr(_b, "crypto_core_ristretto255_from_hash")
+    if _HAVE_RBCL:
+        _BACKEND = "rbcl"
 except ImportError:
     _HAVE_RBCL = False
+
+if not _HAVE_RBCL and os.environ.get("JANUS_ALLOW_PURE_PYTHON_GROUP") == "1":
+    # TEST-ONLY fallback (crypto/_ristretto_py.py): a pure-Python
+    # ristretto255, ~1000x slower than libsodium and not constant-time.
+    # Opt-in by environment variable so a real run can never pick it up
+    # by accident -- without the variable the behaviour is unchanged:
+    # every group operation raises, telling the caller to install rbcl.
+    from . import _ristretto_py as _b
+    _HAVE_RBCL = True
+    _BACKEND = "pure-python (TEST ONLY)"
+
+
+def backend_name() -> str:
+    """Which group implementation is live: 'rbcl', the test-only
+    pure-Python one, or None. Printed by the notebooks so a run's log
+    says which one produced it."""
+    return _BACKEND
 
 
 def _require_rbcl():
@@ -52,7 +74,9 @@ def _require_rbcl():
             "notebooks/00_Setup_and_Crypto_Tests.ipynb. Do NOT install "
             "`pynacl` for this: mainline PyNaCl has never shipped "
             "ristretto255 bindings, under any version (see this module's "
-            "docstring, FIX.md F8)."
+            "docstring, FIX.md F8). For tests only, "
+            "JANUS_ALLOW_PURE_PYTHON_GROUP=1 selects a slow pure-Python "
+            "group (crypto/_ristretto_py.py)."
         )
 
 
@@ -98,6 +122,10 @@ class Scalar:
         """Reduce a big Python int mod L into libsodium's scalar encoding."""
         raw = x.to_bytes(64, "little") if x.bit_length() <= 512 else (x % (2**512)).to_bytes(64, "little")
         return Scalar(_wide_scalar_reduce(raw))
+
+    def to_int(self) -> int:
+        """The canonical representative in [0, L)."""
+        return int.from_bytes(self.b, "little")
 
     def __add__(self, other: "Scalar") -> "Scalar":
         _require_rbcl()
@@ -195,6 +223,44 @@ def scalar_mul_base(s: Scalar) -> Point:
     if s.b == _SCALAR_ZERO:
         return Point(_POINT_IDENTITY)
     return Point(_b.crypto_scalarmult_ristretto255_base(s.b))
+
+
+def identity() -> Point:
+    return Point(_POINT_IDENTITY)
+
+
+def group_order() -> int:
+    """The public scalar group order L. `Scalar.from_int` only accepts
+    non-negative Python ints (it serializes to 64 raw bytes before
+    reducing); a caller with a SIGNED value -- e.g. norm_proof.py's
+    centered sketch coordinates -- must reduce it into [0, L) itself
+    first via `x % group_order()`, which is always non-negative for any
+    integer x in Python. This is not a convenience wrapper over that
+    case because getting the sign-handling wrong silently produces a
+    wrong scalar rather than an error, so callers do it explicitly."""
+    return _GROUP_ORDER_L
+
+
+def msm(scalars, points) -> Point:
+    """sum_i scalars[i] * points[i], scalars given as Python ints (any
+    sign, reduced mod L here). Terms with a zero scalar are skipped, and
+    an empty or all-zero sum is the identity.
+
+    A plain loop of variable-base multiplications: with libsodium each
+    one is ~0.1 ms, so the m = 8192 commitment in crypto/norm_proof.py
+    costs about a second. A bucket method would need far more point
+    additions than that through a Python binding, so it would be slower
+    here, not faster.
+    """
+    _require_rbcl()
+    acc = None
+    for s, pt in zip(scalars, points):
+        s = int(s) % _GROUP_ORDER_L
+        if s == 0:
+            continue
+        term = _b.crypto_scalarmult_ristretto255(s.to_bytes(32, "little"), pt.b)
+        acc = term if acc is None else _b.crypto_core_ristretto255_add(acc, term)
+    return Point(acc) if acc is not None else Point(_POINT_IDENTITY)
 
 
 def fiat_shamir_challenge(*parts: bytes) -> Scalar:

@@ -16,12 +16,17 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from crypto.clsag import verify_with_scopes, same_round_same_signer
-from crypto.rangeproof import verify_range, verify_recomposition
+from crypto.rangeproof import verify_range, verify_recomposition, recompose_commitment
 from crypto.r_cons import verify_identity_binding
 from crypto.pedersen import commit_sum, verify_opening, commit as pedersen_commit, Commitment
 from crypto.ristretto import Scalar
 from crypto.secagg import aggregate_masked, unmask_aggregate, P_MASK
 from crypto.vector_commit import weighted_digest
+from crypto.norm_proof import (
+    verify_sketch_commitment, subset_sum_challenge, wraparound_window, verify_wraparound_binding,
+    verify_aggregate_sketch, localize_fault,
+)
+from crypto.sketch import int_sketch_norm_sq_bound
 
 from .norm_rule import compute_threshold, NormThreshold
 from .client import dequantize
@@ -46,8 +51,22 @@ def derive_B_t(previous_round_committed_norms: np.ndarray, kappa: float = 1.0) -
 
 
 def check_V1_ring_signature(submission, rho_t: bytes, rho_e: bytes) -> bool:
+    """FIX.md F7a: the signed message now includes a hash of the
+    client's masked vector (`submission.masked_vector_hash`), so this
+    check (unchanged in mechanism -- still CLSAG verification) now
+    ALSO attests that `masked_vector_hash` genuinely belongs with this
+    c_k/signature pair. A submission from before F7a (no
+    `masked_vector_hash`, the dataclass default b"") will fail here,
+    which is correct: it cannot be re-verified against the new message
+    shape, not silently accepted under the old one.
+    """
     sig = submission.ring_signature
-    message = submission.commitment_point.b + submission.escrow_ciphertext.c1.b + submission.escrow_ciphertext.c2.b
+    message = (
+        submission.commitment_point.b
+        + submission.escrow_ciphertext.c1.b
+        + submission.escrow_ciphertext.c2.b
+        + submission.masked_vector_hash
+    )
     return verify_with_scopes(sig, message, rho_t, rho_e)
 
 
@@ -59,44 +78,51 @@ def check_V2_no_double_submission(submission, seen_key_images_this_round: set) -
     return tag not in seen_key_images_this_round
 
 
-def check_V3_norm_bound(phase2, B_t: float) -> bool:
-    """Checks the client's range proof is well-formed AND is bound to
-    the ACTUAL norm of its publicly-sent sketch `phase2.sketch` --
-    not, as an earlier version of this function did, to `c_k`
-    (`submission.commitment_point`). `c_k` is a Pedersen commitment to
-    `weighted_digest(masked, rho_t)` with an independent random
-    blinding (see fl/client.py step 5) -- a different value AND a
-    different blinding than `prove_range`'s (norm_estimate,
-    agg_blinding). Checking recomposition against `c_k` therefore
-    compared two unrelated commitments and could only ever succeed by
-    astronomical coincidence, rejecting every honest client every
-    round (caught via live Colab testing: "0 accepted" for all 5-8
-    clients regardless of model).
+def check_V3_norm_bound(phase2, B_t: float, commitment_point, sketch_dim: int, model_dim: int,
+                         sketch_seed: bytes, quant_bits: int = 16, density: float = 1.0 / 3.0,
+                         n_tests: int = 8) -> bool:
+    """FIX.md F7 (V3 redesign): the server NEVER sees a cleartext
+    sketch or any individual sketch coordinate now. Three independent
+    things have to hold:
 
-    The server independently recomputes the claimed norm from
-    `phase2.sketch` (sent in cleartext in this reference
-    implementation -- crypto/sketch.py and crypto/rangeproof.py are
-    both explicitly flagged elsewhere as correctness references, not
-    a production norm-hiding Bulletproofs-over-vector-commitment
-    construction) and re-derives the SAME commitment the client's
-    `prove_range` call is tied to via `agg_blinding`, so recomposition
-    is a real check again: it fails if the client's range proof does
-    not actually decompose to the sketch's own norm.
+    1. `phase2.sketch_commitment` verifies on its own terms
+       (`crypto.norm_proof.verify_sketch_commitment`): every
+       per-coordinate square proof is valid, and the one PUBLIC scalar
+       v = <y,y> it reveals is within the norm bound B_t implies
+       (`int_sketch_norm_sq_bound`). This replaces the old cleartext
+       `np.linalg.norm(phase2.sketch)` call -- same check, hidden input.
+    2. Each of the `n_tests` wraparound bindings verifies against
+       `phase2.sketch_commitment.y_commitments` under this round's
+       PUBLICLY-derived weights and window (`subset_sum_challenge`,
+       `wraparound_window` -- both pure functions of public round/config
+       data, recomputed here rather than trusted from the client).
+    3. Each corresponding range proof is well-formed (catches a client
+       claiming an out-of-window flooded sum).
+
+    `commitment_point` (c_k) and `sketch_seed` (sigma_t) must be the
+    SAME values `round_step_phase2` used to build its transcript
+    (`b"norm_proof:" + phase1.commitment_point.b`) and its weights
+    (`subset_sum_challenge(seed=sketch_seed, ...)`) -- a mismatch on
+    either fails every honest client, not just a malicious one.
     """
-    if not verify_range(phase2.range_proof):
+    transcript = b"norm_proof:" + commitment_point.b
+    norm_bound_sq = int_sketch_norm_sq_bound(B_t, sketch_dim, density)
+    if not verify_sketch_commitment(phase2.sketch_commitment, transcript, norm_bound_sq):
         return False
-    n_bits = phase2.range_proof.n_bits
-    norm_estimate = int(np.linalg.norm(phase2.sketch))
-    if norm_estimate < 0 or norm_estimate >= (1 << n_bits):
-        # Genuinely outside what this proof can attest to. fl/client.py's
-        # round_step_phase2 clamps its OWN prove_range call to avoid a
-        # crash when norm_estimate >= 2**n_bits; rejecting that case here
-        # (rather than independently re-clamping to match) prevents a
-        # client whose real norm exceeds the provable range from having
-        # it silently capped-and-accepted.
+    weights_list = subset_sum_challenge(seed=sketch_seed, m=sketch_dim, n_tests=n_tests)
+    window = wraparound_window(sketch_dim, model_dim, density, quant_bits)
+    if not (len(phase2.wraparound_range_proofs) == len(phase2.wraparound_bindings) == len(weights_list)):
         return False
-    claimed_commitment = pedersen_commit(Scalar.from_int(norm_estimate), phase2.range_proof_aggregate_blinding)
-    return verify_recomposition(phase2.range_proof, claimed_commitment)
+    for j, w in enumerate(weights_list):
+        rp = phase2.wraparound_range_proofs[j]
+        bp = phase2.wraparound_bindings[j]
+        if not verify_range(rp):
+            return False
+        tx = transcript + b":wrap:" + j.to_bytes(4, "little")
+        C_j = recompose_commitment(rp)
+        if not verify_wraparound_binding(C_j, bp, w, phase2.sketch_commitment.y_commitments, window, tx):
+            return False
+    return True
 
 
 def check_V4_consistency(phase2, rho_t: bytes, rho_e: bytes, vrf_alpha: bytes, commitment_point) -> bool:
@@ -104,27 +130,23 @@ def check_V4_consistency(phase2, rho_t: bytes, rho_e: bytes, vrf_alpha: bytes, c
     return verify_identity_binding(phase2.identity_binding_proof, rho_t, rho_e, vrf_alpha, transcript)
 
 
-def verify_submission(submission, phase2, rho_t: bytes, rho_e: bytes, vrf_alpha: bytes, B_t: float, seen_key_images_this_round: set) -> VerificationResult:
+def verify_submission(submission, phase2, rho_t: bytes, rho_e: bytes, vrf_alpha: bytes, B_t: float,
+                       seen_key_images_this_round: set, sketch_dim: int, model_dim: int,
+                       sigma_t: bytes, quant_bits: int = 16, density: float = 1.0 / 3.0) -> VerificationResult:
     reasons = []
     if not check_V1_ring_signature(submission, rho_t, rho_e):
         reasons.append("V1_ring_signature_failed")
     if not check_V2_no_double_submission(submission, seen_key_images_this_round):
         reasons.append("V2_double_submission")
-    if not check_V3_norm_bound(phase2, B_t):
-        # Diagnostic detail, not just the bare check name -- computed
-        # independently here (cheap, read-only) purely for the
-        # rejected_reasons message, so a future "every client fails
-        # V3" report is immediately diagnosable instead of requiring
-        # another round of guessing: which of range-well-formed /
-        # out-of-provable-range / recomposition-mismatch it was, and
-        # the actual numbers involved.
-        range_ok = verify_range(phase2.range_proof)
-        n_bits = phase2.range_proof.n_bits
-        norm_estimate = int(np.linalg.norm(phase2.sketch))
+    if not check_V3_norm_bound(phase2, B_t, submission.commitment_point, sketch_dim, model_dim,
+                                sketch_seed=sigma_t, quant_bits=quant_bits, density=density):
+        # Diagnostic detail, not just the bare check name: v is PUBLIC
+        # (unlike the hidden y itself) so it is safe and useful to log,
+        # same spirit as the old cleartext-norm diagnostic this replaces.
+        norm_bound_sq = int_sketch_norm_sq_bound(B_t, sketch_dim, density)
         reasons.append(
-            f"V3_norm_bound_exceeded (range_proof_valid={range_ok}, "
-            f"norm_estimate={norm_estimate}, B_t={B_t:.3f}, n_bits={n_bits}, "
-            f"provable_cap={(1 << n_bits) - 1})"
+            f"V3_norm_bound_exceeded (v={phase2.sketch_commitment.v}, "
+            f"norm_bound_sq={norm_bound_sq}, B_t={B_t:.3f})"
         )
     if not check_V4_consistency(phase2, rho_t, rho_e, vrf_alpha, submission.commitment_point):
         reasons.append("V4_consistency_failed")
@@ -168,7 +190,17 @@ def run_round(
     model_dim: int,
     unmask_provider,        # callable(accepted_indices, excluded_indices) -> UnmaskingMaterial
     masked_vector_provider=None,  # callable(client_index) -> x_k; see the streaming note below (FIX.md F5)
+    sketch_dim: int = None,       # FIX.md F7: sketch_m -- required, kept keyword-with-None so old
+    sigma_t: bytes = None,        # positional call sites fail loudly instead of silently mis-seeding V3
+    quant_bits: int = 16,
+    density: float = 1.0 / 3.0,
 ) -> RoundOutcome:
+    if sketch_dim is None or sigma_t is None:
+        raise ValueError(
+            "run_round needs sketch_dim and sigma_t (FIX.md F7: check_V3_norm_bound "
+            "verifies the committed sketch, which needs the round's sketch dimension "
+            "and seed to recompute the same public weights/window the client proved against)"
+        )
     # Default provider: read the vector off the submission itself, the
     # pre-F5 behaviour. `fl/round_loop.py` passes a provider backed by
     # the round's vector store instead, so the submissions carry no
@@ -190,7 +222,9 @@ def run_round(
     rejected_reasons = {}
     for client_index, submission in submissions:
         phase2 = phase2s[client_index]
-        result = verify_submission(submission, phase2, rho_t, rho_e, vrf_alpha, B_t, seen_key_images)
+        result = verify_submission(submission, phase2, rho_t, rho_e, vrf_alpha, B_t, seen_key_images,
+                                    sketch_dim=sketch_dim, model_dim=model_dim, sigma_t=sigma_t,
+                                    quant_bits=quant_bits, density=density)
         if result.accepted:
             seen_key_images.add(submission.key_image_round.b)
             accepted.append((client_index, submission))
