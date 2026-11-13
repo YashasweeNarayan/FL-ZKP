@@ -16,7 +16,9 @@ mvp_scope:
   rounds_per_run: 45         # cut from 120-150 (ROADMAP.md §0.1)
   n_seeds: 1                 # cut from 3
   models:
-    - resnet50
+    - resnet18                # swapped from resnet50 2026-11-13: FL-benchmark convention, and
+                               # ~47% of resnet50's model_dim -- see fl/models.py build_resnet18
+                               # docstring and FIX.md. resnet50 kept as a later scalability ablation.
     - mobilenet_v2           # efficientnet_b0 intentionally dropped, see fl/models.py
   attacks:                   # cut from 7 to 5 (A2, A6 deferred -- compute-heavy, orthogonal to crypto claims)
     - a1_scaling

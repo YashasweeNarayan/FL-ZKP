@@ -77,6 +77,30 @@ def build_resnet50(num_classes: int, in_channels: int = 1):
     return model
 
 
+def build_resnet18(num_classes: int, in_channels: int = 1):
+    """ResNet-18, from-scratch weights, 1-channel stem, GroupNorm
+    throughout. Primary MVP backbone as of 2026-11-13 (see
+    STATUS.md/FIX.md): FL-literature convention for this class of
+    benchmark (FedAvg, FedProx, SCAFFOLD, MOON, the non-IID BatchNorm
+    papers that motivated this file's GroupNorm swap all use
+    ResNet-18 or smaller, never ResNet-50), and ~47% of ResNet-50's
+    `model_dim` (~11.2M vs ~23.6M params with a 62-class head), which
+    matters directly here since mask generation, sketching and range
+    proofs are all O(model_dim). `build_resnet50` is kept, not
+    removed -- it is still the intended large-model scalability
+    ablation once F2 (mask PRG) and F5 (memory) land (FIX.md).
+    """
+    _require_torch()
+    import torch.nn as nn
+    import torchvision
+
+    model = torchvision.models.resnet18(weights=None)  # from scratch, no ImageNet weights
+    model.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    model = _replace_batchnorm_with_groupnorm(model)
+    return model
+
+
 def build_mobilenet_v2(num_classes: int, in_channels: int = 1):
     """MobileNetV2, from-scratch weights, 1-channel stem, GroupNorm
     throughout. The lighter of the two MVP backbones -- chosen
@@ -132,7 +156,8 @@ def build_tiny_debug_model(num_classes: int, in_channels: int = 1):
 
 
 MVP_MODEL_BUILDERS = {
-    "resnet50": build_resnet50,
+    "resnet18": build_resnet18,
+    "resnet50": build_resnet50,  # kept for the later large-model scalability ablation, see build_resnet18's docstring
     "mobilenet_v2": build_mobilenet_v2,
     # "efficientnet_b0" intentionally omitted -- see module docstring
     # and ROADMAP.md §0.1's 3-day scope cut.
