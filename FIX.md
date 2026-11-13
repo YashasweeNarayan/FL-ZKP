@@ -18,14 +18,17 @@ Status words used below:
 | # | Issue | Severity | Status |
 |---|---|---|---|
 | F1 | Aggregate was never unmasked: the model received random values every round | Correctness, blocks everything | **FIXED, CONFIRMED** |
-| F2 | Mask PRG and digest weights expanded by a Python SHA-256 loop; digest multiplied in Python big integers | Performance | **FIXED, SANDBOX-TESTED** |
+| F2 | Mask PRG and digest weights expanded by a Python SHA-256 loop; digest multiplied in Python big integers | Performance | **FIXED, CONFIRMED** |
 | F3 | Each pairwise mask is computed twice in the simulation | Performance (simulation only) | **INVESTIGATED, NOT ADOPTED** -- see below |
-| F4 | Sketch sign matrix is regenerated once per client though it is the same for all | Performance (simulation only) | **FIXED, SANDBOX-TESTED** |
-| F5 | Two full-dimension arrays are kept per client for the whole round: 17.6 GB at 50 clients | Memory, blocks 50 clients | **FIXED, SANDBOX-TESTED** |
+| F4 | Sketch sign matrix is regenerated once per client though it is the same for all | Performance (simulation only) | **FIXED, CONFIRMED** |
+| F5 | Two full-dimension arrays are kept per client for the whole round: 17.6 GB at 50 clients | Memory, blocks 50 clients | **FIXED, CONFIRMED** |
 | F6 | Local training is one full-batch SGD step; unlikely to learn | ML validity | OPEN |
 | F7 | V3 norm check: sketch sent in clear, not bound to the update, commitment not binding for the client | Security and privacy | OPEN (design chosen) |
+| F8 | `crypto/ristretto.py` called ristretto255 bindings PyNaCl has never shipped, under any version | Correctness, blocks every EC-dependent module | **FIXED, CONFIRMED** |
 
-Order of work: F1 → F2–F5 → F6 → F7.
+Order of work: F1 → F2–F5 → F6 → F7. F8 was found and fixed out of this
+order (2026-11-13), discovered while chasing a Colab install error that
+blocked re-confirming F1-F5 at all.
 
 ---
 
@@ -169,7 +172,19 @@ and pynacl. Expected on Colab: every round line shows `aggregate=EXACT`.
 
 ## F2 — Mask PRG and weighted-digest speed
 
-**Status: FIXED, SANDBOX-TESTED (2026-11-13). Colab timing owed.**
+**Status: FIXED, CONFIRMED ON COLAB (2026-11-13).** resnet18, 8 clients,
+2 rounds, real GPU: `round 0 timing: phase1=45.8s, phase2=31.9s, verify=8.7s,
+total=86.4s (~10.81s/client)`, round 1 nearly identical (`43.9s/31.8s/8.2s`).
+Against the pre-fix resnet50 baseline at the same client count
+(`phase1=1102.9s, phase2=257.7s, verify=256.9s, total=1617.5s`) -- not a
+clean apples-to-apples isolation (model_dim also dropped ~53% with the
+ResNet-18 swap), but the direction and magnitude are exactly what F2 (mask
+PRG + exact-arithmetic digest) plus F4 (batched sketch) predict, and
+`verify`'s ~30x drop in particular tracks F2 directly since `verify_submission`
+calls the same `weighted_digest` the mask-PRG fix sped up. `aggregate=EXACT`
+held on BOTH rounds, which also newly confirms F1 survives a real round
+boundary (round 1 trains from a correctly-unmasked round-0 model), not
+just round 0 in isolation.
 
 ### What was wrong
 
@@ -309,7 +324,13 @@ was never adopted in the simulation either.
 
 ## F4 — Sketch sign matrix regenerated per client
 
-**Status: FIXED, SANDBOX-TESTED (2026-11-13). Colab timing owed.**
+**Status: FIXED, CONFIRMED ON COLAB (2026-11-13).** Bootstrap norm sampling
+(this fix's other call site, `bootstrap_norms_from_model_dim`): 10 samples
+at resnet18 (model_dim=11,202,046) in 39.7s total, vs. the pre-fix ~330s at
+resnet50 one-sample-at-a-time -- confirms the batching change, not just the
+smaller model (the printed per-call breakdown, `7 in one pass` then
+`3 in one pass`, shows the batching itself firing). Phase 2 numbers are
+under F2's entry above (both fixes land in the same round-loop run).
 
 ### What was wrong
 
