@@ -33,7 +33,7 @@ from crypto.sketch import TorchSketchProjector
 
 from .client import (
     ClientKeys, ClientRoundContext, round_step_phase1, round_step_phase2, quantize, center_mod_p_mask,
-    share_self_mask_secret,
+    share_self_mask_secret, sketch_phase1_batch,
 )
 from .server import run_round, apply_update, UnmaskingMaterial
 from .norm_rule import bootstrap_from_server_root, update_threshold_ema
@@ -318,6 +318,14 @@ def run_training_loop(
         phase1_by_client = {}
         self_mask_shares_held = {}   # {k: {holder_id: ShamirShare}} -- held by the OTHER clients, not the server
         holder_ids = list(range(1, n_clients + 1))
+        # FIX.md F3: NOT enabled here. A naive per-round cache of every
+        # pair's expanded vector was measured to cost more memory than
+        # it saves in time -- see FIX.md F3 for the numbers (2.5 GB at
+        # 8 clients, 39 GB at 30, 110 GB at 50 -- directly worsening the
+        # F5 crash this project already hit). pairwise_mask_cached and
+        # its tests stay in the repo for a future pair-ordered redesign,
+        # but round_loop.py must not pass a cache here until one exists.
+        pairwise_mask_cache_this_round = None
         for client_idx in range(n_clients):
             ctx = ClientRoundContext(
                 keys=ClientKeys(sk=client_sks[client_idx], pk=ring[client_idx], index=client_idx),
@@ -331,6 +339,7 @@ def run_training_loop(
             phase1_by_client[client_idx] = round_step_phase1(
                 ctx, w_t, rho_t, rho_e, vrf_alpha, sampling_rate, sigma_dp,
                 n_clients, client_datasets[client_idx], model, lr, epochs, pk_trace,
+                _sim_pairwise_mask_cache=pairwise_mask_cache_this_round,
             )
         _t_phase1 = time.time() - _t_phase1_start
 
@@ -338,11 +347,20 @@ def run_training_loop(
         # each client's OWN ctx from phase 1 (not a fresh one), since
         # round_step_phase2 needs the SAME ctx.keys.sk for R_cons.
         _t_phase2_start = time.time()
+        # FIX.md F4: sigma_t is the same for every client this round, so
+        # TorchSketchProjector's (m, d) sign chunks are identical across
+        # clients too. sketch_phase1_batch generates each chunk once and
+        # applies it to every client's vector in the same pass, instead
+        # of rebuilding the chunks once per client -- again a
+        # simulation-only saving (a real client has only its own vector
+        # to project).
+        sketches_by_client = sketch_phase1_batch(phase1_by_client, sigma_t, sketch_m, model_dim)
         phase2_by_client = {}
         for client_idx in range(n_clients):
             phase2_by_client[client_idx] = round_step_phase2(
                 ctx_by_client[client_idx], phase1_by_client[client_idx],
                 sigma_t, sketch_m, threshold.B_t, rho_t, rho_e, vrf_alpha,
+                _sim_precomputed_sketch=sketches_by_client[client_idx],
             )
         _t_phase2 = time.time() - _t_phase2_start
 

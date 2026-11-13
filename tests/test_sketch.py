@@ -46,6 +46,47 @@ def test_different_seeds_give_different_projections():
     assert not np.allclose(y1, y2)
 
 
+def test_project_batch_matches_project_called_once_per_vector():
+    """FIX.md F4: project_batch must give exactly the same output as
+    calling project() once per vector under the same seed -- it is
+    only a dedup of the sign-chunk generation, not a different
+    projection."""
+    rng = np.random.default_rng(4)
+    d, m = 60_000, 2048
+    seed = b"batch-seed"
+    qs = [rng.normal(0, 1, size=d) for _ in range(5)]
+
+    individually = [SketchProjector(seed, m, d).project(q) for q in qs]
+    batched = SketchProjector(seed, m, d).project_batch(qs)
+
+    assert len(batched) == 5
+    for a, b in zip(individually, batched):
+        # Same signs, same products, summed in a different order (BLAS
+        # reduces (n,width)@(width,m) differently than (m,width)@(width,)) --
+        # float32 non-associativity, not a mismatch in which values were
+        # multiplied. Loose tolerance reflects that, not slack in the check.
+        np.testing.assert_allclose(a, b, rtol=1e-3, atol=1e-4)
+
+
+def test_project_batch_empty_and_single():
+    d, m = 10_000, 512
+    proj = SketchProjector(b"s", m, d)
+    assert proj.project_batch([]) == []
+    q = np.random.default_rng(5).normal(0, 1, size=d)
+    [only] = proj.project_batch([q])
+    np.testing.assert_allclose(only, proj.project(q), rtol=1e-6)
+
+
+def test_project_batch_rejects_wrong_dim():
+    proj = SketchProjector(b"s", 512, 10_000)
+    bad = np.zeros(999)
+    try:
+        proj.project_batch([bad])
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+
 def test_cost_independent_of_d_in_wallclock_terms():
     """Not a hard assertion (wall-clock is noisy) -- prints timing at
     small, fast sizes just to show cost scales with d on THIS CPU
@@ -71,5 +112,8 @@ if __name__ == "__main__":
     test_sketch_preserves_norm_within_jl_epsilon_on_synthetic_vector()
     test_sketch_is_deterministic_given_seed()
     test_different_seeds_give_different_projections()
+    test_project_batch_matches_project_called_once_per_vector()
+    test_project_batch_empty_and_single()
+    test_project_batch_rejects_wrong_dim()
     test_cost_independent_of_d_in_wallclock_terms()
     print("ALL sketch.py TESTS PASSED")

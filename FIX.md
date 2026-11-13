@@ -19,8 +19,8 @@ Status words used below:
 |---|---|---|---|
 | F1 | Aggregate was never unmasked: the model received random values every round | Correctness, blocks everything | **FIXED, CONFIRMED** |
 | F2 | Mask PRG and digest weights expanded by a Python SHA-256 loop; digest multiplied in Python big integers | Performance | **FIXED, SANDBOX-TESTED** |
-| F3 | Each pairwise mask is computed twice in the simulation | Performance (simulation only) | OPEN |
-| F4 | Sketch sign matrix is regenerated once per client though it is the same for all | Performance (simulation only) | OPEN |
+| F3 | Each pairwise mask is computed twice in the simulation | Performance (simulation only) | **INVESTIGATED, NOT ADOPTED** -- see below |
+| F4 | Sketch sign matrix is regenerated once per client though it is the same for all | Performance (simulation only) | **FIXED, SANDBOX-TESTED** |
 | F5 | Two full-dimension arrays are kept per client for the whole round: 17.6 GB at 50 clients | Memory, blocks 50 clients | OPEN |
 | F6 | Local training is one full-batch SGD step; unlikely to learn | ML validity | OPEN |
 | F7 | V3 norm check: sketch sent in clear, not bound to the update, commitment not binding for the client | Security and privacy | OPEN (design chosen) |
@@ -241,19 +241,138 @@ pass, and the server-path dry run from F1 still gives an exact aggregate.
 
 ## F3 — Pairwise masks computed twice
 
-**Status: OPEN.**
-Both members of a pair expand the same vector. In a single-process
-simulation it can be expanded once and applied with both signs.
-For the paper: this is a simulation saving only; per-client cost must be
-reported without it.
+**Status: INVESTIGATED, NOT ADOPTED (2026-11-13).** Built, measured, and
+disabled by default -- the numbers below are why.
+
+### The idea
+
+Two parties in a pair share the same shared_secret (X25519 ECDH), so
+they derive the same round seed and the same magnitude vector; only the
+sign differs. In this single-process simulation, both parties' masking
+calls run in the same process, so the vector could in principle be
+expanded once per pair and reused with the opposite sign for the
+second party, instead of expanding it twice.
+
+### What was built
+
+`crypto/secagg.py::pairwise_mask_cached(shared_secret, round_nonce, dim,
+sign, cache, pair_key)`: with `cache=None` it is exactly `pairwise_mask`
+(the real per-party cost); with a dict, the first call for a `pair_key`
+expands and stores the magnitude, the second call reuses it with the
+other sign.
+
+### What the numbers said
+
+Measured in the sandbox at model_dim = 11,208,318 (ResNet-18 estimate),
+8 clients, best of 3:
+
+| | Uncached | Cached |
+|---|---|---|
+| Wall time, all 56 expansions | 11.4 s | 12.7 s (slower) |
+
+The cache is not free: the dict in `fl/round_loop.py`'s loop structure
+does not release a pair's entry until the SECOND party is processed,
+which can be much later in the per-client loop -- so it holds up to
+`n(n-1)/2` full `model_dim`-length arrays at once in the worst case,
+not `n`. At this project's own scale:
+
+| Clients | Cache, worst case |
+|---|---|
+| 8 | 2.5 GB |
+| 30 | 39.0 GB |
+| 50 | 109.8 GB |
+
+30 clients is exactly the count that caused the RAM crash FIX.md F5
+exists to fix. Shipping F3 as designed would make that crash worse, not
+better, and the sandbox timing shows it is not even a time win at 8
+clients -- the memory traffic of holding many large arrays costs more
+than the AES calls it avoids.
+
+### Decision
+
+`fl/round_loop.py` passes `pairwise_mask_cache_this_round = None`,
+which makes every call go through the uncached path -- behavior is
+unchanged from before F3 was investigated. `pairwise_mask_cached` and
+`tests/test_mask_cache.py` stay in the repo: a pair-ORDERED redesign
+(process pairs, not clients, as the outer loop, so each magnitude is
+consumed by both parties immediately and freed) could recover the
+saving without the memory blowup, but that is a real restructure of
+`round_step_phase1`'s calling convention, not a drop-in cache, and
+is not worth it unless F2 and F4 turn out to be insufficient.
+
+### For the paper
+
+Nothing changes: this never touched per-client real-world cost, and it
+was never adopted in the simulation either.
+
+---
 
 ## F4 — Sketch sign matrix regenerated per client
 
-**Status: OPEN.**
-`round_step_phase2` builds a new `TorchSketchProjector` per client from the
-same seed σ_t, so the 8192 × d sign matrix is generated n times per round.
-Plan: generate each chunk once and apply it to all clients.
-For the paper: simulation saving only; a real client still pays for one sketch.
+**Status: FIXED, SANDBOX-TESTED (2026-11-13). Colab timing owed.**
+
+### What was wrong
+
+`round_step_phase2` built a fresh `TorchSketchProjector(seed=sigma_t, ...)`
+and called `.project()` once per client, even though sigma_t is the same
+for every client in a round -- the projector's (m, d) sign chunks (an
+internal detail of `.project()`'s chunked loop) are therefore identical
+across clients, and were being regenerated from scratch n times.
+
+### What changed
+
+- `SketchProjector.project_batch(qs)` (NumPy) and
+  `TorchSketchProjector.project_batch(qs)` (torch): generate each
+  chunk's signs once and apply them to every vector in `qs` in the
+  same pass, instead of once per vector. Same chunking and seeding as
+  `project()`.
+- `fl/client.py::sketch_phase1_batch(phase1_by_client, sketch_seed,
+  sketch_dim, model_dim)`: calls `project_batch` across every client's
+  `_secret_q` for the round, returns `{client_idx: y_k}`.
+- `round_step_phase2` takes an optional `_sim_precomputed_sketch`; when
+  given, it skips building its own projector. `fl/round_loop.py` calls
+  `sketch_phase1_batch` once per round and passes each client's result
+  in. Unlike F3, this holds no more memory than the round loop already
+  needs: `project_batch` stacks the `n` per-client vectors it is given
+  exactly once, which is the same `n * model_dim` the loop already
+  holds in `phase1_by_client` (F5's problem, not a new one) -- it does
+  not multiply by the number of pairs the way F3's cache did.
+
+### Measured (sandbox CPU, NumPy reference, best of 3; TorchSketchProjector
+itself is untested here, same caveat as the rest of that class)
+
+m = 8192, 8 clients, d = 200,000 (smaller d so the per-client loop
+finishes in sandbox time; cost is O(m*d), so this is representative):
+per-client loop 79.1 s, batched 10.7 s -- **7.4x**.
+
+### How it was checked
+
+`tests/test_sketch.py`: `project_batch` output matches calling
+`project()` once per vector (within float32 reordering tolerance),
+handles 0/1 vectors, rejects wrong dimension. A separate dry run
+(outside the test suite, torch stubbed) confirmed
+`sketch_phase1_batch`'s own plumbing -- extracting `_secret_q`,
+centering, keying the output dict -- matches the direct per-client
+path exactly, with the NumPy `SketchProjector` standing in for
+`TorchSketchProjector` since torch is not installed in this sandbox.
+75 repository tests pass.
+
+### Known limits
+
+- `TorchSketchProjector.project_batch` itself has not run anywhere
+  torch is actually installed. Written carefully against `project()`'s
+  already-reviewed-but-unrun implementation; validate on Colab before
+  trusting the GPU path, same as `project()`.
+- This is a simulation-only saving, same as F3's idea was: a real
+  client still pays for exactly one `project()` call, since it has no
+  other client's vector to batch with. Must not be used when reporting
+  per-client cost in the paper.
+
+### For the paper
+
+- State the real per-client sketch cost as one `project()` call at
+  m=8192, d=model_dim -- `sketch_phase1_batch` is simulation plumbing,
+  not a protocol change.
 
 ## F5 — Memory: O(n·d) arrays held for the whole round
 

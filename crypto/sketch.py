@@ -100,6 +100,37 @@ class SketchProjector:
             out += signs @ q32[start:end]
         return out * self.scale
 
+    def project_batch(self, qs: list, chunk: int = 4_000) -> list:
+        """Projects several vectors under this SAME seed in one pass
+        over the sign chunks, instead of calling `project()` once per
+        vector (FIX.md F4: that would regenerate every chunk's signs
+        once per vector even though they are identical). Verified
+        against calling `project()` individually in
+        tests/test_sketch.py.
+        """
+        n = len(qs)
+        if n == 0:
+            return []
+        for q in qs:
+            if q.shape[0] != self.d:
+                raise ValueError(f"expected d={self.d}, got {q.shape[0]}")
+        qs32 = np.stack([q.astype(np.float32, copy=False) for q in qs], axis=0)  # (n, d)
+        out = np.zeros((n, self.m), dtype=np.float64)
+        for start in range(0, self.d, chunk):
+            end = min(start + chunk, self.d)
+            width = end - start
+            sub_seed = int.from_bytes(
+                seed_commitment(self.seed + start.to_bytes(8, "little"))[:8], "little"
+            )
+            sub_rng = np.random.default_rng(sub_seed)
+            u = sub_rng.random(size=(self.m, width), dtype=np.float32)
+            signs = np.zeros((self.m, width), dtype=np.float32)
+            signs[u < self.density / 2] = -1.0
+            signs[u > 1.0 - self.density / 2] = 1.0
+            out += qs32[:, start:end] @ signs.T  # (n, width) @ (width, m) -> (n, m)
+        out *= self.scale
+        return [out[i] for i in range(n)]
+
 
 def empirical_jl_distortion(q: np.ndarray, seed: bytes, m: int, trials: int = 1) -> float:
     """||Pi(q)||_2 / ||q||_2 — should be close to 1.0 within the JL
@@ -273,3 +304,62 @@ class TorchSketchProjector:
             signs[u > 1.0 - self.density / 2] = 1.0
             out += signs @ q_t[start:end]
         return (out * self.scale).cpu().numpy()
+
+    def project_batch(self, qs: list, chunk: int = None) -> list:
+        """Torch counterpart of `SketchProjector.project_batch`
+        (FIX.md F4): generates each chunk's sign matrix once and
+        applies it to every vector in `qs` in the same pass, instead
+        of once per vector. Same chunking, seeding and OOM-retry
+        discipline as `project()`; returns one NumPy array per input,
+        in input order.
+
+        *** WRITTEN, NOT RUN -- same caveat as the rest of this class
+        (see class docstring and STATUS.md): torch is not installed in
+        the sandbox this was written in. Reviewed carefully against
+        `project()`'s already-reviewed-but-unrun implementation; the
+        NumPy counterpart (same algorithm, same chunk/seed scheme) IS
+        sandbox-tested against calling `project()` per vector, in
+        tests/test_sketch.py. Validate this method on Colab before
+        trusting it, exactly like `project()` itself.
+        """
+        torch = self.torch
+        n = len(qs)
+        if n == 0:
+            return []
+        if chunk is None:
+            chunk = self._default_chunk_size
+        for q in qs:
+            if q.shape[0] != self.d:
+                raise ValueError(f"expected d={self.d}, got {q.shape[0]}")
+        qs_t = torch.stack([
+            torch.as_tensor(q, dtype=torch.float32, device=self.device) if isinstance(q, np.ndarray)
+            else q.to(device=self.device, dtype=torch.float32)
+            for q in qs
+        ], dim=0)  # (n, d)
+        try:
+            out = self._project_chunked_batch(qs_t, chunk)
+        except torch.cuda.OutOfMemoryError:
+            if chunk <= 2_000:
+                raise
+            torch.cuda.empty_cache()
+            out = self._project_chunked_batch(qs_t, max(2_000, chunk // 4))
+        return [out[i].cpu().numpy() for i in range(n)]
+
+    def _project_chunked_batch(self, qs_t, chunk: int):
+        torch = self.torch
+        n = qs_t.shape[0]
+        out = torch.zeros((n, self.m), dtype=torch.float32, device=self.device)
+        for start in range(0, self.d, chunk):
+            end = min(start + chunk, self.d)
+            width = end - start
+            sub_seed = int.from_bytes(
+                seed_commitment(self.seed + start.to_bytes(8, "little"))[:8], "little"
+            )
+            gen = torch.Generator(device=self.device)
+            gen.manual_seed(sub_seed & ((1 << 63) - 1))
+            u = torch.rand((self.m, width), generator=gen, device=self.device, dtype=torch.float32)
+            signs = torch.zeros((self.m, width), dtype=torch.float32, device=self.device)
+            signs[u < self.density / 2] = -1.0
+            signs[u > 1.0 - self.density / 2] = 1.0
+            out += qs_t[:, start:end] @ signs.T  # (n, width) @ (width, m) -> (n, m)
+        return out * self.scale

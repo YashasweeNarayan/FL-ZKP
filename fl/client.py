@@ -20,7 +20,7 @@ import numpy as np
 from crypto.ristretto import Scalar, Point, scalar_mul_base
 from crypto.vrf import evaluate as vrf_evaluate, is_sampled as vrf_is_sampled
 from crypto.dp import split_noise
-from crypto.secagg import pairwise_mask, self_mask, self_secret_bytes, shamir_share_self_secret, P_MASK
+from crypto.secagg import pairwise_mask_cached, self_mask, self_secret_bytes, shamir_share_self_secret, P_MASK
 from crypto.pedersen import commit as pedersen_commit
 from crypto.elgamal_threshold import encrypt as elgamal_encrypt
 from crypto.clsag import sign as clsag_sign, h_p as clsag_h_p
@@ -233,8 +233,16 @@ def round_step_phase1(
     lr: float,
     epochs: int,
     pk_trace: Point,
+    _sim_pairwise_mask_cache: dict | None = None,
 ) -> ClientSubmissionPhase1:
-    """Steps 0-7 of ARCHITECTURE.md §4's round protocol."""
+    """Steps 0-7 of ARCHITECTURE.md §4's round protocol.
+
+    `_sim_pairwise_mask_cache`: simulation-only (FIX.md F3), see
+    `crypto.secagg.pairwise_mask_cached`. Leave as `None` for the real
+    per-client cost; `fl/round_loop.py` passes a dict it owns for one
+    round to avoid expanding each pair's mask twice in this
+    single-process simulation.
+    """
     # Step 0: VRF self-sampling.
     vrf_out = vrf_evaluate(ctx.keys.sk, ctx.keys.pk, vrf_alpha)
     b_k = vrf_is_sampled(vrf_out.beta, sampling_rate)
@@ -262,7 +270,10 @@ def round_step_phase1(
     masked = q_k.copy()
     for other_idx, secret in ctx.pairwise_secrets.items():
         sign = 1 if ctx.keys.index < other_idx else -1
-        masked = (masked + pairwise_mask(secret, rho_t, ctx.model_dim, sign)) % P_MASK
+        pair_key = (min(ctx.keys.index, other_idx), max(ctx.keys.index, other_idx))
+        masked = (masked + pairwise_mask_cached(
+            secret, rho_t, ctx.model_dim, sign, _sim_pairwise_mask_cache, pair_key,
+        )) % P_MASK
     masked = (masked + self_mask(self_secret_bytes(ctx.self_mask_secret_int), rho_t, ctx.model_dim)) % P_MASK
 
     # Step 5: Pedersen-commit the masked vector, via a single scalar
@@ -304,6 +315,31 @@ def round_step_phase1(
     )
 
 
+def sketch_phase1_batch(
+    phase1_by_client: dict, sketch_seed: bytes, sketch_dim: int, model_dim: int,
+) -> dict:
+    """Simulation-only optimization (FIX.md F4). sigma_t (`sketch_seed`)
+    is the same for every client this round, so `TorchSketchProjector`'s
+    (m, d) sign chunks are identical across clients -- only the vector
+    being projected differs. `SketchProjector.project_batch` /
+    `TorchSketchProjector.project_batch` generate each chunk once and
+    apply it to every client's vector in the same pass, instead of once
+    per client (`round_step_phase2` calling `.project()` n times). A
+    real client still pays for exactly one project() call -- it has no
+    other client's vector to batch with, so this must not be used when
+    reporting per-client cost.
+
+    Returns `{client_idx: y_k}`, the same per-client sketch
+    `round_step_phase2` would otherwise compute itself; pass each value
+    in as that call's `_sim_precomputed_sketch`.
+    """
+    sketch = TorchSketchProjector(seed=sketch_seed, m=sketch_dim, d=model_dim)
+    indices = list(phase1_by_client.keys())
+    signed_qs = [center_mod_p_mask(phase1_by_client[i]._secret_q).astype(np.float64) for i in indices]
+    ys = sketch.project_batch(signed_qs)
+    return dict(zip(indices, ys))
+
+
 def round_step_phase2(
     ctx: ClientRoundContext,
     phase1: ClientSubmissionPhase1,
@@ -313,6 +349,7 @@ def round_step_phase2(
     rho_t: bytes,
     rho_e: bytes,
     vrf_alpha: bytes,
+    _sim_precomputed_sketch: np.ndarray | None = None,
 ) -> ClientSubmissionPhase2:
     """Steps 8-10, run AFTER the server reveals sigma_t.
 
@@ -347,10 +384,18 @@ def round_step_phase2(
     (which assumes norms shrink as training converges) track a
     quantity that actually does shrink, instead of P_MASK-scale
     wrap-noise that wouldn't.
+
+    `_sim_precomputed_sketch`: simulation-only (FIX.md F4), see
+    `sketch_phase1_batch`. Leave as `None` for the real per-client
+    cost -- this builds and uses its own `TorchSketchProjector` exactly
+    as before.
     """
-    sketch = TorchSketchProjector(seed=sketch_seed, m=sketch_dim, d=ctx.model_dim)
-    signed_q = center_mod_p_mask(phase1._secret_q)
-    y_k = sketch.project(signed_q.astype(np.float64))
+    if _sim_precomputed_sketch is not None:
+        y_k = _sim_precomputed_sketch
+    else:
+        sketch = TorchSketchProjector(seed=sketch_seed, m=sketch_dim, d=ctx.model_dim)
+        signed_q = center_mod_p_mask(phase1._secret_q)
+        y_k = sketch.project(signed_q.astype(np.float64))
 
     norm_estimate = int(np.linalg.norm(y_k))
     n_bits = max(8, int(np.ceil(np.log2(max(B_t * 4, 2)))))

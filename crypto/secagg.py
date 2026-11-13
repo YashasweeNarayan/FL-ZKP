@@ -77,6 +77,34 @@ def pairwise_mask(shared_secret: bytes, round_nonce: bytes, dim: int, sign: int)
     return pairwise_mask_from_round_seed(pairwise_round_seed(shared_secret, round_nonce), dim, sign)
 
 
+def pairwise_mask_cached(
+    shared_secret: bytes, round_nonce: bytes, dim: int, sign: int,
+    cache: dict | None, pair_key,
+) -> np.ndarray:
+    """Same result as `pairwise_mask` (FIX.md F3). Both parties in a pair
+    derive the identical shared_secret (X25519 ECDH) and therefore the
+    identical round seed and expanded magnitude vector -- only `sign`
+    differs between them. A real client has no access to the other
+    party's process and must still expand its own copy; this
+    simulation runs every client in one process, so when the caller
+    passes a `cache` dict it owns for exactly one round, the expansion
+    is done once per unordered pair (`pair_key`, e.g. `(min(i,j),
+    max(i,j))`) and the stored vector is reused for the second party
+    with the opposite sign -- a cheap O(dim) negation instead of a
+    second AES-CTR expansion.
+
+    `cache=None` recovers the exact per-party cost (calls `pairwise_mask`
+    directly) -- this is what any real-cost measurement must use.
+    """
+    if cache is None:
+        return pairwise_mask(shared_secret, round_nonce, dim, sign)
+    magnitude = cache.get(pair_key)
+    if magnitude is None:
+        magnitude = pairwise_mask_from_round_seed(pairwise_round_seed(shared_secret, round_nonce), dim, 1)
+        cache[pair_key] = magnitude
+    return (sign * magnitude) % P_MASK
+
+
 def self_mask(self_secret: bytes, round_nonce: bytes, dim: int) -> np.ndarray:
     """A client's own private mask -- summed INTO its masked update but
     never cancelled by any other client's contribution. Recoverable only
