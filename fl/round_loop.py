@@ -114,6 +114,7 @@ def bootstrap_norms_from_model_dim(
     delta_scale: float = 5.0,
     rng: np.random.Generator = None,
     verbose: bool = True,
+    sketch_batch_budget_bytes: int = DEFAULT_SKETCH_BATCH_BYTES,
 ) -> np.ndarray:
     """Round-0 B_t bootstrap, STAND-IN for ARCHITECTURE.md ROADMAP
     §3.4's real design ("server computes norms on its OWN root-set
@@ -192,15 +193,30 @@ def bootstrap_norms_from_model_dim(
         print(f"bootstrap_norms_from_model_dim: {n_samples} samples at model_dim={model_dim}, "
               f"device={sketch.device} (NumPy-CPU upper-bound estimate ~{est_per_sample:.1f}s/sample, "
               f"~{est_per_sample * n_samples / 60:.1f} min total -- should be much faster on GPU)")
-    for i in range(n_samples):
+    # FIX.md F4/F5: every sample uses the SAME sketch_seed, so the sign
+    # chunks are identical across samples -- generating them once per
+    # batch instead of once per sample is the same saving F4 found in
+    # phase 2, and this loop was costing 33 s/sample at ResNet-50
+    # (330 s before round 0 even started). Batched in groups sized from
+    # a byte budget, not all n_samples at once, so peak stays bounded
+    # the same way phase 2's does.
+    batch = suggested_batch_size(model_dim, sketch_batch_budget_bytes)
+    done = 0
+    while done < n_samples:
+        group = min(batch, n_samples - done)
         t0 = time.time() if verbose else None
-        delta = rng.normal(0.0, delta_scale, size=model_dim)
-        q = quantize(delta, bits=quant_bits)
-        signed_q = center_mod_p_mask(q)
-        y = sketch.project(signed_q.astype(np.float64))
-        norms[i] = np.linalg.norm(y)
+        stack = np.empty((group, model_dim), dtype=np.float32)
+        for row in range(group):
+            delta = rng.normal(0.0, delta_scale, size=model_dim)
+            stack[row] = center_mod_p_mask(quantize(delta, bits=quant_bits))
+            del delta
+        for row, y in enumerate(sketch.project_batch(stack)):
+            norms[done + row] = np.linalg.norm(y)
+        del stack
         if verbose:
-            print(f"  sample {i+1}/{n_samples} done ({time.time()-t0:.1f}s)")
+            print(f"  samples {done+1}-{done+group}/{n_samples} done "
+                  f"({time.time()-t0:.1f}s for {group} in one pass)")
+        done += group
     return norms
 
 
