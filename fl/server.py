@@ -167,7 +167,24 @@ def run_round(
     n_clients: int,
     model_dim: int,
     unmask_provider,        # callable(accepted_indices, excluded_indices) -> UnmaskingMaterial
+    masked_vector_provider=None,  # callable(client_index) -> x_k; see the streaming note below (FIX.md F5)
 ) -> RoundOutcome:
+    # Default provider: read the vector off the submission itself, the
+    # pre-F5 behaviour. `fl/round_loop.py` passes a provider backed by
+    # the round's vector store instead, so the submissions carry no
+    # full-length arrays at all.
+    if masked_vector_provider is None:
+        by_index = {idx: sub for idx, sub in submissions}
+
+        def masked_vector_provider(idx):
+            vec = by_index[idx]._secret_masked_vector
+            if vec is None:
+                raise ValueError(
+                    f"client {idx}: no masked vector on the submission and no "
+                    f"masked_vector_provider given -- phase 1 stored it in a "
+                    f"vector store, so run_round needs that store's provider"
+                )
+            return vec
     seen_key_images: set = set()
     accepted = []
     rejected_reasons = {}
@@ -193,14 +210,34 @@ def run_round(
             rejected_reasons=rejected_reasons,
         )
 
-    # Clients reveal r_k only AFTER acceptance (see client.py's
-    # reveal_blinding_after_acceptance) -- this function assumes the
-    # caller already collected those and attached them, since the
-    # reveal is an out-of-band step gated on this function's own output
-    # in a real deployment (chicken-and-egg only in sequence diagrams,
-    # not in the actual control flow: accept first, THEN ask for r_k).
-    masked_vectors = [sub._secret_masked_vector for _, sub in accepted]
-    aggregate_masked_vector = aggregate_masked(masked_vectors)
+    # FIX.md F5: the masked vectors are STREAMED, one client at a time,
+    # and the two things computed from them -- the coordinate-wise sum
+    # and each client's own digest -- are produced in the SAME pass, so
+    # each vector is fetched once and dropped before the next is
+    # fetched. Peak here is the accumulator plus one vector, i.e. O(d),
+    # independent of how many clients were accepted. Holding the list
+    # was 10.6 GB at 30 clients and crashed the runtime on 2026-11-12.
+    #
+    # This is also what a real server does: process each submission as
+    # it arrives, accumulate, discard. `masked_vector_provider(idx)` is
+    # the seam -- in this simulation it reads from the round's vector
+    # store; in a deployment it would be the arriving message.
+    #
+    # The digest MUST be computed here from the vector the server
+    # actually received, not taken from a value the client supplied:
+    # recomputing it is precisely what binds x_k to the commitment c_k
+    # that V5 checks. A client-supplied digest would always match its
+    # own c_k by construction, so V5 would pass for any x_k whatsoever.
+    aggregate_masked_vector = None
+    published_sum_value = 0
+    for client_index, _ in accepted:
+        x_k = masked_vector_provider(client_index)
+        aggregate_masked_vector = (
+            np.array(x_k, dtype=np.int64) % P_MASK if aggregate_masked_vector is None
+            else (aggregate_masked_vector + x_k) % P_MASK
+        )
+        published_sum_value += weighted_digest(x_k, seed=rho_t)
+        del x_k
 
     # V5: anyone can recompute Pi c_k and compare against the server's
     # published aggregate-opening. `expected` is the LHS (product of the
@@ -221,7 +258,8 @@ def run_round(
     # the much larger group order L, and N*P_MASK << L for any
     # realistic client count, so no wraparound happens there). But
     # `aggregate_masked_vector` is already reduced mod P_MASK
-    # COORDINATE-WISE by `aggregate_masked` -- required for SecAgg's
+    # COORDINATE-WISE by the streaming accumulation above (same
+    # reduction `aggregate_masked` applies) -- required for SecAgg's
     # masks to cancel correctly -- so digesting it afterward reduces
     # the *weighted sum of already-wrapped coordinates*, which differs
     # from the exact sum(d_k) by a multiple of P_MASK as soon as more
@@ -232,7 +270,13 @@ def run_round(
     # round with exactly this "does not open to Pi(c_k)" mismatch.
     commitments = [Commitment(sub.commitment_point) for _, sub in accepted]
     expected = commit_sum(commitments)
-    published_sum_value = sum(weighted_digest(sub._secret_masked_vector, seed=rho_t) for _, sub in accepted)
+
+    # Clients reveal r_k only AFTER acceptance (see client.py's
+    # reveal_blinding_after_acceptance) -- this function assumes the
+    # caller already collected those and attached them, since the
+    # reveal is an out-of-band step gated on this function's own output
+    # in a real deployment (chicken-and-egg only in sequence diagrams,
+    # not in the actual control flow: accept first, THEN ask for r_k).
     published_sum_blinding = None
     for _, sub in accepted:
         r_k = sub._secret_blinding

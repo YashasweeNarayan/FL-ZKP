@@ -21,7 +21,7 @@ Status words used below:
 | F2 | Mask PRG and digest weights expanded by a Python SHA-256 loop; digest multiplied in Python big integers | Performance | **FIXED, SANDBOX-TESTED** |
 | F3 | Each pairwise mask is computed twice in the simulation | Performance (simulation only) | **INVESTIGATED, NOT ADOPTED** -- see below |
 | F4 | Sketch sign matrix is regenerated once per client though it is the same for all | Performance (simulation only) | **FIXED, SANDBOX-TESTED** |
-| F5 | Two full-dimension arrays are kept per client for the whole round: 17.6 GB at 50 clients | Memory, blocks 50 clients | OPEN |
+| F5 | Two full-dimension arrays are kept per client for the whole round: 17.6 GB at 50 clients | Memory, blocks 50 clients | **FIXED, SANDBOX-TESTED** |
 | F6 | Local training is one full-batch SGD step; unlikely to learn | ML validity | OPEN |
 | F7 | V3 norm check: sketch sent in clear, not bound to the update, commitment not binding for the client | Security and privacy | OPEN (design chosen) |
 
@@ -376,12 +376,149 @@ path exactly, with the NumPy `SketchProjector` standing in for
 
 ## F5 — Memory: O(n·d) arrays held for the whole round
 
-**Status: OPEN.**
-`ClientSubmissionPhase1` keeps `_secret_q` and `_secret_masked_vector`
-(2 × d × 8 bytes) per client until the round ends: 10.6 GB at 30 clients
-(the 2026-11-12 crash), 17.6 GB at 50.
-Plan: keep only small artifacts in RAM; spill the two arrays to disk and
-stream them.
+**Status: FIXED, SANDBOX-TESTED (2026-11-13). Colab confirmation owed.**
+This is the bug behind the 2026-11-12 runtime crash.
+
+### What was wrong
+
+Each client produces two full-length int64 arrays in phase 1:
+
+- `q_k`, the quantized update, needed later by phase 2's sketch;
+- `x_k = q_k + m_k`, the masked vector, needed later by the server.
+
+Both were carried on `ClientSubmissionPhase1`, and the round loop held
+every client's submission until the round ended. That is
+`2 · n · model_dim · 8` bytes resident at once: 2.8 GB at 8 clients and
+ResNet-50, **10.6 GB at 30** — the crash — and 17.6 GB at 50. A ceiling
+on client count, not a tuning problem.
+
+### Why the obvious fix was the wrong one
+
+The tempting restructure is to fuse phase 1 and phase 2 per client, so
+each `q_k` dies immediately. That breaks the protocol:
+ARCHITECTURE.md line 194 requires σ_t to be published *after every*
+`c_k` is on the bulletin board, because §9's soundness argument needs
+the projection seed chosen independently of any client's `q_k`. Fusing
+the phases would reveal σ_t to client 1 before client 2 had committed.
+
+So the ordering stays exactly as it was. What changed is only *where
+the arrays live between the phases* — which is not a protocol fact.
+
+### What changed
+
+- **New `fl/vector_store.py`.** `RoundVectorStore` holds one round's
+  arrays, keeping them resident up to a byte budget and spilling the
+  rest to `.npy` files. Closed in a `finally`, so an aborted round
+  leaves nothing behind across a 45-round sweep. Arrays come back
+  read-only: the resident path returns the stored array while the
+  spilled path returns a fresh load, so a caller that mutated one
+  would corrupt data below the budget and not above it — read-only
+  turns that into an immediate failure instead of a scale-dependent
+  heisenbug.
+- **`round_step_phase1` takes a `vector_sink`.** Given one, it hands
+  over `q_k` and `x_k` and returns a submission carrying neither.
+  Without one, behaviour is exactly as before.
+- **`fl/server.py` streams.** `run_round` takes a
+  `masked_vector_provider(client_index)` and computes the masked sum
+  **and** each client's digest in a single pass, fetching one vector
+  at a time and dropping it before the next. Peak is the accumulator
+  plus one vector — O(d), independent of how many clients were
+  accepted. The default provider reads off the submission, so the old
+  calling convention still works.
+- **`aggregate_masked` accepts any iterable**, so callers can stream a
+  generator instead of materializing a list of n vectors.
+- **Phase 2 batches in bounded groups.** F4's batching stacked all n
+  clients, which would have reintroduced exactly this O(n·d)
+  residency. `sketch_phase1_batch` now takes a `q_provider` and a
+  `batch_size` chosen from a byte budget by
+  `suggested_batch_size`, so it does not grow with n. Batch 7 at
+  ResNet-18 still does the sign-chunk work once per 7 clients instead
+  of once per client, keeping most of F4's win.
+- **Two separate budgets**, not one knob shared: `vector_budget_bytes`
+  (default 2 GiB, resident across the round) and
+  `sketch_batch_budget_bytes` (default 1 GiB, transient inside phase
+  2). They can be live together, so the honest peak is about their
+  sum; sharing one number would have understated it by the batch.
+
+### Measured — peak process RSS, not an estimate
+
+The crash was a real-memory event, so this is a real-memory
+measurement: `run_round` driven end to end at d = 2,000,000, one
+process per configuration, `ru_maxrss` high-water mark. "old" pins each
+masked vector on its submission; "new" streams from the store.
+
+| Clients | old | new |
+|---|---|---|
+| 8 | 265 MiB | 150 MiB |
+| 16 | 387 MiB | 150 MiB |
+| 32 | 632 MiB | **151 MiB** |
+
+The aggregate matched the true sum of the accepted `q_k` in all six
+runs. "old" climbs by ~16 MiB per client — exactly one `model_dim`
+int64 array — while "new" is flat. This harness pins one array per
+client; the round loop pinned two, so the real slope was double.
+
+Projected at the models in play, with the default budgets:
+
+| Model | Clients | Before | After | Disk |
+|---|---|---|---|---|
+| ResNet-18 | 30 | 5.0 GiB | 2.5 GiB | 3.0 GiB |
+| ResNet-18 | 50 | 8.4 GiB | 2.5 GiB | 6.4 GiB |
+| ResNet-50 | 30 | 10.6 GiB | 2.6 GiB | 8.6 GiB |
+| ResNet-50 | 50 | 17.6 GiB | 2.6 GiB | 15.6 GiB |
+
+### How it was checked
+
+- `tests/test_vector_store.py`, 13 tests: exact round-trip on both the
+  resident and the spilled path, mixed residency staying under budget,
+  read-only returns on both paths, cleanup and idempotent close,
+  use-after-close, duplicate put, missing key, early drop, and the F5
+  claim itself — peak residency identical at 8, 30, 50 and 200
+  clients. Plus: `aggregate_masked` over a generator equals the list
+  form, streaming from the store equals the list form, and the fused
+  one-pass sum-and-digest equals the two separate list passes.
+- A dry run (torch stubbed, NumPy projector substituted) confirmed
+  `sketch_phase1_batch` returns results identical to the per-client
+  path at batch sizes 1, 2, 3, 7 and 16, on both the all-resident and
+  all-spilled store, and deterministic across repeats.
+- The F1 server dry run still gives an exact aggregate through the
+  default provider, and still aborts cleanly on too few shares.
+- 88 repository tests pass.
+
+### Known limits
+
+- **Not yet run on Colab.** The round-loop wiring needs torch and
+  pynacl. The pieces are tested here; the integration is not.
+- **Disk traffic.** At 50 clients and ResNet-50 a round writes and
+  re-reads ~15.6 GB. Colab's local disk has room, but this is real I/O
+  time that the next Colab timing line will show. Raising
+  `vector_budget_bytes` on a larger-RAM runtime removes it.
+- **Slightly more RAM at small n.** At 8 clients and ResNet-18
+  everything fits resident anyway, and the phase-2 batch adds ~0.4 GiB
+  on top — about 1.8 GiB where the old code used 1.3. The win starts
+  where it matters (n ≥ 30) and the ceiling is flat after that.
+- **A full disk now fails the round loudly** (the `np.save` error
+  propagates) rather than silently dropping a vector — deliberate,
+  given F1 was exactly a silent-corruption bug.
+
+### For the paper
+
+- Peak server memory is **O(model_dim), independent of client count**:
+  the server holds one submission's vector and a running accumulator.
+  This is also what a real deployment does — process each submission
+  as it arrives, accumulate, discard. Holding all n was an artifact of
+  running every party in one process, so the simulation is now *more*
+  faithful, not less.
+- Per-client memory is unchanged and was always O(model_dim): a real
+  client only ever holds its own vectors.
+- The digest is recomputed by the server from the vector it received,
+  never taken from a client-supplied value. That recomputation is what
+  binds `x_k` to `c_k` in V5; a client-supplied digest would match its
+  own `c_k` by construction and V5 would pass for any `x_k` at all.
+  Worth stating explicitly, since it is the kind of shortcut that
+  looks like a harmless optimization.
+- σ_t is still published only after every `c_k` is posted. The fix
+  changed storage, not message order.
 
 ## F6 — Local training
 

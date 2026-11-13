@@ -132,10 +132,19 @@ def recover_self_mask(shares: list[ShamirShare], round_nonce: bytes, dim: int) -
     return self_mask(secret_bytes, round_nonce, dim)
 
 
-def aggregate_masked(masked_updates: list[np.ndarray]) -> np.ndarray:
-    acc = np.zeros_like(masked_updates[0])
+def aggregate_masked(masked_updates) -> np.ndarray:
+    """Coordinate-wise sum mod P_MASK.
+
+    Takes any iterable, not just a list, so callers can stream vectors
+    in one at a time instead of materializing all n of them (FIX.md F5:
+    holding them all was a 10.6 GB peak at 30 clients). The accumulator
+    is the only full-length array this holds.
+    """
+    acc = None
     for u in masked_updates:
-        acc = (acc + u) % P_MASK
+        acc = np.array(u, dtype=np.int64) % P_MASK if acc is None else (acc + u) % P_MASK
+    if acc is None:
+        raise ValueError("aggregate_masked needs at least one vector")
     return acc
 
 

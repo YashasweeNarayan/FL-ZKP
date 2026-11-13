@@ -234,6 +234,7 @@ def round_step_phase1(
     epochs: int,
     pk_trace: Point,
     _sim_pairwise_mask_cache: dict | None = None,
+    vector_sink=None,
 ) -> ClientSubmissionPhase1:
     """Steps 0-7 of ARCHITECTURE.md §4's round protocol.
 
@@ -242,6 +243,14 @@ def round_step_phase1(
     per-client cost; `fl/round_loop.py` passes a dict it owns for one
     round to avoid expanding each pair's mask twice in this
     single-process simulation.
+
+    `vector_sink`: FIX.md F5. When given, it is called as
+    `vector_sink(q_k, masked)` and the returned submission carries
+    `_secret_q = _secret_masked_vector = None`, so n submissions do not
+    pin 2*n*model_dim*8 bytes of RAM for the whole round. When `None`,
+    both arrays stay on the submission exactly as before -- that is
+    still the right shape for a single client in isolation, and for
+    tests.
     """
     # Step 0: VRF self-sampling.
     vrf_out = vrf_evaluate(ctx.keys.sk, ctx.keys.pk, vrf_alpha)
@@ -302,6 +311,14 @@ def round_step_phase1(
     message = commitment.point.b + escrow_ct.c1.b + escrow_ct.c2.b
     sig = clsag_sign(ctx.keys.sk, ctx.keys.index, ctx.ring, message, rho_t, rho_e)
 
+    # FIX.md F5: hand the two full-length arrays to the round's store
+    # and keep them off the submission, so holding n submissions costs
+    # O(n) small objects instead of O(n * model_dim) int64 entries.
+    if vector_sink is not None:
+        vector_sink(q_k, masked)
+        q_k = None
+        masked = None
+
     return ClientSubmissionPhase1(
         commitment_point=commitment.point,
         escrow_ciphertext=escrow_ct,
@@ -316,7 +333,8 @@ def round_step_phase1(
 
 
 def sketch_phase1_batch(
-    phase1_by_client: dict, sketch_seed: bytes, sketch_dim: int, model_dim: int,
+    client_indices, q_provider, sketch_seed: bytes, sketch_dim: int, model_dim: int,
+    batch_size: int = 8,
 ) -> dict:
     """Simulation-only optimization (FIX.md F4). sigma_t (`sketch_seed`)
     is the same for every client this round, so `TorchSketchProjector`'s
@@ -329,15 +347,40 @@ def sketch_phase1_batch(
     other client's vector to batch with, so this must not be used when
     reporting per-client cost.
 
+    FIX.md F5: batched in groups of `batch_size`, NOT across all n
+    clients at once -- an n-wide stack would be exactly the
+    O(n * model_dim) residency F5 exists to remove. The sign chunks are
+    regenerated once per batch instead of once per client, so batch
+    size 8 already captures 7/8 of F4's saving at bounded memory;
+    `fl/vector_store.py::suggested_batch_size` picks it from a byte
+    budget so it does not grow with client count.
+
+    `q_provider(client_index)` returns that client's `_secret_q`; each
+    is read once, converted into its row of the batch, and released
+    before the next is read.
+
     Returns `{client_idx: y_k}`, the same per-client sketch
     `round_step_phase2` would otherwise compute itself; pass each value
     in as that call's `_sim_precomputed_sketch`.
     """
     sketch = TorchSketchProjector(seed=sketch_seed, m=sketch_dim, d=model_dim)
-    indices = list(phase1_by_client.keys())
-    signed_qs = [center_mod_p_mask(phase1_by_client[i]._secret_q).astype(np.float64) for i in indices]
-    ys = sketch.project_batch(signed_qs)
-    return dict(zip(indices, ys))
+    indices = list(client_indices)
+    batch_size = max(1, int(batch_size))
+    out = {}
+    for start in range(0, len(indices), batch_size):
+        group = indices[start : start + batch_size]
+        stack = np.empty((len(group), model_dim), dtype=np.float32)
+        for row, client_index in enumerate(group):
+            q = q_provider(client_index)
+            # center_mod_p_mask returns a new array; assigning into the
+            # preallocated row casts to float32 without building a
+            # second full-length float64 copy that outlives the loop.
+            stack[row] = center_mod_p_mask(q)
+            del q
+        for client_index, y_k in zip(group, sketch.project_batch(stack)):
+            out[client_index] = y_k
+        del stack
+    return out
 
 
 def round_step_phase2(
@@ -393,6 +436,13 @@ def round_step_phase2(
     if _sim_precomputed_sketch is not None:
         y_k = _sim_precomputed_sketch
     else:
+        if phase1._secret_q is None:
+            raise ValueError(
+                "phase 1 handed q_k to a vector_sink (FIX.md F5), so this "
+                "submission carries no q_k to sketch -- pass the sketch in as "
+                "_sim_precomputed_sketch (see sketch_phase1_batch) or call "
+                "round_step_phase1 without a vector_sink"
+            )
         sketch = TorchSketchProjector(seed=sketch_seed, m=sketch_dim, d=ctx.model_dim)
         signed_q = center_mod_p_mask(phase1._secret_q)
         y_k = sketch.project(signed_q.astype(np.float64))

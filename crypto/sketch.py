@@ -111,10 +111,19 @@ class SketchProjector:
         n = len(qs)
         if n == 0:
             return []
-        for q in qs:
-            if q.shape[0] != self.d:
-                raise ValueError(f"expected d={self.d}, got {q.shape[0]}")
-        qs32 = np.stack([q.astype(np.float32, copy=False) for q in qs], axis=0)  # (n, d)
+        # A caller that already built an (n, d) float32 block -- as
+        # fl/client.py::sketch_phase1_batch does, to bound peak memory
+        # (FIX.md F5) -- hands it straight through, instead of paying
+        # for a second full copy here.
+        if isinstance(qs, np.ndarray) and qs.ndim == 2 and qs.dtype == np.float32:
+            if qs.shape[1] != self.d:
+                raise ValueError(f"expected d={self.d}, got {qs.shape[1]}")
+            qs32 = qs
+        else:
+            for q in qs:
+                if q.shape[0] != self.d:
+                    raise ValueError(f"expected d={self.d}, got {q.shape[0]}")
+            qs32 = np.stack([q.astype(np.float32, copy=False) for q in qs], axis=0)  # (n, d)
         out = np.zeros((n, self.m), dtype=np.float64)
         for start in range(0, self.d, chunk):
             end = min(start + chunk, self.d)
@@ -328,14 +337,21 @@ class TorchSketchProjector:
             return []
         if chunk is None:
             chunk = self._default_chunk_size
-        for q in qs:
-            if q.shape[0] != self.d:
-                raise ValueError(f"expected d={self.d}, got {q.shape[0]}")
-        qs_t = torch.stack([
-            torch.as_tensor(q, dtype=torch.float32, device=self.device) if isinstance(q, np.ndarray)
-            else q.to(device=self.device, dtype=torch.float32)
-            for q in qs
-        ], dim=0)  # (n, d)
+        # Pre-stacked (n, d) block from sketch_phase1_batch: move it
+        # across in one go rather than stacking a second copy.
+        if isinstance(qs, np.ndarray) and qs.ndim == 2:
+            if qs.shape[1] != self.d:
+                raise ValueError(f"expected d={self.d}, got {qs.shape[1]}")
+            qs_t = torch.as_tensor(qs, dtype=torch.float32, device=self.device)
+        else:
+            for q in qs:
+                if q.shape[0] != self.d:
+                    raise ValueError(f"expected d={self.d}, got {q.shape[0]}")
+            qs_t = torch.stack([
+                torch.as_tensor(q, dtype=torch.float32, device=self.device) if isinstance(q, np.ndarray)
+                else q.to(device=self.device, dtype=torch.float32)
+                for q in qs
+            ], dim=0)  # (n, d)
         try:
             out = self._project_chunked_batch(qs_t, chunk)
         except torch.cuda.OutOfMemoryError:

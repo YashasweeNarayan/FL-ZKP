@@ -36,6 +36,9 @@ from .client import (
     share_self_mask_secret, sketch_phase1_batch,
 )
 from .server import run_round, apply_update, UnmaskingMaterial
+from .vector_store import (
+    RoundVectorStore, DEFAULT_BUDGET_BYTES, DEFAULT_SKETCH_BATCH_BYTES, suggested_batch_size,
+)
 from .norm_rule import bootstrap_from_server_root, update_threshold_ema
 from .models import flatten_state_dict, unflatten_to_state_dict
 
@@ -216,6 +219,9 @@ def run_training_loop(
     epochs: int = 1,
     verbose: bool = True,
     secagg_share_threshold: int = None,
+    vector_budget_bytes: int = DEFAULT_BUDGET_BYTES,
+    sketch_batch_budget_bytes: int = DEFAULT_SKETCH_BATCH_BYTES,
+    spill_dir: str = None,
 ):
     """Runs ARCHITECTURE.md §4's round protocol for `rounds` rounds over
     one model: VRF self-sampling -> local train -> DP noise -> quantize
@@ -318,132 +324,163 @@ def run_training_loop(
         phase1_by_client = {}
         self_mask_shares_held = {}   # {k: {holder_id: ShamirShare}} -- held by the OTHER clients, not the server
         holder_ids = list(range(1, n_clients + 1))
-        # FIX.md F3: NOT enabled here. A naive per-round cache of every
-        # pair's expanded vector was measured to cost more memory than
-        # it saves in time -- see FIX.md F3 for the numbers (2.5 GB at
-        # 8 clients, 39 GB at 30, 110 GB at 50 -- directly worsening the
-        # F5 crash this project already hit). pairwise_mask_cached and
-        # its tests stay in the repo for a future pair-ordered redesign,
-        # but round_loop.py must not pass a cache here until one exists.
-        pairwise_mask_cache_this_round = None
-        for client_idx in range(n_clients):
-            ctx = ClientRoundContext(
-                keys=ClientKeys(sk=client_sks[client_idx], pk=ring[client_idx], index=client_idx),
-                ring=ring,
-                pairwise_secrets=pairwise_secrets[client_idx],
-                self_mask_secret_int=new_self_mask_secret(),
-                model_dim=model_dim,
+        # FIX.md F5: q_k and x_k go here instead of staying on the
+        # submissions, so peak RAM stops scaling with n_clients. Closed
+        # in the `finally` below -- an aborted round must not leave
+        # spill files behind across a 45-round sweep.
+        store = RoundVectorStore(budget_bytes=vector_budget_bytes, dirpath=spill_dir)
+        try:
+            # FIX.md F3: NOT enabled here. A naive per-round cache of every
+            # pair's expanded vector was measured to cost more memory than
+            # it saves in time -- see FIX.md F3 for the numbers (2.5 GB at
+            # 8 clients, 39 GB at 30, 110 GB at 50 -- directly worsening the
+            # F5 crash this project already hit). pairwise_mask_cached and
+            # its tests stay in the repo for a future pair-ordered redesign,
+            # but round_loop.py must not pass a cache here until one exists.
+            pairwise_mask_cache_this_round = None
+            for client_idx in range(n_clients):
+                ctx = ClientRoundContext(
+                    keys=ClientKeys(sk=client_sks[client_idx], pk=ring[client_idx], index=client_idx),
+                    ring=ring,
+                    pairwise_secrets=pairwise_secrets[client_idx],
+                    self_mask_secret_int=new_self_mask_secret(),
+                    model_dim=model_dim,
+                )
+                ctx_by_client[client_idx] = ctx
+                self_mask_shares_held[client_idx] = share_self_mask_secret(ctx, holder_ids, share_t)
+
+                def _sink(q_k, masked, _k=client_idx):
+                    store.put(("q", _k), q_k)
+                    store.put(("x", _k), masked)
+
+                phase1_by_client[client_idx] = round_step_phase1(
+                    ctx, w_t, rho_t, rho_e, vrf_alpha, sampling_rate, sigma_dp,
+                    n_clients, client_datasets[client_idx], model, lr, epochs, pk_trace,
+                    _sim_pairwise_mask_cache=pairwise_mask_cache_this_round,
+                    vector_sink=_sink,
+                )
+            _t_phase1 = time.time() - _t_phase1_start
+
+            # sigma_t "revealed" now that every c_k is committed -- reuse
+            # each client's OWN ctx from phase 1 (not a fresh one), since
+            # round_step_phase2 needs the SAME ctx.keys.sk for R_cons.
+            _t_phase2_start = time.time()
+            # FIX.md F4: sigma_t is the same for every client this round, so
+            # TorchSketchProjector's (m, d) sign chunks are identical across
+            # clients too. sketch_phase1_batch generates each chunk once and
+            # applies it to every client's vector in the same pass, instead
+            # of rebuilding the chunks once per client -- again a
+            # simulation-only saving (a real client has only its own vector
+            # to project).
+            sketches_by_client = sketch_phase1_batch(
+                range(n_clients), lambda k: store.get(("q", k)),
+                sigma_t, sketch_m, model_dim,
+                batch_size=suggested_batch_size(model_dim, sketch_batch_budget_bytes),
             )
-            ctx_by_client[client_idx] = ctx
-            self_mask_shares_held[client_idx] = share_self_mask_secret(ctx, holder_ids, share_t)
-            phase1_by_client[client_idx] = round_step_phase1(
-                ctx, w_t, rho_t, rho_e, vrf_alpha, sampling_rate, sigma_dp,
-                n_clients, client_datasets[client_idx], model, lr, epochs, pk_trace,
-                _sim_pairwise_mask_cache=pairwise_mask_cache_this_round,
-            )
-        _t_phase1 = time.time() - _t_phase1_start
+            phase2_by_client = {}
+            for client_idx in range(n_clients):
+                phase2_by_client[client_idx] = round_step_phase2(
+                    ctx_by_client[client_idx], phase1_by_client[client_idx],
+                    sigma_t, sketch_m, threshold.B_t, rho_t, rho_e, vrf_alpha,
+                    _sim_precomputed_sketch=sketches_by_client[client_idx],
+                )
+            _t_phase2 = time.time() - _t_phase2_start
 
-        # sigma_t "revealed" now that every c_k is committed -- reuse
-        # each client's OWN ctx from phase 1 (not a fresh one), since
-        # round_step_phase2 needs the SAME ctx.keys.sk for R_cons.
-        _t_phase2_start = time.time()
-        # FIX.md F4: sigma_t is the same for every client this round, so
-        # TorchSketchProjector's (m, d) sign chunks are identical across
-        # clients too. sketch_phase1_batch generates each chunk once and
-        # applies it to every client's vector in the same pass, instead
-        # of rebuilding the chunks once per client -- again a
-        # simulation-only saving (a real client has only its own vector
-        # to project).
-        sketches_by_client = sketch_phase1_batch(phase1_by_client, sigma_t, sketch_m, model_dim)
-        phase2_by_client = {}
-        for client_idx in range(n_clients):
-            phase2_by_client[client_idx] = round_step_phase2(
-                ctx_by_client[client_idx], phase1_by_client[client_idx],
-                sigma_t, sketch_m, threshold.B_t, rho_t, rho_e, vrf_alpha,
-                _sim_precomputed_sketch=sketches_by_client[client_idx],
-            )
-        _t_phase2 = time.time() - _t_phase2_start
+            _t_verify_start = time.time()
+            submissions = [(i, phase1_by_client[i]) for i in range(n_clients)]
 
-        _t_verify_start = time.time()
-        submissions = [(i, phase1_by_client[i]) for i in range(n_clients)]
+            def unmask_provider(accepted_idx, excluded_idx, _held=self_mask_shares_held, _rho=rho_t):
+                # Simulates the accepted (alive) clients' replies in the
+                # unmasking round. One ShareReleasePolicy for the round
+                # stands in for every honest client applying the same rule:
+                # about any client, release self-mask shares OR pairwise
+                # seeds, never both.
+                policy = ShareReleasePolicy()
+                shares = {}
+                for k in accepted_idx:
+                    policy.release_self_share(k)
+                    shares[k] = [_held[k][h + 1] for h in accepted_idx]
+                seeds = {}
+                for k in excluded_idx:
+                    policy.release_pairwise_seed(k)
+                    for j in accepted_idx:
+                        seeds[(j, k)] = pairwise_round_seed(pairwise_secrets[j][k], _rho)
+                return UnmaskingMaterial(shares, seeds, share_t)
 
-        def unmask_provider(accepted_idx, excluded_idx, _held=self_mask_shares_held, _rho=rho_t):
-            # Simulates the accepted (alive) clients' replies in the
-            # unmasking round. One ShareReleasePolicy for the round
-            # stands in for every honest client applying the same rule:
-            # about any client, release self-mask shares OR pairwise
-            # seeds, never both.
-            policy = ShareReleasePolicy()
-            shares = {}
-            for k in accepted_idx:
-                policy.release_self_share(k)
-                shares[k] = [_held[k][h + 1] for h in accepted_idx]
-            seeds = {}
-            for k in excluded_idx:
-                policy.release_pairwise_seed(k)
-                for j in accepted_idx:
-                    seeds[(j, k)] = pairwise_round_seed(pairwise_secrets[j][k], _rho)
-            return UnmaskingMaterial(shares, seeds, share_t)
+            outcome = run_round(submissions, phase2_by_client, rho_t, rho_e, vrf_alpha, threshold.B_t, n_clients, model_dim,
+                                unmask_provider=unmask_provider,
+                                masked_vector_provider=lambda k: store.get(("x", k)))
+            _t_verify = time.time() - _t_verify_start
 
-        outcome = run_round(submissions, phase2_by_client, rho_t, rho_e, vrf_alpha, threshold.B_t, n_clients, model_dim,
-                            unmask_provider=unmask_provider)
-        _t_verify = time.time() - _t_verify_start
-
-        if verbose:
-            print(f"  round {t_round} timing: phase1(train+most-crypto)={_t_phase1:.1f}s, "
-                  f"phase2(sketch+rangeproof)={_t_phase2:.1f}s, verify={_t_verify:.1f}s, "
-                  f"total={_t_phase1 + _t_phase2 + _t_verify:.1f}s "
-                  f"(n_clients={n_clients}, ~{(_t_phase1 + _t_phase2 + _t_verify) / n_clients:.2f}s/client)")
-
-        if outcome.aborted:
             if verbose:
-                print(f"round {t_round}: ABORTED -- {outcome.abort_reason}")
-                for client_idx, reasons in outcome.rejected_reasons.items():
-                    print(f"  client {client_idx} rejected: {reasons}")
+                print(f"  round {t_round} timing: phase1(train+most-crypto)={_t_phase1:.1f}s, "
+                      f"phase2(sketch+rangeproof)={_t_phase2:.1f}s, verify={_t_verify:.1f}s, "
+                      f"total={_t_phase1 + _t_phase2 + _t_verify:.1f}s "
+                      f"(n_clients={n_clients}, ~{(_t_phase1 + _t_phase2 + _t_verify) / n_clients:.2f}s/client)")
+
+            if outcome.aborted:
+                if verbose:
+                    print(f"round {t_round}: ABORTED -- {outcome.abort_reason}")
+                    for client_idx, reasons in outcome.rejected_reasons.items():
+                        print(f"  client {client_idx} rejected: {reasons}")
+                history.append({
+                    "round": t_round, "aborted": True, "reason": outcome.abort_reason,
+                    "rejected_reasons": outcome.rejected_reasons,
+                })
+                continue
+
+            accepted_commitments = [phase1_by_client[i].commitment_point for i in outcome.accepted_client_indices]
+            audit = independent_v5_check(accepted_commitments, outcome.published_sum_value, outcome.published_sum_blinding)
+
+            # SIMULATION-ONLY self-check: this process happens to hold every
+            # client's plaintext q_k, so it can confirm the unmasked aggregate
+            # is exactly sum_{accepted} q_k. No party in the real protocol can
+            # run this (nobody holds the q_k). It exists because the previous
+            # version of this loop applied a never-unmasked aggregate for every
+            # round while still printing V5=PASS.
+            expected_aggregate = aggregate_masked(
+                store.get(("q", i)) for i in outcome.accepted_client_indices
+            )
+            aggregate_exact = bool(np.array_equal(outcome.aggregate_quantized, expected_aggregate))
+            del expected_aggregate
+            if not aggregate_exact:
+                if verbose:
+                    print(f"round {t_round}: AGGREGATE MISMATCH -- unmasked aggregate != sum of accepted q_k; update NOT applied")
+                history.append({"round": t_round, "aborted": True, "reason": "aggregate mismatch after unmasking"})
+                continue
+
+            w_t = apply_update(w_t, outcome.aggregated_delta)
+
+            next_round_norms = np.array([
+                np.linalg.norm(phase2_by_client[i].sketch) for i in outcome.accepted_client_indices
+            ])
+            threshold = update_threshold_ema(threshold, next_round_norms, k=k, alpha=ema_alpha)
+
+            if verbose:
+                v5_msg = "PASS" if audit.v5_passed else f"FAIL: {audit.detail}"
+                print(f"round {t_round}: accepted={len(outcome.accepted_client_indices)}/{n_clients}, "
+                      f"V5={v5_msg}, aggregate=EXACT, next B_t={threshold.B_t:.3f}")
+
             history.append({
-                "round": t_round, "aborted": True, "reason": outcome.abort_reason,
-                "rejected_reasons": outcome.rejected_reasons,
+                "round": t_round,
+                "aborted": False,
+                "accepted": len(outcome.accepted_client_indices),
+                "v5_passed": audit.v5_passed,
+                "aggregate_exact": aggregate_exact,
+                "B_t": threshold.B_t,
             })
-            continue
-
-        accepted_commitments = [phase1_by_client[i].commitment_point for i in outcome.accepted_client_indices]
-        audit = independent_v5_check(accepted_commitments, outcome.published_sum_value, outcome.published_sum_blinding)
-
-        # SIMULATION-ONLY self-check: this process happens to hold every
-        # client's plaintext q_k, so it can confirm the unmasked aggregate
-        # is exactly sum_{accepted} q_k. No party in the real protocol can
-        # run this (nobody holds the q_k). It exists because the previous
-        # version of this loop applied a never-unmasked aggregate for every
-        # round while still printing V5=PASS.
-        expected_aggregate = aggregate_masked([phase1_by_client[i]._secret_q for i in outcome.accepted_client_indices])
-        aggregate_exact = bool(np.array_equal(outcome.aggregate_quantized, expected_aggregate))
-        del expected_aggregate
-        if not aggregate_exact:
-            if verbose:
-                print(f"round {t_round}: AGGREGATE MISMATCH -- unmasked aggregate != sum of accepted q_k; update NOT applied")
-            history.append({"round": t_round, "aborted": True, "reason": "aggregate mismatch after unmasking"})
-            continue
-
-        w_t = apply_update(w_t, outcome.aggregated_delta)
-
-        next_round_norms = np.array([
-            np.linalg.norm(phase2_by_client[i].sketch) for i in outcome.accepted_client_indices
-        ])
-        threshold = update_threshold_ema(threshold, next_round_norms, k=k, alpha=ema_alpha)
-
-        if verbose:
-            v5_msg = "PASS" if audit.v5_passed else f"FAIL: {audit.detail}"
-            print(f"round {t_round}: accepted={len(outcome.accepted_client_indices)}/{n_clients}, "
-                  f"V5={v5_msg}, aggregate=EXACT, next B_t={threshold.B_t:.3f}")
-
-        history.append({
-            "round": t_round,
-            "aborted": False,
-            "accepted": len(outcome.accepted_client_indices),
-            "v5_passed": audit.v5_passed,
-            "aggregate_exact": aggregate_exact,
-            "B_t": threshold.B_t,
-        })
+        finally:
+            # Releases this round's resident arrays and deletes any
+            # spill files -- on the normal path and on every `continue`
+            # above (aborted round, aggregate mismatch) alike.
+            _st = store.stats()
+            if verbose and _st["spills"]:
+                print(f"  round {t_round} vectors: {_st['resident_arrays']} held in RAM "
+                      f"(peak {_st['peak_resident_bytes']/2**30:.2f} GiB), "
+                      f"{_st['spilled_arrays']} spilled to disk "
+                      f"({_st['bytes_written']/2**30:.2f} GiB written, "
+                      f"{_st['bytes_read']/2**30:.2f} GiB read back)")
+            store.close()
 
     # IMPORTANT: every call to local_train_delta (inside round_step_phase1,
     # once per client per round) reloads `model` with THAT client's own
