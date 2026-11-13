@@ -54,7 +54,7 @@ the EC-dependent crypto modules (`ristretto.py`, `pedersen.py`,
 `reshare.py`, `vrf.py`, `clsag.py`, `secagg.py`'s ECDH helper,
 `mixnet.py`, `rangeproof.py`, `r_cons.py`) for the first time — the
 sandbox that wrote this repo has no network access and could not
-install `pynacl`, so these modules are **written but unverified**
+install `rbcl`, so these modules are **written but unverified**
 until this notebook's cells pass. See `STATUS.md` for the exact tested
 vs. untested ledger.
 
@@ -83,43 +83,50 @@ if not os.path.exists('/content/FL-ZKP'):
 
 ("code", """# Install the EC-dependent toolchain. This is the exact install this
 # sandbox could not run (no network) -- Colab has network, so this
-# should just work. pynacl gives libsodium/ristretto255 bindings;
-# torch/torchvision/flwr_datasets are for the later CASE notebooks but
-# installed here too so one setup pass covers everything.
+# should just work.
 #
-# --upgrade matters here: Colab's base image ships an OLD pynacl
-# (pre-1.4.0, no ristretto255 bindings at all). `pip install pynacl`
-# with no --upgrade is a no-op if any version is already present, so
-# without this flag the next cell fails with
-# "AttributeError: module 'nacl.bindings' has no attribute
-# 'crypto_core_ristretto255_BYTES'" -- not a code bug, just a stale
-# preinstalled package. (Unrelated pip dependency-conflict warnings
-# about gradio/bigframes/pillow/rich here are pre-existing Colab
-# package noise -- ignore them, they don't touch this repo.)
-!pip install -q --upgrade "pynacl>=1.5.0"
+# `rbcl` (NOT pynacl) gives the ristretto255 bindings crypto/ristretto.py
+# needs. Mainline PyNaCl has NEVER shipped ristretto255 support, under
+# any released version -- the PR adding it (github.com/pyca/pynacl/pull/646)
+# is still open and unmerged. An earlier version of this notebook
+# installed/upgraded pynacl instead and chased the resulting
+# AttributeError as a "stale pynacl" problem; that diagnosis was wrong
+# (see FIX.md F8) -- no pynacl version fixes it. `rbcl` ships a
+# manylinux2014 x86_64 wheel, so this installs with no source build.
+# nacl.public (plain X25519, unrelated to ristretto255) is still used
+# by secagg.py's ECDH helper and IS correctly provided by pynacl, so
+# pynacl stays installed too -- just not relied on for ristretto255.
+#
+# torch/torchvision/flwr_datasets are for the later CASE notebooks but
+# installed here too so one setup pass covers everything. (Unrelated
+# pip dependency-conflict warnings about gradio/bigframes/pillow/rich
+# here are pre-existing Colab package noise -- ignore them, they don't
+# touch this repo.)
+!pip install -q rbcl
+!pip install -q pynacl
 !pip install -q flwr-datasets[vision]
 !pip install -q torch torchvision --index-url https://download.pytorch.org/whl/cu121
 """),
 
 ("md", """**If this is the first time this cell has run in this session,
-upgrading pynacl from an older version requires a kernel restart
-before the new version will actually load** (Python caches the old
-module). Go to **Runtime -> Restart session** now, then re-run from
-this cell (not from the very top -- Drive stays mounted and the repo
-stays cloned across a session restart, only the Python process
-resets).
+restart the kernel before the next cell** (a live kernel can keep a
+partially-imported module cached across an install). Go to
+**Runtime -> Restart session** now, then re-run from this cell (not
+from the very top -- Drive stays mounted and the repo stays cloned
+across a session restart, only the Python process resets).
 """),
 
 ("code", """import sys
 sys.path.insert(0, '/content/FL-ZKP')
-import nacl
-print("pynacl version:", nacl.__version__)
-assert tuple(int(x) for x in nacl.__version__.split('.')[:2]) >= (1, 4), (
-    f"pynacl {nacl.__version__} is too old (need >= 1.4.0 for ristretto255). "
-    "Restart the runtime (Runtime -> Restart session) and re-run from the pip install cell above."
+import rbcl
+print("rbcl OK, has ristretto255 bindings:", hasattr(rbcl, "crypto_core_ristretto255_from_hash"))
+assert hasattr(rbcl, "crypto_core_ristretto255_from_hash"), (
+    "rbcl imported but is missing crypto_core_ristretto255_from_hash -- "
+    "if this fires, rbcl's packaging changed; see crypto/ristretto.py's "
+    "import fallback (it also tries rbcl.rbcl) and FIX.md F8."
 )
-import nacl.bindings
-print("pynacl OK:", nacl.bindings.crypto_core_ristretto255_BYTES)
+import nacl
+print("pynacl version (used only for plain X25519, not ristretto255):", nacl.__version__)
 import torch
 print("torch OK, CUDA available:", torch.cuda.is_available())
 """),
@@ -431,7 +438,7 @@ for the GPU/torch reimplementation this blocks on.
 """),
 
 ("code", """import numpy as np
-from fl.round_loop import run_training_loop, bootstrap_norms_from_model_dim
+from fl.round_loop import run_training_loop, bootstrap_norms_from_model_dim, release_gpu_memory
 
 # SMOKE TEST first -- a handful of rounds over a SUBSET of clients,
 # to validate the protocol wiring (V1-V5, the independent V5 audit,
@@ -475,6 +482,7 @@ for model_name in CFG['mvp_scope']['models']:
         rounds=SMOKE_ROUNDS,
     )
     results[model_name] = {'final_w_t': final_w_t, 'history': history}
+    release_gpu_memory()  # free cached GPU memory before the next model in this loop
 """),
 
 ("md", """## Known gaps, flagged honestly
@@ -594,7 +602,7 @@ sweep**).
 """),
 
 ("code", """import numpy as np
-from fl.round_loop import run_training_loop, bootstrap_norms_from_model_dim
+from fl.round_loop import run_training_loop, bootstrap_norms_from_model_dim, release_gpu_memory
 
 SMOKE_ROUNDS = 2
 SMOKE_CLIENTS = 8  # must be >= K_MIN (8) in fl/server.py or every round aborts regardless of verification outcome
@@ -626,6 +634,7 @@ for model_name in CFG['mvp_scope']['models']:
         rounds=SMOKE_ROUNDS,
     )
     results[model_name] = {'final_w_t': final_w_t, 'history': history}
+    release_gpu_memory()  # free cached GPU memory before the next model in this loop
 """),
 
 ("md", "## Evaluation: seen-writer vs. unseen-writer accuracy"),

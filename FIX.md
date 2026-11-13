@@ -551,3 +551,87 @@ Chosen design, in implementation order:
 | F7f | Blame step when F7e fails | abort without attribution |
 
 Depends on F1 (F7e needs the true aggregate).
+
+## F8 — ristretto255 bindings: wrong library entirely, not a version problem
+
+**Status: FIXED, SANDBOX-TESTED (the pure-math half only — see below), 2026-11-13.**
+
+**Cause.** `crypto/ristretto.py` called `nacl.bindings.crypto_core_ristretto255_*`,
+on the assumption (stated in this module's own old docstring, and in
+`notebooks/_build_notebooks.py`'s install cell) that PyNaCl >= 1.5.0 exposes
+ristretto255. **It does not, under any released version.** Mainline PyNaCl
+has never merged ristretto255 support — the PR adding it
+(`github.com/pyca/pynacl/pull/646`) is still open and unmerged upstream, as
+of this writing. The earlier entries in this log and in STATUS.md that
+diagnosed the resulting `AttributeError` as "stale pynacl, needs
+`--upgrade --force-reinstall`, then a kernel restart" were wrong — upgrading
+pynacl to any version, including the 1.6.2 actually installed on the Colab
+run that surfaced this, can never produce
+`nacl.bindings.crypto_core_ristretto255_from_hash`, because that function
+has never existed in that package.
+
+**Evidence.** Confirmed three ways: (1) PyNaCl's own published changelog
+(`pynacl.readthedocs.io/en/latest/changelog/`) lists no ristretto255 entry
+at any version, 1.0 through 1.6.2; (2) the only PyNaCl fork that adds it
+(`joernheissler/pynacl`, branch `ristretto`) is a separate, unmerged fork,
+not what `pip install pynacl` gives you; (3) the user's own Colab run
+reported `pynacl version: 1.6.2` — genuinely new, passing this module's old
+`>= 1.5.0` check — immediately followed by the exact
+`crypto_core_ristretto255_from_hash` `AttributeError` this fix resolves,
+which is only possible if the function is absent from the library itself,
+not from a stale copy of it.
+
+**Change.** Swapped the backend from `nacl.bindings` to `rbcl`
+(`pypi.org/project/rbcl`, maintained by Nth Party) — a package built
+specifically to wrap libsodium's ristretto255 group operations, with
+published manylinux2014 x86_64 wheels (confirmed on PyPI), so it installs
+on Colab with a plain `pip install rbcl`, no source build. Every function
+`crypto/ristretto.py` calls maps onto an rbcl function with the same
+argument order (`crypto_scalarmult_ristretto255(n, p)` matches this
+module's existing `(scalar, point)` call convention; checked against
+rbcl's actual source, not assumed from its README) — except one:
+
+**The one real incompatibility, and how it's handled.** rbcl's Python
+wrapper for `crypto_core_ristretto255_scalar_reduce` validates its input
+is exactly 32 bytes (`SCALARBYTES`), even though its own docstring (and
+libsodium's actual C API) describe a 64-byte ("non-reduced scalar")
+input for this exact operation — confirmed by reading rbcl's source
+directly, not its docs, since the two disagree. `Scalar.from_int` and
+`fiat_shamir_challenge` both need the 64-byte reduction (that's the whole
+point of hashing into a scalar). Fixed by doing that one reduction in
+plain Python instead of through rbcl: `crypto/ristretto.py::_wide_scalar_reduce`
+computes `int.from_bytes(data, "little") % L` with `L` the standard,
+published ristretto255/ed25519 group order
+(`2**252 + 27742317777372353535851937790883648493`, RFC 8032 §5.1) and
+encodes the result as a canonical 32-byte little-endian scalar — this is
+not a placeholder or an approximation, it is libsodium's own definition
+of that operation, computed directly instead of through a wrapper that
+can't take the right input size for it.
+
+**Checks.** New `tests/test_ristretto_pure.py` (11 tests) covers
+`_wide_scalar_reduce` and `Scalar.from_int` — the only two pieces of this
+module that don't touch rbcl and are therefore actually runnable in this
+network-less sandbox: group-order value against RFC 8032, reduction of
+0/L/L+1, 200 random 64-byte values checked against a direct `% L`,
+and `Scalar.from_int(0)` landing on the exact zero-sentinel byte string
+`scalar_mul`/`scalar_mul_base` short-circuit on. All 15 repo test files
+pass (89 tests total). **Honestly incomplete**: every rbcl-backed group
+operation itself (`crypto_core_ristretto255_add`, `_random`, `_from_hash`,
+`crypto_scalarmult_ristretto255[_base]`, `_is_valid_point`, and the other
+four scalar ops) is still untested here — this sandbox has no network to
+install rbcl, so none of it has actually executed yet on real libsodium.
+Everything built on `crypto/ristretto.py` (`pedersen.py`, `clsag.py`,
+`elgamal_threshold.py`, `dkg.py`, `vrf.py`, `mixnet.py`, `rangeproof.py`,
+`r_cons.py`) remains exactly as unverified as before this fix — this fix
+makes the import actually succeed on Colab, it does not newly verify the
+math those modules do with the resulting group elements.
+
+**Also changed**: `notebooks/_build_notebooks.py`'s `SETUP_CELLS` (and the
+regenerated `notebooks/00_Setup_and_Crypto_Tests.ipynb`) now install and
+check `rbcl` instead of upgrading `pynacl` for this; `pynacl` itself stays
+installed, since `secagg.py`'s ECDH helper genuinely needs its (unrelated,
+correctly-supported) X25519 bindings. `notebooks/VERIFY_FIXES_F1_F2_F4_F5.ipynb`
+updated to match. **Not yet run on Colab** — the actual import of `rbcl`
+and every group operation built on it needs that run before any of F1/F2/
+F4/F5's Colab confirmation can proceed again, since all of them sit on top
+of this module.
