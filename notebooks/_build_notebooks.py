@@ -838,7 +838,7 @@ print(f"RSS before: {proc.memory_info().rss / 2**30:.2f} GiB")
 
 results = {}
 for model_name in MODELS_TO_RUN:
-    print(f"\n==== {model_name} ({SMOKE_ROUNDS} rounds, {SMOKE_CLIENTS} clients) ====")
+    print(f"\\n==== {model_name} ({SMOKE_ROUNDS} rounds, {SMOKE_CLIENTS} clients) ====")
     model = models[model_name]
     dim = flat_weights[model_name].numel()
 
@@ -870,7 +870,7 @@ for model_name in MODELS_TO_RUN:
     release_gpu_memory()
 
 print(f"RSS after: {proc.memory_info().rss / 2**30:.2f} GiB")
-print("\n--- per-round summary ---")
+print("\\n--- per-round summary ---")
 for model_name, r in results.items():
     for h in r['history']:
         print(model_name, h)"""),
