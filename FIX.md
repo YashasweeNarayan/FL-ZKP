@@ -376,8 +376,12 @@ path exactly, with the NumPy `SketchProjector` standing in for
 
 ## F5 — Memory: O(n·d) arrays held for the whole round
 
-**Status: FIXED, SANDBOX-TESTED (2026-11-13). Colab confirmation owed.**
-This is the bug behind the 2026-11-12 runtime crash.
+**Status: FIXED, CONFIRMED ON COLAB (2026-11-13).** This is the bug behind
+the 2026-11-12 runtime crash. Confirmed at the exact crash config (resnet18,
+30 clients, 1 round): `accepted=30/30, V5=PASS, aggregate=EXACT`, `23 held
+in RAM (peak 1.92 GiB), 37 spilled to disk`, process RSS flat at 2.19 ->
+2.28 GiB against the `5.01 GiB` the notebook itself computed the old code
+would have pinned simultaneously for this config -- see STATUS.md.
 
 ### What was wrong
 
@@ -554,7 +558,13 @@ Depends on F1 (F7e needs the true aggregate).
 
 ## F8 — ristretto255 bindings: wrong library entirely, not a version problem
 
-**Status: FIXED, SANDBOX-TESTED (the pure-math half only — see below), 2026-11-13.**
+**Status: FIXED, CONFIRMED ON COLAB (2026-11-13).** `rbcl` imports and its
+group operations run correctly against real libsodium: a full round (ring
+keys, 10-holder DKG, PK_trace, CLSAG signing, Pedersen commitments, the
+sketch, range proof) completed with `V5=PASS, aggregate=EXACT` at 30
+clients (see F5, STATUS.md) -- that round could not have started at all if
+`rbcl`'s bindings were broken. Originally landed as sandbox-tested-only
+(the pure-math half, below); the rest is no longer untested.
 
 **Cause.** `crypto/ristretto.py` called `nacl.bindings.crypto_core_ristretto255_*`,
 on the assumption (stated in this module's own old docstring, and in
