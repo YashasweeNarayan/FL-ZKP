@@ -32,6 +32,19 @@ cheap.
 ```python
 import os, shutil, importlib
 
+print("kernel cwd:", os.getcwd())   # if this itself raises/errors, the
+                                     # OS-level cwd is already broken --
+                                     # restart the runtime before anything else
+
+# Move OFF /content/FL-ZKP before deleting it. If the kernel's cwd is
+# already inside the directory being rmtree'd (true on a second run of
+# this cell in the same kernel, which is exactly what happened the
+# first time this was pasted), getcwd() breaks at the OS level for
+# every subprocess spawned afterward -- git and pip both failed with
+# "shell-init: error retrieving current directory" for this reason,
+# and pip silently did NOT upgrade pynacl, which is the real cause of
+# the "ristretto255 available: False" that followed.
+%cd /content
 shutil.rmtree('/content/FL-ZKP', ignore_errors=True)
 !git clone -q https://github.com/YashasweeNarayan/FL-ZKP.git /content/FL-ZKP
 %cd /content/FL-ZKP
