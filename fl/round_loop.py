@@ -231,8 +231,10 @@ def run_training_loop(
     server_root_norms: np.ndarray,
     CFG: dict,
     rounds: int = None,
-    lr: float = 0.01,
-    epochs: int = 1,
+    lr: float = None,
+    epochs: int = None,
+    batch_size: int = None,
+    momentum: float = None,
     verbose: bool = True,
     secagg_share_threshold: int = None,
     vector_budget_bytes: int = DEFAULT_BUDGET_BYTES,
@@ -292,6 +294,16 @@ def run_training_loop(
     """
     n_clients = len(client_datasets)
     rounds = rounds if rounds is not None else CFG["mvp_scope"]["rounds_per_run"]
+    # FIX.md F6: local-training hyperparameters now come from CFG's
+    # local_training section by default (gold-standard FedAvg: multiple
+    # local epochs, each a real mini-batch pass, not one full-batch step
+    # repeated `epochs` times) -- explicit args here are an override,
+    # e.g. for a smoke test or ablation, not the normal path.
+    lt_cfg = CFG.get("local_training", {})
+    lr = lr if lr is not None else lt_cfg.get("lr", 0.01)
+    epochs = epochs if epochs is not None else lt_cfg.get("local_epochs", 5)
+    batch_size = batch_size if batch_size is not None else lt_cfg.get("batch_size", 20)
+    momentum = momentum if momentum is not None else lt_cfg.get("momentum", 0.0)
     sampling_rate = CFG["protocol"]["sampling_rate"]
     sigma_dp = CFG["dp"]["sigma"]
     sketch_m = CFG["sketch"]["m"]
@@ -372,6 +384,7 @@ def run_training_loop(
                 phase1_by_client[client_idx] = round_step_phase1(
                     ctx, w_t, rho_t, rho_e, vrf_alpha, sampling_rate, sigma_dp,
                     n_clients, client_datasets[client_idx], model, lr, epochs, pk_trace,
+                    batch_size=batch_size, momentum=momentum,
                     _sim_pairwise_mask_cache=pairwise_mask_cache_this_round,
                     vector_sink=_sink,
                 )

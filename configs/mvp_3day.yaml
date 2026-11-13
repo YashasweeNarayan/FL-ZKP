@@ -28,6 +28,21 @@ mvp_scope:
     - a7_collusion
   attacker_fractions: [0.1, 0.3]   # "2 fractions" per ROADMAP.md §0.1
 
+local_training:
+  # FIX.md F6: real FedAvg-style local training (McMahan et al. 2017),
+  # not one full-batch gradient step repeated `local_epochs` times.
+  # local_epochs = E, batch_size = B in the paper's notation; defaults
+  # below follow the paper's non-IID FEMNIST-scale recommendation
+  # (E=5 is within its tested E in {1,5,10,20}, B=20 matches its
+  # smallest non-degenerate mini-batch setting) rather than its
+  # largest-E/smallest-B extreme, since this repo's per-client shards
+  # are themselves small (CASE1: 950/client; CASE2: ~4 writers/client,
+  # min_samples_per_writer=120 each).
+  lr: 0.01
+  local_epochs: 5           # E
+  batch_size: 20            # B
+  momentum: 0.0             # plain SGD, matching the FedAvg paper's own default
+
 sketch:
   m: 8192                    # JL sketch output dimension
   density: 0.3333333333333333  # 1/3, sparse JL

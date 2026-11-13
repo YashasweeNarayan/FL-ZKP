@@ -150,11 +150,34 @@ def dequantize(q: np.ndarray, bits: int = 16) -> np.ndarray:
     return signed.astype(np.float64) / scale
 
 
-def local_train_delta(model, w_t, local_data, lr: float, epochs: int):
+def local_train_delta(model, w_t, local_data, lr: float, epochs: int,
+                       batch_size: int, momentum: float = 0.0, seed: int = None):
     """Step 1: Delta_k = LocalTrain(w_t, D_k) - w_t. TORCH-DEPENDENT --
-    the actual SGD loop. Kept intentionally thin: training-loop detail
-    (optimizer choice, batch size) is a model/config concern, not a
-    crypto-wiring concern, so it's parameterized rather than hardcoded.
+    the actual SGD loop.
+
+    FIX.md F6: this is now real FedAvg-style local training (McMahan et
+    al. 2017, "Communication-Efficient Learning..." §3): `epochs` full
+    passes over the client's shard, each pass freshly shuffled and cut
+    into mini-batches of `batch_size`, one SGD step per mini-batch.
+
+    Before this fix, `epochs` full-batch gradient steps were taken over
+    the WHOLE client shard every "epoch" -- identical full gradient each
+    time (no stochasticity: SGD's "S" was never real), and no notion of
+    an epoch as a pass over shuffled batches. That was flagged live (see
+    the comment this replaced) as the likely cause of the training-
+    divergence FloatingPointError below, and is a distinct, ML-validity
+    bug from the crypto-correctness bugs F1-F5/F8 already fixed --
+    nothing here changes the protocol's cryptographic guarantees, only
+    whether local training does what the paper's FedAvg baseline claims
+    it does.
+
+    The last mini-batch of a pass is smaller than `batch_size` whenever
+    the shard size doesn't divide evenly (standard, not a bug: dropping
+    it would silently throw away data, especially costly for FEMNIST's
+    already-small per-writer shards). `batch_size >= len(local_data)`
+    degenerates to exactly one full-batch step per epoch -- not special-
+    cased, since that is simply what mini-batch SGD does when the batch
+    covers the whole shard.
     """
     from .models import flatten_state_dict, unflatten_to_state_dict
     import torch
@@ -163,18 +186,40 @@ def local_train_delta(model, w_t, local_data, lr: float, epochs: int):
     state_dict = unflatten_to_state_dict(w_t, shapes)
     model.load_state_dict(state_dict)
     model.train()
-    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum)
     criterion = torch.nn.CrossEntropyLoss()
 
+    images, labels = local_data.images, local_data.labels
+    n = images.shape[0]
+    if n == 0:
+        raise ValueError("local_train_delta: client has zero local samples -- cannot train")
+    if batch_size <= 0:
+        raise ValueError(f"local_train_delta: batch_size must be positive, got {batch_size}")
+
     last_loss = None
-    for _ in range(epochs):
-        images, labels = local_data.images, local_data.labels
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-        last_loss = float(loss.detach().cpu())
+    n_batches_total = 0
+    for epoch_idx in range(epochs):
+        # Reshuffled every epoch -- the other half of "real epochs": a
+        # pass over the SAME batches every time is not meaningfully
+        # different from one big batch, it is just split into pieces in
+        # a fixed order. `seed` is optional and only for reproducible
+        # ablations; real rounds leave it unset and use torch's global RNG.
+        if seed is not None:
+            g = torch.Generator().manual_seed(seed * 1_000_003 + epoch_idx)
+            perm = torch.randperm(n, generator=g)
+        else:
+            perm = torch.randperm(n)
+        for start in range(0, n, batch_size):
+            batch_idx = perm[start:start + batch_size]
+            batch_images = images[batch_idx]
+            batch_labels = labels[batch_idx]
+            optimizer.zero_grad()
+            outputs = model(batch_images)
+            loss = criterion(outputs, batch_labels)
+            loss.backward()
+            optimizer.step()
+            last_loss = float(loss.detach().cpu())
+            n_batches_total += 1
 
     new_flat, _ = flatten_state_dict(model)
     delta = (new_flat - w_t).detach().cpu().numpy().astype(np.float64)
@@ -187,23 +232,22 @@ def local_train_delta(model, w_t, local_data, lr: float, epochs: int):
     # crypto layer then happily commits to, masks, sketches, and
     # verifies that garbage, so a round can print accepted=8/8,
     # V5=PASS while actually aggregating a corrupted update for that
-    # client. This is a training-stability failure (e.g. lr too high
-    # for this model/data/batch-size combination -- note local_data
-    # is trained as ONE full-batch step per `epochs`, not mini-
-    # batched), not a crypto bug, but it must not be allowed to pass
-    # through silently -- raise loudly instead.
+    # client. This is a training-stability failure (lr/momentum too
+    # high for this model/data/batch-size combination), not a crypto
+    # bug, but it must not be allowed to pass through silently -- raise
+    # loudly instead.
     n_bad = int(np.sum(~np.isfinite(delta)))
     if n_bad:
         raise FloatingPointError(
             f"local_train_delta: {n_bad}/{delta.size} elements of the "
             f"trained delta are non-finite (NaN/Inf) after {epochs} "
-            f"epoch(s) at lr={lr} (final loss={last_loss}) -- training "
-            f"diverged. Lower lr, add gradient clipping, or mini-batch "
-            f"this client's {len(labels)}-sample shard instead of one "
-            f"full-batch step, then retry. (Caught here deliberately: "
-            f"letting this reach quantize() would silently cast NaN/Inf "
-            f"to an undefined int64 value and corrupt this client's "
-            f"contribution without any visible error.)"
+            f"epoch(s) x {n_batches_total} total mini-batches "
+            f"(batch_size={batch_size}) at lr={lr}, momentum={momentum} "
+            f"(final loss={last_loss}) -- training diverged. Lower lr or "
+            f"momentum, or reduce batch_size further, then retry. (Caught "
+            f"here deliberately: letting this reach quantize() would "
+            f"silently cast NaN/Inf to an undefined int64 value and "
+            f"corrupt this client's contribution without any visible error.)"
         )
     return delta
 
@@ -233,10 +277,17 @@ def round_step_phase1(
     lr: float,
     epochs: int,
     pk_trace: Point,
+    batch_size: int = 20,
+    momentum: float = 0.0,
     _sim_pairwise_mask_cache: dict | None = None,
     vector_sink=None,
 ) -> ClientSubmissionPhase1:
     """Steps 0-7 of ARCHITECTURE.md §4's round protocol.
+
+    `batch_size`, `momentum`: FIX.md F6, passed straight through to
+    `local_train_delta`'s real mini-batch/multi-epoch SGD. Defaults here
+    only cover a client called in isolation (e.g. a test); real rounds
+    get these from `fl/round_loop.py::run_training_loop`'s `CFG["local_training"]`.
 
     `_sim_pairwise_mask_cache`: simulation-only (FIX.md F3), see
     `crypto.secagg.pairwise_mask_cached`. Leave as `None` for the real
@@ -259,7 +310,7 @@ def round_step_phase1(
     # Step 1: train or contribute zero.
     if b_k:
         try:
-            delta = local_train_delta(model, w_t, local_data, lr, epochs)
+            delta = local_train_delta(model, w_t, local_data, lr, epochs, batch_size, momentum=momentum)
         except FloatingPointError as e:
             raise FloatingPointError(f"client {ctx.keys.index}: {e}") from e
     else:

@@ -22,7 +22,7 @@ Status words used below:
 | F3 | Each pairwise mask is computed twice in the simulation | Performance (simulation only) | **INVESTIGATED, NOT ADOPTED** -- see below |
 | F4 | Sketch sign matrix is regenerated once per client though it is the same for all | Performance (simulation only) | **FIXED, CONFIRMED** |
 | F5 | Two full-dimension arrays are kept per client for the whole round: 17.6 GB at 50 clients | Memory, blocks 50 clients | **FIXED, CONFIRMED** |
-| F6 | Local training is one full-batch SGD step; unlikely to learn | ML validity | OPEN |
+| F6 | Local training is one full-batch SGD step; unlikely to learn | ML validity | **FIXED, SANDBOX-TESTED** (indexing scheme only) |
 | F7 | V3 norm check: sketch sent in clear, not bound to the update, commitment not binding for the client | Security and privacy | OPEN (design chosen) |
 | F8 | `crypto/ristretto.py` called ristretto255 bindings PyNaCl has never shipped, under any version | Correctness, blocks every EC-dependent module | **FIXED, CONFIRMED** |
 
@@ -547,10 +547,80 @@ Projected at the models in play, with the default budgets:
 
 ## F6 — Local training
 
-**Status: OPEN.**
-`local_train_delta` performs one full-batch SGD step per round.
-Plan: mini-batches and several local steps; consider a pretrained-backbone
-configuration alongside the full-dimension one.
+**Status: FIXED, SANDBOX-TESTED (the indexing scheme only — see below), 2026-11-13.**
+
+### What was wrong
+
+`local_train_delta` took `epochs` full-batch gradient steps over the
+*entire* client shard per round -- not real FedAvg local training
+(McMahan et al. 2017, §3): every "epoch" computed the exact same full
+gradient (no stochasticity -- SGD's "S" was never actually stochastic),
+and there was no notion of an epoch as a pass over shuffled mini-batches.
+This was flagged live on 2026-11-12 in the training-divergence error
+message itself ("note local_data is trained as ONE full-batch step per
+`epochs`, not mini-batched") as a likely contributor to that crash, but
+left unfixed at the time since F1-F5 took priority.
+
+This is an ML-validity bug, independent of the crypto-correctness bugs
+F1-F5/F8: it does not change any cryptographic guarantee, only whether
+local training does what the paper's FedAvg baseline is supposed to do.
+
+### What changed
+
+`fl/client.py::local_train_delta` now runs real mini-batch, multi-epoch
+SGD: for each of `epochs` local epochs, the client's shard is freshly
+shuffled and walked in `batch_size`-sized slices, one optimizer step per
+slice (the last slice of a pass is whatever's left over -- not dropped,
+since FEMNIST per-writer shards are already small). Added `batch_size`
+(required) and `momentum` (optional, default 0 — plain SGD, matching the
+FedAvg paper's own default) parameters; also an optional `seed` for
+reproducible ablations (unset in real rounds, which use torch's global
+RNG as before).
+
+Plumbed through `round_step_phase1` (new `batch_size`, `momentum` params)
+and `run_training_loop`, which now reads `lr`, `local_epochs`,
+`batch_size`, `momentum` from a new `configs/mvp_3day.yaml` `local_training`
+section by default (explicit function args remain an override for tests/
+ablations). Defaults chosen: `lr=0.01` (unchanged), `local_epochs=5`,
+`batch_size=20`, `momentum=0.0` -- E and B both within the FedAvg paper's
+own tested range for a non-IID, small-per-client-shard setting (this
+repo's CASE1 gives each client 950 samples, CASE2 as few as
+4 x 120 = 480), rather than its largest-E/smallest-B extreme.
+
+### Checks
+
+`fl/client.py` cannot be imported at all in this sandbox (it pulls in
+`crypto/pedersen.py`, which computes its Pedersen generator at *module
+import time* via `crypto/ristretto.py`, which needs `rbcl` -- not
+installed here, see F8). So the real function is untested here, same as
+before this fix. New `tests/test_f6_batching_logic.py` (6 tests) instead
+mirrors the exact indexing scheme (`for start in range(0, n, batch_size):
+perm[start:start+batch_size]`, reshuffled every epoch) with NumPy instead
+of torch, and checks: full coverage with no duplicates within an epoch,
+batch count matches `ceil(n/batch_size)`, only the last batch is
+short, `batch_size >= n` degenerates to one batch per epoch, two
+independent shuffles don't coincide (guards against a "reshuffle"
+bug that silently reuses one permutation for every epoch), and total
+batches across multiple epochs is `epochs * ceil(n/batch_size)`. This
+verifies the scheme's arithmetic, not torch's gradients or loss --
+**the actual training loop is still owed its first Colab run.** 96 tests
+now pass across the repo (16 files).
+
+### What the paper needs to say
+
+- Local training is `local_epochs=5` passes of mini-batch SGD,
+  `batch_size=20`, plain SGD (no momentum), `lr=0.01` -- state this
+  explicitly as the FedAvg baseline configuration (ROADMAP.md's "FedAvg,
+  50 clients, VRF self-sampling, no crypto" accuracy-ceiling run should
+  use the SAME local-training hyperparameters, or the ceiling comparison
+  is apples-to-oranges).
+- Before this fix, every reported round number (F1's `aggregate=EXACT`
+  confirmations, F2/F4's timing numbers) was trained with `epochs=1`
+  full-batch steps -- correct aggregation and correct crypto, but not
+  yet real FedAvg local training. Nothing about those confirmations is
+  invalidated (they tested the crypto layer, which is agnostic to what
+  `local_train_delta` computes), but any *accuracy* number collected
+  before this fix should be re-run, not reused.
 
 ## F7 — V3 norm check
 
