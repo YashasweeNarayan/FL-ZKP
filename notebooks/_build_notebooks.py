@@ -659,6 +659,269 @@ for name, model in models.items():
 ]
 
 
+# ---------------------------------------------------------------------------
+# VERIFY_F6_F7: the F6 (real FedAvg local training) and F7 (hidden committed
+# sketch, square proofs, wraparound test, aggregate check, blame) verification
+# pass. Everything in F7 has so far only run against the TEST-ONLY pure-Python
+# ristretto255 backend; this notebook is the first time any of it executes on
+# real libsodium via rbcl, which is the half FIX.md F8 proved cannot be taken
+# on trust.
+# ---------------------------------------------------------------------------
+
+VERIFY_F6_F7_CELLS = [
+    ("md", """# VERIFY \u2014 F6 and F7 (committed-sketch V3, F7e aggregate check, F7f blame)
+
+Run this **after** `00_Setup_and_Crypto_Tests.ipynb` has been run at least
+once in this Colab account, same as the earlier verification notebook.
+
+What this is checking, and why each part is here:
+
+| Gate | What it proves | Why it cannot be taken on trust |
+|---|---|---|
+| A | The whole committed test suite passes against **real rbcl/libsodium** | Every F7 test so far ran only against the pure-Python backend. That backend proves the *algebra*; only rbcl proves the *bindings*. FIX.md F8 was precisely a case of bindings that imported cleanly and did not exist. |
+| B | A real round loop still reaches `aggregate=EXACT`, now with the sketch **never sent in the clear** | F7 rewrote V3, the phase-2 submission shape, and the B_t feedback path. The previous Colab confirmation ran the OLD cleartext-sketch code. |
+| C | The new per-client cost is measured, not estimated | F7b/c adds ~8x the scalar multiplications of the old single range proof (m=8192 per-coordinate square proofs). The number quoted in FIX.md is a prediction until this cell prints the real one. |
+| D | F7e actually catches the attack it exists for, on real crypto | The A1 "lying sketch" cheat passes V1, V2, V3, V4 **and** V5. If F7e does not catch it here, F7e is decorative. |
+
+Nothing in this notebook trains to convergence \u2014 it is a correctness and
+cost pass, deliberately small to spend as little GPU quota as possible."""),
+
+    ("md", "## Clone (idempotent \u2014 same pattern as 00_Setup, no `rmtree`)"),
+    ("code", """import os
+
+# Same pattern as 00_Setup_and_Crypto_Tests.ipynb cell 2: only clone if
+# it isn't already there. Deliberately NOT `shutil.rmtree` then re-clone --
+# rmtree-ing a directory the kernel's cwd might already be inside breaks
+# getcwd() for every subprocess (git, pip) spawned afterward in that kernel.
+if not os.path.exists('/content/FL-ZKP'):
+    !git clone -q https://github.com/YashasweeNarayan/FL-ZKP.git /content/FL-ZKP
+%cd /content/FL-ZKP
+!git fetch -q origin main && git reset -q --hard origin/main
+!git log --oneline -1"""),
+
+    ("md", """The commit line must include the F7e/F7f wiring commit. If it is older than
+that, this cell's `git fetch && reset --hard` did not reach the new commit --
+re-run it before going on, or Gate A will be testing the wrong code."""),
+
+    ("md", "## Install dependencies"),
+    ("code", """# rbcl (NOT pynacl) is what gives crypto/ristretto.py its ristretto255
+# bindings. Mainline PyNaCl has never shipped ristretto255 support under ANY
+# version -- the PR adding it (github.com/pyca/pynacl/pull/646) is still open
+# upstream. See FIX.md F8. pynacl itself stays installed, since secagg.py's
+# ECDH helper genuinely uses its (unrelated) X25519 support.
+!pip install -q rbcl
+!pip install -q pynacl
+!pip install -q flwr-datasets[vision]
+!pip install -q cryptography   # F2's AES-CTR mask PRG -- no slow fallback exists on purpose
+!pip install -q torch torchvision --index-url https://download.pytorch.org/whl/cu121
+!pip install -q pytest psutil"""),
+
+    ("md", """**If this is the first time this cell has run in this session, restart now:
+Runtime -> Restart session.** Then continue from the next cell (do not re-run
+the install cell). Skipping the restart is what produced the stale-import
+confusion recorded in STATUS.md."""),
+
+    ("code", """import sys
+sys.path.insert(0, '/content/FL-ZKP')
+
+import rbcl
+assert hasattr(rbcl, "crypto_core_ristretto255_from_hash"), (
+    "rbcl imported but is missing crypto_core_ristretto255_from_hash -- "
+    "if this fires, rbcl's packaging changed; see crypto/ristretto.py's "
+    "import fallback (it also tries rbcl.rbcl) and FIX.md F8."
+)
+
+from crypto.ristretto import backend_name
+print("group backend:", backend_name())
+assert backend_name() == "rbcl", (
+    f"expected the real rbcl backend, got {backend_name()!r}. If this says "
+    f"'pure-python (TEST ONLY)' then JANUS_ALLOW_PURE_PYTHON_GROUP is set in "
+    f"this environment and the whole run would be meaningless -- unset it."
+)
+
+import torch
+print("torch OK, CUDA available:", torch.cuda.is_available(),
+      torch.cuda.get_device_name(0) if torch.cuda.is_available() else "")"""),
+
+    ("md", """## Gate A \u2014 the whole test suite, on real libsodium
+
+`JANUS_ALLOW_PURE_PYTHON_GROUP` is deliberately NOT set, so
+`crypto/ristretto.py` picks rbcl and every EC-dependent test runs against real
+libsodium. The F7 test files gate on *whether a backend is live*, not on which
+one, so they run here rather than skipping (an earlier version of them gated on
+the env var and would have silently skipped exactly the tests that matter most
+on Colab).
+
+Expect **0 skipped**. A skip here means the gating regressed."""),
+    ("code", """!cd /content/FL-ZKP && python -m pytest tests/ -q 2>&1 | tail -25"""),
+
+    ("md", """If anything failed above, stop here and send me the full failure output --
+the rest of the notebook assumes the primitives are sound.
+
+What Gate A covers, specifically:
+- `tests/test_ristretto_backend.py` \u2014 group laws and the group order, now on rbcl
+- `tests/test_f7_norm_proof.py` \u2014 square proofs, committed sketch, F7d wraparound binding, and `fl/server.py::check_V3_norm_bound`
+- `tests/test_f7e_aggregate.py` \u2014 F7e's cross-client check and F7f's bisection, including a real wraparound cheater and a real lying-sketch cheater
+- `tests/test_round_end_to_end.py` \u2014 `run_round` itself: V1 (with F7a's masked-vector hash), V2, V3, V5, F7e abort + F7f localization, on 8 clients"""),
+
+    ("md", "## Config, data, models, keys"),
+    ("code", """import yaml
+
+with open('configs/mvp_3day.yaml') as f:
+    CFG = yaml.safe_load(f)
+print("models in config:", CFG['mvp_scope']['models'])
+print("sketch m:", CFG['sketch']['m'], " density:", CFG['sketch']['density'])
+print("local_training:", CFG['local_training'])   # F6's real FedAvg knobs
+
+from fl.data_noniid import prepare_case2
+
+femnist_cfg = CFG['datasets']['femnist']
+case2_data = prepare_case2(seed=CFG['seed'], cache_dir=femnist_cfg['cache_dir'])
+print("clients:", len(case2_data['client_train']))"""),
+
+    ("code", """from fl.models import build_model, flatten_state_dict
+
+MODELS_TO_RUN = ['resnet18']   # one model, to spend as little GPU quota as possible
+
+models = {name: build_model(name, num_classes=62, in_channels=1) for name in MODELS_TO_RUN}
+flat_weights = {}
+for name, m in models.items():
+    flat, _ = flatten_state_dict(m)
+    flat_weights[name] = flat
+    print(f"{name} model_dim = {flat.numel():,}")"""),
+
+    ("code", """from crypto.ristretto import Scalar, scalar_mul_base
+from crypto.dkg import generate_contribution, finalize
+from fl.round_loop import build_x25519_keys, precompute_pairwise_secrets
+
+n_clients = len(case2_data['client_train'])
+t = CFG['protocol']['threshold']
+n_c = CFG['protocol']['n_key_holders']
+
+client_sks = [Scalar.random() for _ in range(n_clients)]
+ring = [scalar_mul_base(sk) for sk in client_sks]
+
+x25519_sks, x25519_pks = build_x25519_keys(n_clients)
+pairwise_secrets = precompute_pairwise_secrets(x25519_sks, x25519_pks)
+
+key_holder_ids = list(range(1, n_c + 1))
+dkg_contributions = [generate_contribution(h, t, key_holder_ids) for h in key_holder_ids]
+PK_trace, key_holder_shares = finalize(dkg_contributions, key_holder_ids)
+print(f"ring of {len(ring)} published, PK_trace established among {n_c} key holders (t={t})")"""),
+
+    ("md", """## Gates B and C \u2014 a real round loop, with the new costs measured
+
+**The lines that matter:**
+- `aggregate=EXACT` on every round (F1 still holds with F7's new submission shape)
+- `F7e=PASS` on every round (the cross-client check ran and agreed)
+- `V5=PASS` on every round
+- the `phase2` and `verify` timings, against the pre-F7 baseline printed below
+
+Pre-F7 baseline for this exact configuration (resnet18, 8 clients, from the
+2026-11-13 Colab run recorded in FIX.md): `phase1=45.8s, phase2=31.9s,
+verify=8.7s`. phase2 and verify are the two that F7 should have made more
+expensive; phase1 should be roughly unchanged. If phase2 has grown by much more
+than ~2-3x, say so \u2014 that would mean the per-coordinate proof cost is worse
+than the estimate in FIX.md and the m=8192 sketch dimension needs revisiting.
+
+Watch RSS too: the committed sketch puts 2*m Pedersen commitments plus m square
+proofs on every phase-2 submission, which is far more Python objects per client
+than the old cleartext array."""),
+    ("code", """import time, numpy as np, os, psutil
+from fl.round_loop import run_training_loop, bootstrap_norms_from_model_dim, release_gpu_memory
+
+SMOKE_ROUNDS = 2
+SMOKE_CLIENTS = 8   # must be >= K_MIN (8) in fl/server.py or every round aborts regardless
+
+proc = psutil.Process(os.getpid())
+print(f"RSS before: {proc.memory_info().rss / 2**30:.2f} GiB")
+
+results = {}
+for model_name in MODELS_TO_RUN:
+    print(f"\n==== {model_name} ({SMOKE_ROUNDS} rounds, {SMOKE_CLIENTS} clients) ====")
+    model = models[model_name]
+    dim = flat_weights[model_name].numel()
+
+    t0 = time.time()
+    root_norms = bootstrap_norms_from_model_dim(
+        model_dim=dim,
+        sketch_dim=CFG['sketch']['m'],
+        sketch_seed=f"bootstrap-{model_name}".encode(),
+        quant_bits=16,
+        rng=np.random.default_rng(CFG['seed']),
+    )
+    print(f"bootstrap total: {time.time()-t0:.1f}s")
+
+    t0 = time.time()
+    final_w_t, history = run_training_loop(
+        model=model,
+        model_dim=dim,
+        client_datasets=case2_data['client_train'][:SMOKE_CLIENTS],
+        ring=ring[:SMOKE_CLIENTS],
+        client_sks=client_sks[:SMOKE_CLIENTS],
+        pairwise_secrets={i: {j: pairwise_secrets[i][j] for j in range(SMOKE_CLIENTS) if j != i} for i in range(SMOKE_CLIENTS)},
+        pk_trace=PK_trace,
+        server_root_norms=root_norms,
+        CFG=CFG,
+        rounds=SMOKE_ROUNDS,
+    )
+    print(f"loop wall time: {time.time()-t0:.1f}s")
+    results[model_name] = {'final_w_t': final_w_t, 'history': history}
+    release_gpu_memory()
+
+print(f"RSS after: {proc.memory_info().rss / 2**30:.2f} GiB")
+print("\n--- per-round summary ---")
+for model_name, r in results.items():
+    for h in r['history']:
+        print(model_name, h)"""),
+
+    ("md", """Every round's history entry should read `aborted: False`, `v5_passed: True`,
+`f7e_passed: True`, `aggregate_exact: True`.
+
+`f7e_passed: None` would mean the check could not be RUN (missing material) --
+that is a wiring problem to report, not a pass."""),
+
+    ("md", """## Gate D \u2014 does F7e actually catch the attack?
+
+This is the check that decides whether F7e earns its cost. One client masks a
+model-replacement-scale update (every coordinate 1e6, orders of magnitude past
+any honest client) but commits the sketch of the **zero vector**. That
+submission passes V1, V2, V3 (its committed norm is zero, which is better than
+honest), V4, and V5 -- the masked vector and its commitment are mutually
+consistent. Only comparing the summed committed sketches against the sketch of
+the actual unmasked aggregate exposes it.
+
+This runs the committed test, so the assertions are the ones under version
+control rather than something typed into a cell here."""),
+    ("code", """!cd /content/FL-ZKP && python -m pytest tests/test_f7e_aggregate.py -q -k "lying_sketch or wraparound_cheater" -v 2>&1 | tail -20"""),
+
+    ("md", """Expected: `test_lying_sketch_passes_the_per_client_norm_check` PASSES (the
+cheat really does get past V3), `test_f7e_catches_the_lying_sketch` PASSES
+(F7e stops it), `test_f7f_localizes_the_lying_sketch_cheater` PASSES (and names
+a suspect group containing the cheater, smaller than the whole accepted set).
+
+The same for the wraparound variant, which V3 and F7d also catch independently
+-- F7e is defense-in-depth there rather than the only line."""),
+
+    ("md", """## If something fails
+
+Send the full output and traceback. Most useful, whichever cell broke:
+
+1. the `git log --oneline -1` line, so I know which commit ran
+2. `group backend:` \u2014 must say `rbcl`
+3. the full pytest tail from Gate A, including the count line (`N passed`) and
+   **any skip count**
+4. for Gate B/C: the per-round `timing:` lines and the `accepted=.../V5=.../F7e=...`
+   lines verbatim, plus `RSS before/after`
+5. for a `F7e=FAIL` or an abort: the `F7e suspect groups:` line
+
+What I already know is NOT yet covered, so no need to report it as a surprise:
+F7e's blinding sums are reconstructed from pairwise-masked vectors with no
+self-mask, so a client dropping out *after* acceptance makes that round's F7e
+check un-runnable (`f7e_passed: None`) rather than failing it. See FIX.md F7e."""),
+]
+
+
 if __name__ == "__main__":
     with open(os.path.join(NB_DIR, "00_Setup_and_Crypto_Tests.ipynb"), "w") as f:
         json.dump(nb(SETUP_CELLS), f, indent=1)
@@ -666,4 +929,6 @@ if __name__ == "__main__":
         json.dump(nb(CASE1_CELLS), f, indent=1)
     with open(os.path.join(NB_DIR, "CASE2_NONIID_FEMNIST.ipynb"), "w") as f:
         json.dump(nb(CASE2_CELLS), f, indent=1)
-    print("wrote 3 notebooks")
+    with open(os.path.join(NB_DIR, "VERIFY_FIXES_F6_F7.ipynb"), "w") as f:
+        json.dump(nb(VERIFY_F6_F7_CELLS), f, indent=1)
+    print("wrote 4 notebooks")

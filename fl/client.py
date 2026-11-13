@@ -31,7 +31,9 @@ from crypto.r_cons import prove_identity_binding
 from crypto.vector_commit import weighted_digest
 from crypto.norm_proof import (
     commit_sketch, subset_sum_challenge, wraparound_window, prove_wraparound_binding,
+    mask_blinding_vector,
 )
+from crypto.secagg import pairwise_round_seed
 
 
 @dataclass
@@ -89,7 +91,10 @@ class ClientSubmissionPhase2:
     wraparound_range_proofs: list    # list[RangeProof] -- NO aggregate_blinding on the submission,
                                       # see round_step_phase2's comment on why revealing it would leak
     identity_binding_proof: object   # R_cons AND-proof
-    _secret_y_blindings: list = field(repr=False, default=None)   # F7e: per-coordinate r_i, revealed only as a SUM after acceptance (see FIX.md F7, "wiring")
+    masked_y_blindings: list = field(default=None)   # FIX.md F7e: rho_{k,i} = r_{k,i} + pairwise masks (mod L).
+                                                     # PUBLIC and safe to publish; the raw r_{k,i} never leave the
+                                                     # client. See crypto/norm_proof.py's F7e section for why the
+                                                     # masking is necessary rather than revealing r_{k,i} directly.
 
 
 def quantize(delta: np.ndarray, bits: int = 16) -> np.ndarray:
@@ -476,6 +481,7 @@ def round_step_phase2(
     rho_t: bytes,
     rho_e: bytes,
     vrf_alpha: bytes,
+    n_tests: int = 8,
     _secret_q_override: np.ndarray | None = None,
 ) -> ClientSubmissionPhase2:
     """Steps 8-10, run AFTER the server reveals sigma_t.
@@ -542,7 +548,10 @@ def round_step_phase2(
 
     density = sketch.density
 
-    n_tests = 8
+    # `n_tests` must equal what the server passes to check_V3_norm_bound
+    # (fl/server.py threads it through run_round/verify_submission for
+    # exactly this reason): the two sides derive the SAME public weight
+    # vectors from it, so a mismatch fails every honest client.
     weights_list = subset_sum_challenge(seed=sketch_seed, m=sketch_dim, n_tests=n_tests)
     # PUBLIC window -- derived only from (sketch_dim, model_dim, density,
     # quant_bits), never from this client's own data, so the server can
@@ -582,36 +591,53 @@ def round_step_phase2(
 
     identity_proof = prove_identity_binding(ctx.keys.sk, rho_t, rho_e, vrf_alpha, b"r_cons:" + phase1.commitment_point.b)
 
+    # FIX.md F7e: publish the PAIRWISE-MASKED blinding vector, not the
+    # blindings themselves. Derived from the same per-round pair seeds
+    # secagg's vector path uses (`pairwise_round_seed(secret, rho_t)`),
+    # so the excluded-pair seeds accepted clients already release for
+    # `unmask_aggregate` strip these masks too. Published in phase 2,
+    # i.e. before the accepted set is known -- same ordering as the
+    # masked update vector, and the reason the server cannot choose a
+    # convenient subset after the fact.
+    pairwise_seeds = {
+        other_idx: pairwise_round_seed(secret, rho_t)
+        for other_idx, secret in ctx.pairwise_secrets.items()
+    }
+    masked_y_blindings = mask_blinding_vector(y_blindings, ctx.keys.index, pairwise_seeds)
+
     return ClientSubmissionPhase2(
         sketch_commitment=sketch_commitment,
         wraparound_bindings=wraparound_bindings,
         wraparound_range_proofs=wraparound_range_proofs,
         identity_binding_proof=identity_proof,
-        _secret_y_blindings=y_blindings,
+        masked_y_blindings=masked_y_blindings,
     )
 
 
-def reveal_y_blindings_after_acceptance(phase2: "ClientSubmissionPhase2") -> list:
-    """F7e's per-client half: mirrors `reveal_blinding_after_acceptance`'s
-    gating (only after an accept verdict is posted), but -- UNLIKE that
-    function -- this return value must never reach the server as a
-    per-client list in a real deployment. A sketch coordinate's value
-    range is small enough (bounded by the norm check itself) that
-    revealing C_{y_i} and a single client's own r_i together lets a
-    verifier recover y_i by brute-force discrete log; `r_k`'s reveal in
-    `reveal_blinding_after_acceptance` does not have this problem
-    because `weighted_digest`'s range is the full ~2^61 P_MASK space.
-    So in a real deployment each coordinate's r_i must be additively
-    secret-shared across the accepted set via the SAME Shamir/pairwise
-    mechanism `crypto/secagg.py` already uses for q_k's masks, and only
-    the SUM ever reconstructed -- not this function's return value
-    handed to the server directly. This simulation does not yet wire
-    that sharing (see FIX.md F7, "wiring"); `fl/server.py`'s F7e check
-    sums these lists itself, which is correct ONLY because this
-    simulation's "server" is not an adversary with respect to this
-    specific data path -- it must not be read as the deployment design.
+def release_straddling_pair_seeds(own_index: int, group: list, pairwise_secrets: dict, rho_t: bytes) -> dict:
+    """F7f's per-client half. When the server bisects the accepted set
+    to localize a failed F7e check, the sum over a subgroup G only
+    cancels for pairs with BOTH parties inside G -- so each client in G
+    releases its per-round pair seeds about the accepted clients
+    OUTSIDE G, exactly as it would release seeds about an excluded
+    client for `unmask_aggregate`.
+
+    This is the accountability-anonymity budget being SPENT, not a free
+    check: every bisection step hands the server one more subgroup sum,
+    which is why `norm_proof.localize_fault` stops at `min_group_size`
+    instead of narrowing to a single client. A client is entitled to
+    refuse (the round then fails the F7e check without attribution,
+    the pre-F7f behaviour) -- the policy question of what refusal costs
+    is deliberately not decided here.
+
+    Returns {(own_index, other): round_seed} for every accepted client
+    `other` not in `group`.
     """
-    return phase2._secret_y_blindings
+    return {
+        (own_index, other): pairwise_round_seed(secret, rho_t)
+        for other, secret in pairwise_secrets.items()
+        if other not in set(group)
+    }
 
 
 def reveal_blinding_after_acceptance(phase1: ClientSubmissionPhase1) -> Scalar:

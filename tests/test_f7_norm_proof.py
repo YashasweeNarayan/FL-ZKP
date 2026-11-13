@@ -14,10 +14,22 @@ import os
 import numpy as np
 import pytest
 
-if os.environ.get("JANUS_ALLOW_PURE_PYTHON_GROUP") != "1":
+# Gate on whether ANY group backend is live, not on which one. With rbcl
+# installed (Colab) these run against real libsodium; in a network-less
+# sandbox they run against the pure-Python backend when
+# JANUS_ALLOW_PURE_PYTHON_GROUP=1 selects it; with neither they skip.
+#
+# Gating on the env var alone -- as the first version of these files did --
+# meant the whole F7 suite SKIPPED on Colab, which is the one place it most
+# needs to run: the pure-Python backend proves the algebra, only rbcl proves
+# the bindings.
+from crypto.ristretto import backend_name as _backend_name
+
+if _backend_name() is None:
     pytest.skip(
-        "needs JANUS_ALLOW_PURE_PYTHON_GROUP=1 (test-only ristretto255 backend); "
-        "see crypto/_ristretto_py.py",
+        "no ristretto255 backend available: install rbcl, or set "
+        "JANUS_ALLOW_PURE_PYTHON_GROUP=1 to use the test-only pure-Python "
+        "backend (crypto/_ristretto_py.py)",
         allow_module_level=True,
     )
 
@@ -28,8 +40,11 @@ from crypto.ristretto import Scalar, backend_name
 from crypto.sketch import int_sketch_norm_sq_bound
 
 
-def test_backend_is_test_only():
-    assert backend_name() == "pure-python (TEST ONLY)"
+def test_a_group_backend_is_live():
+    """Which backend is live is printed by the notebooks; what matters
+    here is that one IS, since every assertion below is meaningless
+    against a stub."""
+    assert backend_name() in ("rbcl", "pure-python (TEST ONLY)")
 
 
 # --------------------------------------------------------------------

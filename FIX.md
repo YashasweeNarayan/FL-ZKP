@@ -688,8 +688,8 @@ Final design, in implementation order:
 | F7b | Exact integer sketch (`crypto/sketch.py::project_int`/`project_int_batch`); m PER-COORDINATE Pedersen commitments, not one vector commitment | gap 1 | DONE (`crypto/norm_proof.py::commit_sketch`) |
 | F7c | Real Sigma-protocol "square proof" per coordinate; only Σ(square commitments) is opened, to the public v=⟨y,y⟩ | gap 1 | DONE (`SquareProof`/`prove_square`/`verify_square`) |
 | F7d | Cheap random subset-sum wraparound test, HIDDEN (reworked from the original bit-decomposition-reuse plan into a Schnorr binding + `rangeproof.py` reuse on the few flooded values) | wraparound collusion | DONE (`prove_wraparound_binding`/`verify_wraparound_binding`) |
-| F7e | Aggregate check: per-coordinate sum of accepted clients' sketches == sketch of the true aggregate, blinding sums only (never individual) | gap 2 | Primitive DONE and tested (`verify_aggregate_sketch`); NOT wired into `run_round` |
-| F7f | Group-testing blame (bisect the accepted set on a public, round-seeded partition) when F7e fails, instead of abort-only | abort-without-attribution DoS | Primitive DONE and tested (`localize_fault`/`partition_group`); NOT wired into `run_round` |
+| F7e | Aggregate check: per-coordinate sum of accepted clients' sketches == sketch of the true aggregate, blinding sums only (never individual) | gap 2 | DONE and wired into `run_round` |
+| F7f | Group-testing blame (bisect the accepted set on a public, round-seeded partition) when F7e fails, instead of abort-only | abort-without-attribution DoS | DONE and wired into `run_round` |
 
 **Wiring done:**
 - `fl/client.py::round_step_phase1`: computes `masked_hash = sha256(masked)`,
@@ -715,23 +715,103 @@ Final design, in implementation order:
   `int_sketch_norm(phase2.sketch_commitment.v, ...)` (the public scalar),
   not `np.linalg.norm(phase2.sketch)` (no longer exists on the submission).
 
-**Wiring NOT done (explicit TODO, do not assume this runs):**
-- `fl/server.py::run_round` does not call `verify_aggregate_sketch` (F7e) or
-  `localize_fault` (F7f) at all. The per-client V3 check above is real and
-  blocks a malicious INDIVIDUAL submission from the norm check itself; the
-  cross-client aggregate check that would also catch coordinated
-  wraparound-style collusion across several accepted clients is not yet
-  invoked anywhere in the round loop.
-- F7e's blinding-sum reveal (`y_blindings` summed across accepted clients)
-  is specified to go through `crypto/secagg.py`'s existing Shamir/pairwise
-  secret-sharing (the same mechanism `q_k`'s masks already use), NOT a
-  direct per-client reveal to the server (that would be the same
-  oracle-attack shape F7d's fix avoids). `fl/client.py::reveal_y_blindings_after_acceptance`
-  exists but its docstring says plainly that handing its return value to the
-  server directly is a simulation-only stand-in, not the deployment design;
-  the actual secret-sharing wiring is not built.
-- No test exercises F7e/F7f end-to-end inside `run_round` (only the standalone
-  primitives, in `tests/test_f7_norm_proof.py`).
+### F7e/F7f wiring (done 2026-11-14)
+
+**The mechanism, and the shortcut that is wrong.** The server needs
+Σ_k r_{k,i} to open the product of the accepted clients' per-coordinate
+commitments. It must not learn any single r_{k,i}: a sketch coordinate is
+bounded by the norm check itself, so C_{y_i} plus that client's own r_{k,i}
+gives y_i·G with y_i small enough to brute-force. V5's existing per-client
+`r_k` reveal is safe ONLY because `weighted_digest`'s range is the full ~2^61
+P_MASK space -- that argument does not transfer, and assuming it did was the
+trap the first draft of this module fell into twice (once for F7d, once here).
+
+So the blinding vector gets the same Bonawitz pairwise masking the update
+already gets, one field up (Z_L instead of Z_{P_MASK}):
+`rho_{k,i} = r_{k,i} + Σ_{j≠k} sign(k,j)·PRF(pair_seed_kj, i) mod L`, published
+in phase 2 BEFORE the accepted set is known. New
+`crypto/prg.py::expand_scalar_stream` (64 keystream bytes per scalar, reduced
+mod L, own domain tag so it is a different keystream from the vector mask off
+the same pair seed); new `crypto/norm_proof.py::mask_blinding_vector` /
+`reconstruct_blinding_sum`, the latter mirroring `secagg.unmask_aggregate`'s
+pairwise loop exactly -- same `pairwise_round_seed` values accepted clients
+already release about excluded ones, same sign rule, same validation.
+
+**F7f's subgroup test needed a real mechanism too.** A first attempt could not
+work: for a strict subgroup the server has no independent "true" partial
+aggregate to compare against, because `aggregate_quantized` is only the whole
+accepted set. It does have another route -- once the accepted set's self-mask
+shares are released (they already are, that is how `unmask_aggregate` works),
+the only thing still hiding an individual q_k is its pairwise masks, so a
+subgroup's partial aggregate becomes computable as soon as the clients IN that
+subgroup release their pair seeds about the accepted clients OUTSIDE it. That
+is `unmask_aggregate` run on the subgroup, supplied through `run_round`'s new
+`blame_material_provider`. **That is the privacy cost, and it is the real
+reason `min_group_size` exists:** each bisection step hands the server one more
+partial aggregate, so bisecting to a single client would hand over one client's
+update in the clear. `localize_fault` stops at `min_group_size`, so the
+smallest thing the server ever learns is the summed update of that many
+clients -- ARCHITECTURE.md §6.3's accountability-anonymity budget, spent
+explicitly and only on a round that already failed an integrity check.
+
+**Also wired:** `fl/client.py::release_straddling_pair_seeds` (the per-client
+half, replacing the earlier `reveal_y_blindings_after_acceptance`, which was a
+simulation-only stand-in and is gone); `RoundOutcome.aggregate_sketch_check_passed`
+/ `_bad_coordinates` / `_suspect_groups`; an F7e failure ABORTS the round
+(applying an aggregate that is not the sum of what was committed is the same
+class of failure V5 aborts on) carrying the suspect groups; `fl/round_loop.py`
+builds the provider and prints `F7e=PASS/FAIL/NOT-RUN` per round.
+
+**`None` is not `False`.** A missing masked blinding vector, or a blinding-sum
+reconstruction that cannot complete, returns `None` ("could not be run") and
+the round proceeds as it did before F7e existed. Only a reconstruction that
+SUCCEEDS and then disagrees returns `False`. Reporting a liveness gap as a
+failed integrity check would be a false accusation, and with F7f attached it
+would be a false accusation against a named group.
+
+**One more wiring bug caught by the new end-to-end test:** `n_tests` (F7d's
+number of wraparound tests) was hardcoded 8 in `round_step_phase2` and
+defaulted to 8 in `check_V3_norm_bound` -- agreeing only by coincidence, with
+nothing tying them. Any change to one would have failed every honest client
+with a V3 rejection. Now threaded explicitly through
+`run_round`/`verify_submission`/`round_step_phase2`, and
+`tests/test_round_end_to_end.py` deliberately runs `n_tests=4` so the threading
+is actually exercised rather than passing because both sides happen to say 8.
+
+**Tests (all on real primitives, pure-Python group backend in the sandbox):**
+- `tests/test_f7e_aggregate.py` (14): the masking algebra (full set, strict
+  subset, missing seed, bad seed provenance), `_true_aggregate_sketch`'s
+  centering assumption, F7e passing honestly and catching BOTH a wraparound
+  cheater and a lying-sketch cheater, `None`-vs-`False`, and F7f localizing
+  each cheat to a group containing it and smaller than the accepted set.
+- `tests/test_round_end_to_end.py` (8): `run_round` itself -- the first test in
+  the repo to execute it at all. Honest 8-client round passing V1/V2/V3/V5/F7e,
+  the aggregate matching Σq_k, V5 via `verifier/audit.py`, V1 rejecting a
+  tampered masked-vector hash (F7a), V3 rejecting an over-bound norm, and F7e
+  aborting + localizing the lying-sketch cheat. Also the gap worth knowing:
+  that cheat passes every other check, which is what makes F7e load-bearing
+  rather than defense-in-depth.
+- 159 tests pass with a group backend live; 105 pass + 4 skip without one.
+
+**Still open on F7, honestly:**
+- **No self-mask on the blinding vector, so no dropout resilience.** A client
+  that drops out after acceptance makes that round's F7e check un-runnable
+  (`f7e_passed: None`), where the update path would have recovered via Shamir.
+  The accepted set is fixed and k_min-floored before any rho is used, so this
+  is a liveness gap, not a privacy one -- but it is a real asymmetry with the
+  vector path.
+- **F7f attributes to a group, never an individual, by design** -- and the
+  bisection's cost is O(log n) rounds of inter-client seed releases, which this
+  simulation performs synchronously inside one `run_round` call. A deployment
+  needs those as real protocol rounds, with a policy for a client that refuses.
+- **What happens to a suspect group is not decided.** `run_round` records it
+  and aborts; nothing excludes a repeat offender from future rounds yet. That
+  policy (and its interaction with the ring's anonymity set) is a protocol
+  question, not wiring.
+- **Not yet run on Colab/real rbcl.** Everything above is pure-Python-backend
+  only. `notebooks/VERIFY_FIXES_F6_F7.ipynb` is the pass that settles it, and
+  also the first measurement of F7's real per-client cost (predicted ~8x the
+  old single range proof; unverified until that notebook runs).
 - Depends on F1 (F7e needs the true aggregate) -- satisfied, F1 is fixed.
 
 ## F8 — ristretto255 bindings: wrong library entirely, not a version problem

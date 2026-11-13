@@ -385,11 +385,114 @@ def verify_wraparound_binding(C_prime: Point, proof: SchnorrProof, weights: list
 # exactly: a blinding factor is only ever revealed as part of a SUM that
 # the double-masking mechanism (secagg.py's self-mask / pairwise-mask
 # shares) assembles, never individually. The function below is the
-# verification half; the sum itself is produced by routing each
-# client's y_blindings (per coordinate) through secagg.py's existing
-# additive-secret-sharing machinery the same way q_k's masks already
-# are -- see FIX.md's F7 entry, "wiring", for the exact call sites.
+# verification half; `mask_blinding_vector` / `reconstruct_blinding_sum`
+# below are the mechanism that produces the sum.
+#
+# THE MECHANISM (and why the obvious shortcut is wrong). The server needs
+# sum_k r_{k,i} for each coordinate i, to open the product of the accepted
+# clients' per-coordinate commitments. It must NOT learn any single
+# r_{k,i}: a sketch coordinate's value range is bounded by the norm check
+# itself, so C_{y_i} together with that client's own r_{k,i} gives
+# y_i*G with y_i small enough to recover by brute-force discrete log.
+# (V5's existing per-client `r_k` reveal is safe only because
+# `weighted_digest`'s range is the full ~2^61 P_MASK space -- that
+# argument does not transfer here, which is exactly the trap the first
+# draft of this module fell into.)
+#
+# So the blinding vector gets the SAME Bonawitz pairwise masking the
+# quantized update already gets, one field up: each client publishes
+#     rho_{k,i} = r_{k,i} + sum_{j != k} sign(k,j) * PRF(pair_seed_kj, i)   (mod L)
+# in phase 2, BEFORE the accepted set is known (same ordering as the
+# masked vectors). Summed over all clients the pairwise terms cancel;
+# summed over a strict subset, the pairs straddling the boundary do not,
+# and are stripped with the SAME `pairwise_round_seed` values accepted
+# clients already release about excluded ones for `unmask_aggregate`.
+# The mask stream comes from `crypto.prg.expand_scalar_stream` under its
+# own domain tag, so it is a different keystream from the vector mask
+# derived from the same pair seed.
+#
+# What this deliberately does NOT have, and the consequence: no
+# self-mask, and therefore no Shamir dropout recovery. For the UPDATE
+# vector, secagg's self-mask is what stops a server from isolating one
+# client by claiming its partners dropped. Here the blinding sum is
+# taken over the accepted set, which is fixed and published BEFORE any
+# rho_{k,i} is used, and k_min (=8) floors its size -- so the smallest
+# sum the server can obtain through the honest path already covers 8
+# clients. The one place smaller sums are legitimately computed is F7f's
+# localization below, which is bounded by its own `min_group_size`
+# floor. A client that drops out after acceptance makes this round's
+# F7e check incomputable (a liveness failure, logged) rather than
+# leaking anything. That is a real, documented gap versus the update
+# path's dropout resilience, not an oversight -- see FIX.md F7e.
 # ---------------------------------------------------------------------------
+
+from .prg import derive_stream_key, expand_scalar_stream
+
+
+def blinding_pairwise_mask(pair_round_seed: bytes, m: int, sign: int) -> list[int]:
+    """One pair's blinding mask, as m ints mod L. `sign` is +1 for the
+    lower-indexed party and -1 for the higher, matching
+    `secagg.pairwise_mask`'s convention exactly -- the two paths must
+    agree on sign or neither cancels.
+
+    Derived from the pair's ROUND seed (not the long-term secret), for
+    the same reason `secagg.pairwise_mask` does it that way: the server
+    can reproduce this exact stream from a released round seed alone
+    when stripping an excluded partner's mask, without ever seeing the
+    long-term secret.
+    """
+    L = group_order()
+    stream = expand_scalar_stream(derive_stream_key(b"f7e-blinding-mask", pair_round_seed, b""), m)
+    if sign == 1:
+        return stream
+    return [(-x) % L for x in stream]
+
+
+def mask_blinding_vector(y_blindings: list[Scalar], own_index: int,
+                          pairwise_round_seeds: dict[int, bytes]) -> list[int]:
+    """Client side, phase 2. `pairwise_round_seeds` is
+    {other_client_index: pairwise_round_seed(shared_secret, rho_t)} --
+    the same per-round seeds secagg's vector path uses. Returns the
+    masked blinding vector (m ints mod L) that goes on the submission;
+    the raw `y_blindings` never leave the client.
+    """
+    L = group_order()
+    acc = [r.to_int() % L for r in y_blindings]
+    m = len(acc)
+    for other_idx, seed in pairwise_round_seeds.items():
+        sign = 1 if own_index < other_idx else -1
+        mask = blinding_pairwise_mask(seed, m, sign)
+        acc = [(a + b) % L for a, b in zip(acc, mask)]
+    return acc
+
+
+def reconstruct_blinding_sum(masked_by_client: dict, accepted: list[int],
+                              excluded_pair_seeds: dict, m: int) -> list[Scalar]:
+    """Server side. Sums the accepted clients' published masked blinding
+    vectors and strips the pairwise terms that did not cancel because
+    one party was excluded, mirroring `secagg.unmask_aggregate`'s
+    pairwise loop (same seeds, same sign rule, same validation that a
+    seed came from an accepted client about an excluded one).
+
+    Returns sum_k r_{k,i} as m `Scalar`s -- the ONLY thing about any
+    client's blindings that ever becomes visible.
+    """
+    L = group_order()
+    accepted_set = set(accepted)
+    acc = [0] * m
+    for k in accepted:
+        row = masked_by_client[k]
+        if len(row) != m:
+            raise ValueError(f"client {k}: masked blinding vector has length {len(row)}, expected {m}")
+        acc = [(a + b) % L for a, b in zip(acc, row)]
+    for (j, k), seed in excluded_pair_seeds.items():
+        if j not in accepted_set or k in accepted_set:
+            raise ValueError(f"pair ({j}, {k}): seed must come from an accepted client about an excluded one")
+        sign = 1 if j < k else -1
+        mask = blinding_pairwise_mask(seed, m, sign)
+        acc = [(a - b) % L for a, b in zip(acc, mask)]
+    return [Scalar.from_int(x) for x in acc]
+
 
 def verify_aggregate_sketch(y_commitments_by_client: list[list[Commitment]],
                              revealed_sum_blindings: list[Scalar],

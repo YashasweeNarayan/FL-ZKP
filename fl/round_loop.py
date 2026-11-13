@@ -24,7 +24,7 @@ import numpy as np
 
 from crypto.secagg import (
     derive_pairwise_secret_via_x25519, new_self_mask_secret, pairwise_round_seed,
-    ShareReleasePolicy, aggregate_masked,
+    ShareReleasePolicy, aggregate_masked, unmask_aggregate,
 )
 from crypto.sketch import seed_commitment, int_sketch_norm
 from verifier.audit import independent_v5_check
@@ -431,10 +431,46 @@ def run_training_loop(
                         seeds[(j, k)] = pairwise_round_seed(pairwise_secrets[j][k], _rho)
                 return UnmaskingMaterial(shares, seeds, share_t)
 
+            def blame_material_provider(group, _held=self_mask_shares_held, _rho=rho_t, _store=store):
+                """FIX.md F7f. Simulates what the clients IN `group`
+                release when the server bisects a failed F7e check:
+                their per-round pair seeds about every accepted client
+                OUTSIDE the group (`fl/client.py::release_straddling_pair_seeds`).
+                With those, the subgroup's partial aggregate is
+                computable by running the ordinary unmasking path on the
+                subgroup -- which is exactly the privacy cost `localize_fault`'s
+                min_group_size floor bounds; see fl/server.py's F7f comment.
+
+                Returns None when the subgroup is too small for the
+                self-mask shares to reconstruct (below `share_t`), so
+                the server leaves that group suspect rather than
+                clearing it on evidence it could not actually check.
+                """
+                group = list(group)
+                group_set = set(group)
+                if len(group) < share_t:
+                    return None
+                outside = [k for k in range(n_clients) if k not in group_set]
+                straddling = {}
+                for j in group:
+                    for k in outside:
+                        straddling[(j, k)] = pairwise_round_seed(pairwise_secrets[j][k], _rho)
+                partial_masked = aggregate_masked(_store.get(("x", k)) for k in group)
+                shares = {k: [_held[k][h + 1] for h in group] for k in group}
+                try:
+                    partial_q = unmask_aggregate(
+                        partial_masked, group, shares, share_t, straddling, _rho, model_dim,
+                    )
+                except ValueError:
+                    return None
+                return partial_q, straddling
+
             outcome = run_round(submissions, phase2_by_client, rho_t, rho_e, vrf_alpha, threshold.B_t, n_clients, model_dim,
                                 unmask_provider=unmask_provider,
                                 masked_vector_provider=lambda k: store.get(("x", k)),
-                                sketch_dim=sketch_m, sigma_t=sigma_t)
+                                sketch_dim=sketch_m, sigma_t=sigma_t,
+                                sketch_projector=TorchSketchProjector(seed=sigma_t, m=sketch_m, d=model_dim),
+                                blame_material_provider=blame_material_provider)
             _t_verify = time.time() - _t_verify_start
 
             if verbose:
@@ -448,9 +484,17 @@ def run_training_loop(
                     print(f"round {t_round}: ABORTED -- {outcome.abort_reason}")
                     for client_idx, reasons in outcome.rejected_reasons.items():
                         print(f"  client {client_idx} rejected: {reasons}")
+                    if outcome.aggregate_sketch_check_passed is False:
+                        # FIX.md F7f: say WHO, when the bisection managed to
+                        # narrow it. An unattributed abort is the DoS this
+                        # replaced, so the distinction matters in the log.
+                        print(f"  F7e suspect groups: {outcome.aggregate_sketch_suspect_groups or 'none (not localized)'}")
                 history.append({
                     "round": t_round, "aborted": True, "reason": outcome.abort_reason,
                     "rejected_reasons": outcome.rejected_reasons,
+                    "f7e_passed": outcome.aggregate_sketch_check_passed,
+                    "f7e_bad_coordinates": outcome.aggregate_sketch_bad_coordinates,
+                    "f7e_suspect_groups": outcome.aggregate_sketch_suspect_groups,
                 })
                 continue
 
@@ -491,14 +535,19 @@ def run_training_loop(
 
             if verbose:
                 v5_msg = "PASS" if audit.v5_passed else f"FAIL: {audit.detail}"
+                # F7e: PASS / NOT-RUN are different outcomes and must read
+                # differently -- NOT-RUN means the check could not be
+                # performed (missing material), never that it passed.
+                f7e_msg = {True: "PASS", None: "NOT-RUN"}.get(outcome.aggregate_sketch_check_passed, "FAIL")
                 print(f"round {t_round}: accepted={len(outcome.accepted_client_indices)}/{n_clients}, "
-                      f"V5={v5_msg}, aggregate=EXACT, next B_t={threshold.B_t:.3f}")
+                      f"V5={v5_msg}, F7e={f7e_msg}, aggregate=EXACT, next B_t={threshold.B_t:.3f}")
 
             history.append({
                 "round": t_round,
                 "aborted": False,
                 "accepted": len(outcome.accepted_client_indices),
                 "v5_passed": audit.v5_passed,
+                "f7e_passed": outcome.aggregate_sketch_check_passed,   # True / None (not run); False never reaches here, it aborts above
                 "aggregate_exact": aggregate_exact,
                 "B_t": threshold.B_t,
             })

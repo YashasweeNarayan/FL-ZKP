@@ -1,7 +1,12 @@
-"""RFC 9496 test vectors and group-law checks for the test-only
-pure-Python ristretto255 backend (crypto/_ristretto_py.py), which
-crypto/ristretto.py falls back to when JANUS_ALLOW_PURE_PYTHON_GROUP=1
-and rbcl is not installed.
+"""Group-law checks for whichever ristretto255 backend is live --
+real `rbcl`/libsodium on Colab, or the test-only pure-Python backend
+(crypto/_ristretto_py.py) in a network-less sandbox.
+
+Deliberately backend-agnostic: these are exactly the properties BOTH
+implementations must satisfy, so the same file validates the sandbox
+backend's algebra and the real bindings' behaviour. That second job
+matters as much as the first -- FIX.md F8 was a case of bindings that
+imported fine and did not exist.
 
 This file is the thing crypto/_ristretto_py.py's own module docstring
 already claimed exists ("RFC 9496 test vectors ... are verified") --
@@ -18,10 +23,22 @@ import os
 
 import pytest
 
-if os.environ.get("JANUS_ALLOW_PURE_PYTHON_GROUP") != "1":
+# Gate on whether ANY group backend is live, not on which one. With rbcl
+# installed (Colab) these run against real libsodium; in a network-less
+# sandbox they run against the pure-Python backend when
+# JANUS_ALLOW_PURE_PYTHON_GROUP=1 selects it; with neither they skip.
+#
+# Gating on the env var alone -- as the first version of these files did --
+# meant the whole F7 suite SKIPPED on Colab, which is the one place it most
+# needs to run: the pure-Python backend proves the algebra, only rbcl proves
+# the bindings.
+from crypto.ristretto import backend_name as _backend_name
+
+if _backend_name() is None:
     pytest.skip(
-        "needs JANUS_ALLOW_PURE_PYTHON_GROUP=1 to select the test-only pure-Python "
-        "ristretto255 backend; see crypto/_ristretto_py.py and crypto/ristretto.py",
+        "no ristretto255 backend available: install rbcl, or set "
+        "JANUS_ALLOW_PURE_PYTHON_GROUP=1 to use the test-only pure-Python "
+        "backend (crypto/_ristretto_py.py)",
         allow_module_level=True,
     )
 
@@ -47,8 +64,8 @@ from crypto.ristretto import Point, Scalar, backend_name, group_order, identity,
 # which this file does not substitute for.
 
 
-def test_backend_is_pure_python_test_only():
-    assert backend_name() == "pure-python (TEST ONLY)"
+def test_a_group_backend_is_live():
+    assert backend_name() in ("rbcl", "pure-python (TEST ONLY)")
 
 
 def test_identity_point_is_all_zero_bytes():

@@ -80,3 +80,47 @@ def expand_field_stream(key: bytes, dim: int) -> np.ndarray:
         out[pos : pos + vals.shape[0]] = vals
         pos += vals.shape[0]
     return out
+
+
+# ---------------------------------------------------------------------------
+# Scalar-field stream (FIX.md F7e).
+#
+# The stream above produces elements of Z_{P_MASK} (~2^61), which is the
+# right field for masking a QUANTIZED UPDATE. F7e needs to mask something
+# else: a vector of Pedersen BLINDING FACTORS, which live in Z_L where L
+# is the ristretto255 scalar group order (~2^252). Those masks have to
+# cancel under addition mod L, not mod P_MASK, so they need their own
+# expander rather than four stitched-together P_MASK elements.
+#
+# Same construction, wider output: 64 keystream bytes per scalar, read
+# little-endian and reduced mod L. 64 bytes is 512 bits against a ~252-bit
+# modulus, so the reduction's distance from uniform on [0, L) is below
+# 2^-250 per element -- the same wide-reduction argument crypto/ristretto.py's
+# `_wide_scalar_reduce` already relies on for hashing into a scalar.
+# ---------------------------------------------------------------------------
+
+_SCALAR_L = 2 ** 252 + 27742317777372353535851937790883648493  # ristretto255/ed25519 group order
+_SCALAR_WIDE_BYTES = 64
+
+
+def expand_scalar_stream(key: bytes, dim: int) -> list[int]:
+    """`dim` pseudorandom integers in [0, L), as Python ints.
+
+    Returned as ints rather than `Scalar` objects on purpose: the caller
+    (crypto/norm_proof.py) adds and subtracts these mod L in bulk, which
+    is far cheaper on Python ints than on 32-byte `Scalar` wrappers, and
+    converts to `Scalar` only at the point a commitment is actually
+    computed.
+    """
+    if len(key) != 32:
+        raise ValueError("stream key must be 32 bytes (use derive_stream_key)")
+    if dim < 0:
+        raise ValueError("dim must be non-negative")
+    enc = Cipher(algorithms.AES(key), modes.CTR(bytes(16))).encryptor()
+    nbytes = _SCALAR_WIDE_BYTES * dim
+    raw = enc.update(bytes(nbytes)) if nbytes else b""
+    out = []
+    for i in range(dim):
+        chunk = raw[i * _SCALAR_WIDE_BYTES : (i + 1) * _SCALAR_WIDE_BYTES]
+        out.append(int.from_bytes(chunk, "little") % _SCALAR_L)
+    return out
