@@ -24,6 +24,14 @@ try:
 except ImportError:
     _HAVE_NACL = False
 
+# ristretto255 core ops (crypto_core_ristretto255_*) were added to PyNaCl
+# in 1.5.0 (2022-01-07); Colab's base image has shipped older pynacl
+# builds that import fine but lack this attribute, which otherwise
+# surfaces as a bare AttributeError three frames deep inside whichever
+# protocol call happened to need it first -- confusing enough on its own
+# that it is worth a dedicated check rather than waiting for one.
+_HAVE_RISTRETTO255 = _HAVE_NACL and hasattr(_b, "crypto_core_ristretto255_from_hash")
+
 
 def _require_nacl():
     if not _HAVE_NACL:
@@ -31,6 +39,20 @@ def _require_nacl():
             "pynacl is not installed. This module requires network access "
             "(`pip install pynacl`), which this sandbox does not have. "
             "Run on Colab — see notebooks/00_Setup_and_Crypto_Tests.ipynb."
+        )
+    if not _HAVE_RISTRETTO255:
+        import nacl
+        raise RuntimeError(
+            f"pynacl {getattr(nacl, '__version__', '?')} is installed but is "
+            f"missing nacl.bindings.crypto_core_ristretto255_from_hash -- "
+            f"that needs pynacl>=1.5.0. `pip install pynacl` with no version "
+            f"pin is a no-op if ANY version is already present (Colab's base "
+            f"image ships one), so this is the actual fix:\n"
+            f"    !pip install -q --upgrade --force-reinstall 'pynacl>=1.5.0'\n"
+            f"then RESTART THE RUNTIME (Runtime -> Restart session) before "
+            f"re-running -- the old nacl.bindings module stays imported in a "
+            f"live kernel even after the upgrade, so re-running without "
+            f"restarting hits this same error again."
         )
 
 

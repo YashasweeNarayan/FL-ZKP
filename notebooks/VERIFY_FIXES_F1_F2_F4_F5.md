@@ -37,10 +37,16 @@ shutil.rmtree('/content/FL-ZKP', ignore_errors=True)
 %cd /content/FL-ZKP
 !git log --oneline -1
 
-# pynacl: the EC layer. cryptography: F2's AES-CTR mask PRG (no slow
+# pynacl: the EC layer. --upgrade matters here: Colab's base image
+# ships an old pynacl, and `pip install pynacl` with no version pin is
+# a no-op if ANY version is already present. nacl.bindings.
+# crypto_core_ristretto255_from_hash (and the rest of ristretto255) only
+# exists from pynacl>=1.5.0 -- an older one imports fine and fails much
+# later with a bare AttributeError, which is what happened on the first
+# run of this cell. cryptography: F2's AES-CTR mask PRG (no slow
 # fallback exists on purpose -- two parties on different expanders
 # would derive different masks). flwr-datasets: FEMNIST.
-!pip install -q pynacl flwr-datasets cryptography
+!pip install -q --upgrade --force-reinstall 'pynacl>=1.5.0' flwr-datasets cryptography
 
 import sys
 sys.path.insert(0, '/content/FL-ZKP')
@@ -51,6 +57,9 @@ for mod in ('torch', 'nacl', 'cryptography', 'flwr_datasets', 'numpy'):
     except ImportError as e:
         print(f"{mod:16s} MISSING -> {e}")
 
+import nacl.bindings as _nb
+print("ristretto255 available:", hasattr(_nb, 'crypto_core_ristretto255_from_hash'))
+
 import torch
 print("CUDA:", torch.cuda.is_available(),
       torch.cuda.get_device_name(0) if torch.cuda.is_available() else "")
@@ -58,6 +67,15 @@ print("CUDA:", torch.cuda.is_available(),
 
 Expect the commit line to read `10656e4` or later. If `cryptography`
 is missing the run will fail immediately and loudly — that is deliberate.
+
+**If this cell upgraded pynacl (the previous attempt had an older one
+already loaded), restart the runtime now — Runtime → Restart session —
+and re-run every cell from here.** A live kernel keeps the old
+`nacl.bindings` module even after `pip install --upgrade` finishes; only
+a restart actually loads the new one. If you skip this and hit
+`crypto_core_ristretto255_from_hash` again, this is why — the fix just
+made the error message say so explicitly instead of a bare
+`AttributeError` three frames deep.
 
 ---
 
