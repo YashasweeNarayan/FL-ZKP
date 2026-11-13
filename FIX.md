@@ -17,7 +17,7 @@ Status words used below:
 
 | # | Issue | Severity | Status |
 |---|---|---|---|
-| F1 | Aggregate was never unmasked: the model received random values every round | Correctness, blocks everything | **FIXED, SANDBOX-TESTED** |
+| F1 | Aggregate was never unmasked: the model received random values every round | Correctness, blocks everything | **FIXED, CONFIRMED** |
 | F2 | Mask PRG is a Python SHA-256 loop: ~5.6 s per mask, n² masks per round | Performance | OPEN |
 | F3 | Each pairwise mask is computed twice in the simulation | Performance (simulation only) | OPEN |
 | F4 | Sketch sign matrix is regenerated once per client though it is the same for all | Performance (simulation only) | OPEN |
@@ -31,7 +31,11 @@ Order of work: F1 → F2–F5 → F6 → F7.
 
 ## F1 — The aggregate was never unmasked
 
-**Status: FIXED, SANDBOX-TESTED (2026-11-13). Colab confirmation owed.**
+**Status: FIXED, CONFIRMED (2026-11-13).** Confirmed on real Colab
+infrastructure (CASE2, resnet50, model_dim=23,628,798, 8 clients):
+round 0 printed `accepted=8/8, V5=PASS, aggregate=EXACT`. This is the
+first round in the project's history whose aggregate was ever
+mathematically correct.
 
 ### What was wrong
 
