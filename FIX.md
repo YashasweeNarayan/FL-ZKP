@@ -18,7 +18,7 @@ Status words used below:
 | # | Issue | Severity | Status |
 |---|---|---|---|
 | F1 | Aggregate was never unmasked: the model received random values every round | Correctness, blocks everything | **FIXED, CONFIRMED** |
-| F2 | Mask PRG is a Python SHA-256 loop: ~5.6 s per mask, n² masks per round | Performance | OPEN |
+| F2 | Mask PRG and digest weights expanded by a Python SHA-256 loop; digest multiplied in Python big integers | Performance | **FIXED, SANDBOX-TESTED** |
 | F3 | Each pairwise mask is computed twice in the simulation | Performance (simulation only) | OPEN |
 | F4 | Sketch sign matrix is regenerated once per client though it is the same for all | Performance (simulation only) | OPEN |
 | F5 | Two full-dimension arrays are kept per client for the whole round: 17.6 GB at 50 clients | Memory, blocks 50 clients | OPEN |
@@ -167,14 +167,77 @@ and pynacl. Expected on Colab: every round line shows `aggregate=EXACT`.
 
 ---
 
-## F2 — Mask PRG speed
+## F2 — Mask PRG and weighted-digest speed
 
-**Status: OPEN.**
-`crypto/secagg.py::_prg` calls SHA-256 from a Python loop, 32 bytes per
-call. Measured in the sandbox at d = 23,628,798: 5.56 s per mask vector,
-against 0.32 s for an AES-128-CTR keystream with the same reduction. A round
-needs n² mask vectors, which is about 83 minutes at 30 clients.
-Plan: expand masks with AES-CTR (the choice in Bonawitz et al.).
+**Status: FIXED, SANDBOX-TESTED (2026-11-13). Colab timing owed.**
+
+### What was wrong
+
+Two O(model_dim) steps ran in slow reference code.
+
+1. `crypto/secagg.py::_prg` expanded every mask by calling SHA-256 from a
+   Python loop, 32 bytes per call. A round needs n² mask vectors
+   (each of n clients expands n−1 pairwise masks and one self-mask).
+2. `crypto/vector_commit.py::weighted_digest` (found while fixing 1) used
+   the same SHA-256 loop for its weights, then multiplied weight × value
+   in Python big integers, one object per coordinate. It runs once per
+   client in phase 1 and once per accepted client in the server's V5 sum.
+
+### What changed
+
+- New `crypto/prg.py`: one expander for both uses.
+  `key = SHA-256(tag ‖ length-prefixed parts)`, then an AES-256-CTR
+  keystream, 8 bytes per element, shifted right by 3 to 61 bits, with the
+  single value 2^61 − 1 mapped to 0. AES in counter mode is the mask PRG
+  of Bonawitz et al. (CCS 2017). Distance from uniform: 2^-61 per element.
+  The parts are length-prefixed, which the old concatenation was not.
+- `_prg` and `_weight_stream` call it, under different domain tags.
+- `weighted_digest` multiplies in uint64 with an exact reduction for the
+  Mersenne prime 2^61 − 1 (`_dot_mod_p`), and reads the weights chunk by
+  chunk, so it no longer allocates a model_dim-sized weight array.
+- No fallback to the old expander: two parties on different expanders
+  would derive different masks and the aggregate would not unmask.
+  `cryptography` is therefore a hard dependency (preinstalled on Colab).
+
+### Measured (sandbox CPU, best of 3)
+
+| Step | model_dim | Before | After | Speed-up |
+|---|---|---|---|---|
+| One mask vector | 11,208,318 | 2.88 s | 0.091 s | 32× |
+| One mask vector | 23,628,798 | 5.68 s | 0.164 s | 35× |
+| One weighted digest | 11,208,318 | 4.63 s | 0.285 s | 16× |
+| One weighted digest | 23,628,798 | 9.15 s | 0.575 s | 16× |
+
+Per round these two steps cost n² masks + 2n digests. At 8 clients and
+model_dim 23.6M that is about 510 s before and 20 s after on this CPU.
+The Colab round measured 1617 s in total, so other costs remain
+(training, sketch, range proofs, unmasking); the next Colab timing line
+will show how much.
+
+### How it was checked
+
+`tests/test_prg.py`, 7 tests: determinism, range, prefix property,
+independence from chunk size, domain and part-boundary separation, a
+coarse uniformity check, `_dot_mod_p` against big-integer arithmetic
+including the largest inputs, `weighted_digest` against the big-integer
+sum across chunk boundaries, and linearity mod P. All 67 repository tests
+pass, and the server-path dry run from F1 still gives an exact aggregate.
+
+### Known limits
+
+- Mask values differ from the old expander's. Nothing was stored, so
+  nothing breaks, but old and new code cannot be mixed in one run.
+- The 16× digest figure is NumPy on CPU; a GPU version is possible but
+  not needed at this size.
+
+### For the paper
+
+- State the PRG: AES-256-CTR keyed by SHA-256 of the pairwise or self
+  seed and the round nonce, output in Z_p with p = 2^61 − 1.
+- T1 (update confidentiality) already assumes PRG security; this names
+  the PRG.
+- Per-client mask cost is (n−1) + 1 expansions of model_dim elements;
+  report it from the measured per-vector time.
 
 ## F3 — Pairwise masks computed twice
 

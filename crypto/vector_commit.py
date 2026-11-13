@@ -61,50 +61,67 @@ tests/test_vector_commit.py's linearity check a faithful stand-in for
 the full Com(a,r)+Com(b,s) == Com(a+b,r+s) property without needing
 pynacl to verify it.
 
-*** PERFORMANCE NOTE, same caveat as sketch.py's SketchProjector ***
-This reference does the weighted sum with numpy using Python-object
-(arbitrary-precision) arithmetic for the final accumulation, since
-weight*value products exceed int64/float64 range. That is correctness-
-tested here, at moderate d, but NOT the fast path for d~23.5M -- same
-GPU/torch reimplementation note as sketch.py applies (see STATUS.md):
-the production client.py should do this with the same chunked
-PRG-plus-batched-modmul pattern, on GPU, not this reference loop.
+PERFORMANCE (FIX.md F2)
+-----------------------
+The weights come from the AES-256-CTR expander in crypto/prg.py and the
+weighted sum is done in uint64 with an exact Mersenne-prime reduction
+(_dot_mod_p), chunk by chunk. The earlier version expanded the weights
+with a Python SHA-256 loop and multiplied in Python big integers; the
+result is the same number for the same weights, tested against the
+big-integer computation in tests/test_prg.py.
 """
 from __future__ import annotations
 
-import hashlib
-
 import numpy as np
+
+from .prg import derive_stream_key, expand_field_stream, iter_field_stream
 
 P_MASK = 2 ** 61 - 1  # MUST match secagg.py's masking modulus -- the vectors
                       # this digest is applied to already live in this domain
 
 
+def _weight_key(seed: bytes) -> bytes:
+    # Distinct domain tag: these weights can never collide with a masking
+    # stream even if a seed were reused.
+    return derive_stream_key(b"vc-weight", seed)
+
+
 def _weight_stream(seed: bytes, dim: int) -> np.ndarray:
     """Deterministic stream of `dim` field elements in [0, P_MASK),
-    derived from `seed` via chunked SHA-256 expansion -- the identical
-    construction to secagg.py's _prg (same chunk size, same
-    uint64-then-reduce approach), reused here under a distinct domain-
-    separation tag ("vc-weight") so these weights never collide with
-    any masking PRG output even if a seed were accidentally reused.
+    derived from `seed` with the AES-256-CTR expander in crypto/prg.py
+    (FIX.md F2)."""
+    return expand_field_stream(_weight_key(seed), dim)
+
+
+_M31 = np.uint64((1 << 31) - 1)
+_M30 = np.uint64((1 << 30) - 1)
+_M32 = np.uint64((1 << 32) - 1)
+
+
+def _dot_mod_p(w: np.ndarray, v: np.ndarray) -> int:
+    """Exact sum_j w_j * v_j mod P_MASK for int64 arrays with entries in
+    [0, P_MASK), using only uint64 arithmetic.
+
+    Split a = a_hi*2^31 + a_lo and b likewise (a_hi < 2^30, a_lo < 2^31):
+
+        a*b = a_hi*b_hi*2^62 + (a_hi*b_lo + a_lo*b_hi)*2^31 + a_lo*b_lo
+
+    P_MASK = 2^61 - 1, so 2^61 = 1 and 2^62 = 2 (mod P_MASK). Writing the
+    cross term as c = c_hi*2^30 + c_lo gives c*2^31 = c_hi + c_lo*2^31.
+    Every partial result stays below 2^63, so nothing wraps.
     """
-    out = np.empty(dim, dtype=np.int64)
-    counter = 0
-    filled = 0
-    buf = b""
-    while filled < dim:
-        if len(buf) < 8 * 4096:
-            buf += hashlib.sha256(seed + b"||vc-weight||" + counter.to_bytes(8, "little")).digest()
-            counter += 1
-            continue
-        take = min(4096, dim - filled)
-        chunk_bytes = buf[: take * 8]
-        buf = buf[take * 8 :]
-        raw = np.frombuffer(chunk_bytes, dtype=np.uint64)[:take]
-        vals = (raw % np.uint64(P_MASK)).astype(np.int64)
-        out[filled : filled + take] = vals
-        filled += take
-    return out
+    a = w.astype(np.uint64)
+    b = v.astype(np.uint64)
+    a_lo, a_hi = a & _M31, a >> np.uint64(31)
+    b_lo, b_hi = b & _M31, b >> np.uint64(31)
+    cross = a_hi * b_lo + a_lo * b_hi
+    term = (a_lo * b_lo + np.uint64(2) * (a_hi * b_hi)
+            + (cross >> np.uint64(30)) + ((cross & _M30) << np.uint64(31)))
+    # term < 2^63 per element; add the two 32-bit halves separately so the
+    # running sums cannot overflow, then finish in Python integers.
+    lo = int((term & _M32).sum(dtype=np.uint64))
+    hi = int((term >> np.uint64(32)).sum(dtype=np.uint64))
+    return (lo + (hi << 32)) % P_MASK
 
 
 def weighted_digest(vec: np.ndarray, seed: bytes) -> int:
@@ -113,18 +130,21 @@ def weighted_digest(vec: np.ndarray, seed: bytes) -> int:
     client and the verifying server/auditor, so both sides derive the
     identical weight stream independently).
 
-    `vec` must already be a 1-D integer array with entries in
-    [0, P_MASK) -- exactly the domain fl/client.py's double-masking step
-    (and secagg.py's aggregate_masked) already produces.
+    `vec` is a 1-D integer array; entries are reduced into [0, P_MASK)
+    before use. The weight stream is consumed chunk by chunk and never
+    held in full.
     """
     vec = np.asarray(vec)
     dim = vec.shape[0]
-    weights = _weight_stream(seed, dim)
     total = 0
-    chunk = 1 << 16
-    for start in range(0, dim, chunk):
-        end = min(start + chunk, dim)
-        # object dtype: weight*value can exceed 2^122, past int64/float64 range
-        prod = weights[start:end].astype(object) * vec[start:end].astype(object)
-        total = (total + int(prod.sum())) % P_MASK
+    start = 0
+    for weights in iter_field_stream(_weight_key(seed), dim, chunk=1 << 18):
+        end = start + weights.shape[0]
+        part = vec[start:end]
+        if part.dtype == object:
+            # arbitrary-precision input: exact reference path
+            total = (total + int((weights.astype(object) * part).sum())) % P_MASK
+        else:
+            total = (total + _dot_mod_p(weights, np.mod(part.astype(np.int64), P_MASK))) % P_MASK
+        start = end
     return total

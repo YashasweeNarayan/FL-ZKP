@@ -25,6 +25,7 @@ import hashlib
 import numpy as np
 
 from .field import L, ShamirPolynomial, ShamirShare, reconstruct
+from .prg import derive_stream_key, expand_field_stream
 
 # Masking modulus: a 61-bit Mersenne prime, NOT the Ed25519 group order L.
 # L (~2^252) is used for Shamir-sharing curve scalars (field.py) and does
@@ -40,25 +41,10 @@ P_MASK = 2**61 - 1
 def _prg(key: bytes, round_nonce: bytes, dim: int, seed_salt: bytes = b"") -> np.ndarray:
     """Deterministic pseudorandom vector in Z_{P_MASK}^dim from (key, round_nonce).
     Both pairwise masks and self-masks use this -- same primitive,
-    different key material.
+    different key material. AES-256-CTR expansion, see crypto/prg.py
+    (FIX.md F2).
     """
-    out = np.empty(dim, dtype=np.int64)
-    counter = 0
-    filled = 0
-    buf = b""
-    while filled < dim:
-        if len(buf) < 8 * 4096:
-            buf += hashlib.sha256(key + round_nonce + seed_salt + counter.to_bytes(8, "little")).digest()
-            counter += 1
-            continue
-        take = min(4096, dim - filled)
-        chunk_bytes = buf[: take * 8]
-        buf = buf[take * 8 :]
-        raw = np.frombuffer(chunk_bytes, dtype=np.uint64)[:take]
-        vals = (raw % np.uint64(P_MASK)).astype(np.int64)
-        out[filled : filled + take] = vals
-        filled += take
-    return out
+    return expand_field_stream(derive_stream_key(b"secagg-mask", key, round_nonce, seed_salt), dim)
 
 
 def pairwise_round_seed(shared_secret: bytes, round_nonce: bytes) -> bytes:
