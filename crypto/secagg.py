@@ -61,13 +61,34 @@ def _prg(key: bytes, round_nonce: bytes, dim: int, seed_salt: bytes = b"") -> np
     return out
 
 
+def pairwise_round_seed(shared_secret: bytes, round_nonce: bytes) -> bytes:
+    """Round-specific seed for one pair's mask, derived one-way from the
+    pair's LONG-TERM shared secret. This is the value a surviving client
+    hands to the server when its partner's submission was dropped or
+    rejected (see `unmask_aggregate`): it lets the server strip that one
+    pair's mask for that one round, and reveals nothing about the
+    long-term secret or about any other round's mask (SHA-256 preimage
+    resistance). Without this indirection, removing a dropped client's
+    pairwise masks would mean disclosing the long-term secret itself and
+    with it every past and future round's mask for that pair.
+    """
+    return hashlib.sha256(b"janus-fl-pairwise-round-seed" + shared_secret + round_nonce).digest()
+
+
+def pairwise_mask_from_round_seed(round_seed: bytes, dim: int, sign: int) -> np.ndarray:
+    v = _prg(round_seed, b"", dim, seed_salt=b"pairwise")
+    return (sign * v) % P_MASK
+
+
 def pairwise_mask(shared_secret: bytes, round_nonce: bytes, dim: int, sign: int) -> np.ndarray:
     """sign = +1 for the lower-indexed party in a pair, -1 for the
     higher-indexed -- this is what makes every pairwise mask cancel
     exactly once summed over all clients (standard Bonawitz construction).
+    Expanded from the pair's round seed (not the long-term secret
+    directly) so the server-side removal path in `unmask_aggregate`
+    reproduces exactly the same vector from the round seed alone.
     """
-    v = _prg(shared_secret, round_nonce, dim, seed_salt=b"pairwise")
-    return (sign * v) % P_MASK
+    return pairwise_mask_from_round_seed(pairwise_round_seed(shared_secret, round_nonce), dim, sign)
 
 
 def self_mask(self_secret: bytes, round_nonce: bytes, dim: int) -> np.ndarray:
@@ -101,6 +122,104 @@ def aggregate_masked(masked_updates: list[np.ndarray]) -> np.ndarray:
     acc = np.zeros_like(masked_updates[0])
     for u in masked_updates:
         acc = (acc + u) % P_MASK
+    return acc
+
+
+# ---------------------------------------------------------------------------
+# Unmasking round (Bonawitz et al. CCS'17, "Unmasking" step). Summing the
+# accepted clients' masked vectors is NOT the aggregate yet:
+#
+#   sum_{k in A} x_k  =  sum_{k in A} q_k
+#                      + sum_{k in A} selfmask_k                 (never cancels)
+#                      + sum_{k in A, j not in A} +-PRG(seed_kj)  (partner missing)
+#
+# Pairwise masks cancel only between two clients that are BOTH in the
+# accepted set A. The other two terms must be removed explicitly, using
+# material the clients release only after the accepted set is fixed.
+# ---------------------------------------------------------------------------
+
+def new_self_mask_secret() -> int:
+    """A fresh self-mask secret, drawn from Z_L so that Shamir sharing
+    over Z_L (field.py) reconstructs it EXACTLY. A raw 256-bit value can
+    exceed L (~2^252); it would be reduced mod L inside the polynomial
+    and the reconstructed secret would then expand to a different mask
+    than the one the client actually applied.
+    """
+    from .field import rand_scalar
+    return rand_scalar()
+
+
+def self_secret_bytes(self_secret_int: int) -> bytes:
+    return self_secret_int.to_bytes(32, "little")
+
+
+class ShareReleasePolicy:
+    """What an honest client is willing to release during unmasking, for
+    ONE round. This is the rule that makes double-masking mean anything
+    (ARCHITECTURE.md C7 / REVIEW.md R5): about any given client k, an
+    honest holder releases EITHER its share of k's self-mask secret (k's
+    submission is being aggregated) OR its pairwise round seed with k
+    (k's submission is excluded) -- never both. A server holding both
+    for the same k could strip every mask from k's vector and read the
+    update in the clear.
+    """
+
+    def __init__(self):
+        self._self_share_released_about: set = set()
+        self._pairwise_seed_released_about: set = set()
+
+    def release_self_share(self, about_client: int) -> None:
+        if about_client in self._pairwise_seed_released_about:
+            raise PermissionError(
+                f"refusing to release a self-mask share about client {about_client}: "
+                f"pairwise seeds with that client were already released this round"
+            )
+        self._self_share_released_about.add(about_client)
+
+    def release_pairwise_seed(self, about_client: int) -> None:
+        if about_client in self._self_share_released_about:
+            raise PermissionError(
+                f"refusing to release a pairwise seed with client {about_client}: "
+                f"self-mask shares about that client were already released this round"
+            )
+        self._pairwise_seed_released_about.add(about_client)
+
+
+def unmask_aggregate(
+    masked_sum: np.ndarray,
+    accepted: list[int],
+    self_mask_shares: dict,
+    share_threshold: int,
+    excluded_pair_seeds: dict,
+    round_nonce: bytes,
+    dim: int,
+) -> np.ndarray:
+    """Turns sum_{k in A} x_k (mod P_MASK) into sum_{k in A} q_k (mod P_MASK).
+
+    masked_sum          -- aggregate_masked() over the accepted clients' vectors.
+    accepted            -- client indices in A.
+    self_mask_shares    -- {k: [ShamirShare, ...]} for every k in A; at least
+                           `share_threshold` shares each, or this raises (fewer
+                           shares reconstruct a wrong secret silently, which
+                           would corrupt the aggregate with no error).
+    excluded_pair_seeds -- {(j, k): round_seed} for every accepted j and every
+                           excluded k (rejected or dropped), as released by j.
+    """
+    acc = masked_sum.copy()
+    accepted_set = set(accepted)
+    for k in accepted:
+        distinct = list({sh.index: sh for sh in self_mask_shares.get(k, [])}.values())
+        if len(distinct) < share_threshold:
+            raise ValueError(
+                f"client {k}: only {len(distinct)} distinct self-mask shares, "
+                f"need {share_threshold} -- cannot unmask this round"
+            )
+        acc = (acc - recover_self_mask(distinct[:share_threshold], round_nonce, dim)) % P_MASK
+    for (j, k), seed in excluded_pair_seeds.items():
+        if j not in accepted_set or k in accepted_set:
+            raise ValueError(f"pair ({j}, {k}): seed must come from an accepted client about an excluded one")
+        sign = 1 if j < k else -1
+        acc = (acc - pairwise_mask_from_round_seed(seed, dim, sign)) % P_MASK
     return acc
 
 

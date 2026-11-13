@@ -22,14 +22,20 @@ import time
 
 import numpy as np
 
-from crypto.secagg import derive_pairwise_secret_via_x25519
+from crypto.secagg import (
+    derive_pairwise_secret_via_x25519, new_self_mask_secret, pairwise_round_seed,
+    ShareReleasePolicy, aggregate_masked,
+)
 from crypto.sketch import seed_commitment
 from verifier.audit import independent_v5_check
 
 from crypto.sketch import TorchSketchProjector
 
-from .client import ClientKeys, ClientRoundContext, round_step_phase1, round_step_phase2, quantize, center_mod_p_mask
-from .server import run_round, apply_update
+from .client import (
+    ClientKeys, ClientRoundContext, round_step_phase1, round_step_phase2, quantize, center_mod_p_mask,
+    share_self_mask_secret,
+)
+from .server import run_round, apply_update, UnmaskingMaterial
 from .norm_rule import bootstrap_from_server_root, update_threshold_ema
 from .models import flatten_state_dict, unflatten_to_state_dict
 
@@ -209,6 +215,7 @@ def run_training_loop(
     lr: float = 0.01,
     epochs: int = 1,
     verbose: bool = True,
+    secagg_share_threshold: int = None,
 ):
     """Runs ARCHITECTURE.md §4's round protocol for `rounds` rounds over
     one model: VRF self-sampling -> local train -> DP noise -> quantize
@@ -270,6 +277,12 @@ def run_training_loop(
     k = CFG["norm_rule"]["k"]
     ema_alpha = CFG["norm_rule"]["ema_alpha"]
 
+    # Self-mask secrets are t-of-n Shamir-shared among the clients. Default
+    # t = floor(2n/3)+1 (Bonawitz et al.'s honest-majority-of-survivors
+    # setting): fewer than t accepted clients means the round cannot be
+    # unmasked and aborts, independently of the k_min privacy floor.
+    share_t = secagg_share_threshold if secagg_share_threshold is not None else (2 * n_clients) // 3 + 1
+
     w_t, model_shapes = flatten_state_dict(model)
     threshold = bootstrap_from_server_root(server_root_norms, k=k)
     history = []
@@ -303,15 +316,18 @@ def run_training_loop(
         _t_phase1_start = time.time()
         ctx_by_client = {}
         phase1_by_client = {}
+        self_mask_shares_held = {}   # {k: {holder_id: ShamirShare}} -- held by the OTHER clients, not the server
+        holder_ids = list(range(1, n_clients + 1))
         for client_idx in range(n_clients):
             ctx = ClientRoundContext(
                 keys=ClientKeys(sk=client_sks[client_idx], pk=ring[client_idx], index=client_idx),
                 ring=ring,
                 pairwise_secrets=pairwise_secrets[client_idx],
-                self_mask_secret_int=int.from_bytes(os.urandom(32), "little"),
+                self_mask_secret_int=new_self_mask_secret(),
                 model_dim=model_dim,
             )
             ctx_by_client[client_idx] = ctx
+            self_mask_shares_held[client_idx] = share_self_mask_secret(ctx, holder_ids, share_t)
             phase1_by_client[client_idx] = round_step_phase1(
                 ctx, w_t, rho_t, rho_e, vrf_alpha, sampling_rate, sigma_dp,
                 n_clients, client_datasets[client_idx], model, lr, epochs, pk_trace,
@@ -332,7 +348,27 @@ def run_training_loop(
 
         _t_verify_start = time.time()
         submissions = [(i, phase1_by_client[i]) for i in range(n_clients)]
-        outcome = run_round(submissions, phase2_by_client, rho_t, rho_e, vrf_alpha, threshold.B_t, n_clients, model_dim)
+
+        def unmask_provider(accepted_idx, excluded_idx, _held=self_mask_shares_held, _rho=rho_t):
+            # Simulates the accepted (alive) clients' replies in the
+            # unmasking round. One ShareReleasePolicy for the round
+            # stands in for every honest client applying the same rule:
+            # about any client, release self-mask shares OR pairwise
+            # seeds, never both.
+            policy = ShareReleasePolicy()
+            shares = {}
+            for k in accepted_idx:
+                policy.release_self_share(k)
+                shares[k] = [_held[k][h + 1] for h in accepted_idx]
+            seeds = {}
+            for k in excluded_idx:
+                policy.release_pairwise_seed(k)
+                for j in accepted_idx:
+                    seeds[(j, k)] = pairwise_round_seed(pairwise_secrets[j][k], _rho)
+            return UnmaskingMaterial(shares, seeds, share_t)
+
+        outcome = run_round(submissions, phase2_by_client, rho_t, rho_e, vrf_alpha, threshold.B_t, n_clients, model_dim,
+                            unmask_provider=unmask_provider)
         _t_verify = time.time() - _t_verify_start
 
         if verbose:
@@ -355,6 +391,21 @@ def run_training_loop(
         accepted_commitments = [phase1_by_client[i].commitment_point for i in outcome.accepted_client_indices]
         audit = independent_v5_check(accepted_commitments, outcome.published_sum_value, outcome.published_sum_blinding)
 
+        # SIMULATION-ONLY self-check: this process happens to hold every
+        # client's plaintext q_k, so it can confirm the unmasked aggregate
+        # is exactly sum_{accepted} q_k. No party in the real protocol can
+        # run this (nobody holds the q_k). It exists because the previous
+        # version of this loop applied a never-unmasked aggregate for every
+        # round while still printing V5=PASS.
+        expected_aggregate = aggregate_masked([phase1_by_client[i]._secret_q for i in outcome.accepted_client_indices])
+        aggregate_exact = bool(np.array_equal(outcome.aggregate_quantized, expected_aggregate))
+        del expected_aggregate
+        if not aggregate_exact:
+            if verbose:
+                print(f"round {t_round}: AGGREGATE MISMATCH -- unmasked aggregate != sum of accepted q_k; update NOT applied")
+            history.append({"round": t_round, "aborted": True, "reason": "aggregate mismatch after unmasking"})
+            continue
+
         w_t = apply_update(w_t, outcome.aggregated_delta)
 
         next_round_norms = np.array([
@@ -365,13 +416,14 @@ def run_training_loop(
         if verbose:
             v5_msg = "PASS" if audit.v5_passed else f"FAIL: {audit.detail}"
             print(f"round {t_round}: accepted={len(outcome.accepted_client_indices)}/{n_clients}, "
-                  f"V5={v5_msg}, next B_t={threshold.B_t:.3f}")
+                  f"V5={v5_msg}, aggregate=EXACT, next B_t={threshold.B_t:.3f}")
 
         history.append({
             "round": t_round,
             "aborted": False,
             "accepted": len(outcome.accepted_client_indices),
             "v5_passed": audit.v5_passed,
+            "aggregate_exact": aggregate_exact,
             "B_t": threshold.B_t,
         })
 

@@ -20,7 +20,7 @@ import numpy as np
 from crypto.ristretto import Scalar, Point, scalar_mul_base
 from crypto.vrf import evaluate as vrf_evaluate, is_sampled as vrf_is_sampled
 from crypto.dp import split_noise
-from crypto.secagg import pairwise_mask, self_mask, P_MASK
+from crypto.secagg import pairwise_mask, self_mask, self_secret_bytes, shamir_share_self_secret, P_MASK
 from crypto.pedersen import commit as pedersen_commit
 from crypto.elgamal_threshold import encrypt as elgamal_encrypt
 from crypto.clsag import sign as clsag_sign, h_p as clsag_h_p
@@ -42,7 +42,7 @@ class ClientRoundContext:
     keys: ClientKeys
     ring: list   # list[Point], the full published ring (len 50)
     pairwise_secrets: dict   # {other_client_index: bytes}, from X25519 ECDH (see secagg.py)
-    self_mask_secret_int: int
+    self_mask_secret_int: int   # in Z_L (crypto.secagg.new_self_mask_secret), so its Shamir shares reconstruct it exactly
     model_dim: int
     quant_bits: int = 16
 
@@ -208,6 +208,17 @@ def local_train_delta(model, w_t, local_data, lr: float, epochs: int):
     return delta
 
 
+def share_self_mask_secret(ctx: ClientRoundContext, holder_ids: list, t: int) -> dict:
+    """Before masking: Shamir-share this round's self-mask secret among
+    the other clients ({holder_id: ShamirShare}, holder ids 1-indexed).
+    The holders release these to the server only if this client's
+    submission ends up in the accepted set (ShareReleasePolicy) -- that
+    is how the server removes the self-mask from the aggregate, and why
+    it cannot remove it from a vector it merely claims was dropped.
+    """
+    return shamir_share_self_secret(ctx.self_mask_secret_int, t, holder_ids)
+
+
 def round_step_phase1(
     ctx: ClientRoundContext,
     w_t,
@@ -252,7 +263,7 @@ def round_step_phase1(
     for other_idx, secret in ctx.pairwise_secrets.items():
         sign = 1 if ctx.keys.index < other_idx else -1
         masked = (masked + pairwise_mask(secret, rho_t, ctx.model_dim, sign)) % P_MASK
-    masked = (masked + self_mask(ctx.self_mask_secret_int.to_bytes(32, "little"), rho_t, ctx.model_dim)) % P_MASK
+    masked = (masked + self_mask(self_secret_bytes(ctx.self_mask_secret_int), rho_t, ctx.model_dim)) % P_MASK
 
     # Step 5: Pedersen-commit the masked vector, via a single scalar
     # DIGEST rather than one commitment per coordinate (d can be tens

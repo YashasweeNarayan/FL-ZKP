@@ -20,7 +20,7 @@ from crypto.rangeproof import verify_range, verify_recomposition
 from crypto.r_cons import verify_identity_binding
 from crypto.pedersen import commit_sum, verify_opening, commit as pedersen_commit, Commitment
 from crypto.ristretto import Scalar
-from crypto.secagg import aggregate_masked, P_MASK
+from crypto.secagg import aggregate_masked, unmask_aggregate, P_MASK
 from crypto.vector_commit import weighted_digest
 
 from .norm_rule import compute_threshold, NormThreshold
@@ -142,6 +142,19 @@ class RoundOutcome:
     published_sum_value: int = None       # exact sum of each accepted client's own weighted_digest(masked_k, rho_t) -- what the server publishes for V5; may exceed P_MASK (see run_round's comment on why it must not be re-reduced mod P_MASK)
     published_sum_blinding: "object" = None  # Scalar: sum of revealed r_k's for the accepted set
     rejected_reasons: dict = field(default_factory=dict)  # client_index -> list[str], e.g. ["V3_norm_bound_exceeded"]
+    aggregate_quantized: "object" = None  # np.int64 in Z_{P_MASK}: sum of the accepted clients' q_k AFTER unmasking -- the protocol's public output, before dequantization
+
+
+@dataclass
+class UnmaskingMaterial:
+    """What the accepted clients release once the accepted set is fixed
+    (crypto/secagg.py's unmasking round). Collected by the caller
+    through `unmask_provider`, because WHICH material is needed depends
+    on the accepted set this function computes.
+    """
+    self_mask_shares: dict       # {accepted k: [ShamirShare, ...]}
+    excluded_pair_seeds: dict    # {(accepted j, excluded k): round_seed bytes}
+    share_threshold: int
 
 
 def run_round(
@@ -153,6 +166,7 @@ def run_round(
     B_t: float,
     n_clients: int,
     model_dim: int,
+    unmask_provider,        # callable(accepted_indices, excluded_indices) -> UnmaskingMaterial
 ) -> RoundOutcome:
     seen_key_images: set = set()
     accepted = []
@@ -224,13 +238,33 @@ def run_round(
         r_k = sub._secret_blinding
         published_sum_blinding = r_k if published_sum_blinding is None else published_sum_blinding + r_k
 
-    mean_masked = aggregate_masked_vector.astype(np.float64) / max(len(accepted), 1)
-    dequantized_mean_delta = dequantize(aggregate_masked_vector, bits=16) / max(len(accepted), 1)
+    # Unmasking round. `aggregate_masked_vector` is NOT the aggregate:
+    # it still carries every accepted client's self-mask, plus the
+    # pairwise masks accepted clients share with excluded ones (those
+    # only cancel when BOTH partners are summed). Until 2026-11-13 this
+    # function dequantized it directly, which handed uniformly random
+    # values (~1e12 after dequantization) to apply_update every round.
+    # V5 above is unaffected and stays on the MASKED vectors: it checks
+    # that what was summed is what was committed, not what it decodes to.
+    accepted_indices = [idx for idx, _ in accepted]
+    accepted_set = set(accepted_indices)
+    excluded_indices = [idx for idx, _ in submissions if idx not in accepted_set]
+    material = unmask_provider(accepted_indices, excluded_indices)
+    try:
+        aggregate_quantized = unmask_aggregate(
+            aggregate_masked_vector, accepted_indices, material.self_mask_shares,
+            material.share_threshold, material.excluded_pair_seeds, rho_t, model_dim,
+        )
+    except ValueError as e:
+        return RoundOutcome(aborted=True, abort_reason=f"unmasking failed: {e}", rejected_reasons=rejected_reasons)
+
+    dequantized_mean_delta = dequantize(aggregate_quantized, bits=16) / max(len(accepted), 1)
 
     return RoundOutcome(
         aggregated_delta=dequantized_mean_delta,
-        accepted_client_indices=[idx for idx, _ in accepted],
+        accepted_client_indices=accepted_indices,
         aborted=False,
+        aggregate_quantized=aggregate_quantized,
         v5_check_passed=None,  # filled in by verifier/audit.py's independent_v5_check once posted to BB
         sum_commitment_check=expected,
         published_sum_value=published_sum_value,
