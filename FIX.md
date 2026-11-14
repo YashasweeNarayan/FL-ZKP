@@ -1041,6 +1041,46 @@ is actually exercised rather than passing because both sides happen to say 8.
   Nothing left open on this fix; F7f's group-not-individual attribution
   remains open by design, unchanged, not something to fix.
 
+## Checkpoint/resume for multi-hour free-tier Colab runs (2026-11-15)
+
+- **Context, not a correctness bug**: moving from Gate-E-scale smoke tests
+  (8-9 clients, a handful of rounds) to a real first MVP-scoped result
+  (`n_clients=50`, `sampling_rate=0.25` -> ~13 active clients/round,
+  measured ~53s/client/round on resnet18) means a single run is hours
+  long (~3.8h for 20 rounds, the scope-cut chosen to fit one free-tier
+  Colab session -- see `notebooks/CASE1_IID_MNIST.ipynb`'s new markdown
+  cell for the full time-budget math). `fl/round_loop.py::run_training_loop`
+  had no way to save or resume progress -- a Colab disconnect at any
+  point during a multi-hour run lost 100% of the already-paid-for GPU
+  and crypto work, with no way to recover anything already computed.
+- **Fix**: two new functions in `fl/round_loop.py`, `save_checkpoint(path,
+  round_idx, w_t, threshold, history, suspect_tracker)` and
+  `load_checkpoint(path)`, using `torch.save`/`torch.load` (picklable
+  dataclasses alongside the `w_t` tensor, one file, no second
+  serialization format needed). `run_training_loop` gained two new
+  keyword-only params, both `None` by default so every existing call
+  site (all four notebooks) is unaffected: `checkpoint_path` (if given,
+  saves after EVERY round, inside the existing `finally` block so it
+  fires on the normal path AND on every abort path -- aggregate
+  mismatch, F7/F7e failure -- since `history` already has that round's
+  entry by the time `finally` runs) and `resume_from` (the dict
+  `load_checkpoint` returns; if given, restores `w_t`/`threshold`/
+  `history`/`suspect_tracker` and resumes the loop at `round+1` instead
+  of 0). The save itself writes to a `.tmp` path and `os.replace`s it
+  over the real path, so a crash mid-save can never leave a corrupt,
+  unreadable checkpoint -- the previous round's checkpoint (or none)
+  survives until the new one fully lands.
+- **Checks**: `python3 -m py_compile fl/round_loop.py` clean; full local
+  pure-Python suite rerun after the change, unaffected (113 passed, 5
+  skipped -- same as before this change, since no existing test calls
+  `run_training_loop` directly; it's torch/EC-dependent like the rest of
+  this module, exercised only via the notebooks on Colab per
+  `STATUS.md`). Not yet exercised on a real multi-hour Colab run --
+  flagging this as untested-on-real-infra rather than implying it's
+  been proven to survive an actual disconnect.
+- **Notes for the paper**: none -- this is scaffolding for producing a
+  result, not part of the protocol itself; doesn't belong in the paper.
+
 ## F8 — ristretto255 bindings: wrong library entirely, not a version problem
 
 **Status: FIXED, CONFIRMED ON COLAB (2026-11-13).** `rbcl` imports and its

@@ -221,6 +221,51 @@ def bootstrap_norms_from_model_dim(
     return norms
 
 
+def save_checkpoint(path: str, round_idx: int, w_t, threshold, history: list, suspect_tracker: SuspectTracker) -> None:
+    """2026-11-15, scaling to multi-hour free-tier Colab runs: persist
+    everything `run_training_loop` needs to resume after round
+    `round_idx` -- the flat model weights, the norm-rule threshold
+    state (`B_t`/EMA), the round-by-round history log, and the
+    SuspectTracker's accumulated ban/quarantine state. Written with
+    torch.save because `w_t` is a torch tensor (see
+    models.flatten_state_dict) and torch.save pickles arbitrary
+    picklable Python objects (the dataclasses here) alongside tensors
+    fine, in one file -- no reason to hand-roll a second serialization
+    format for the rest of the dict.
+
+    `suspect_tracker` is a plain dataclass of dicts/sets/ints (no open
+    file handles, no torch state of its own), confirmed pickle-safe by
+    inspection before this was written.
+
+    Written to a `.tmp` path first and then renamed over the real path,
+    so a disconnect/crash DURING the save can never leave a half-written,
+    unreadable checkpoint behind -- the previous round's checkpoint (or
+    none) survives until this one fully lands.
+    """
+    import torch
+    tmp_path = path + ".tmp"
+    torch.save({
+        "round": round_idx,
+        "w_t": w_t,
+        "threshold": threshold,
+        "history": history,
+        "suspect_tracker": suspect_tracker,
+    }, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def load_checkpoint(path: str) -> dict:
+    """Loads what save_checkpoint() wrote: a dict with keys
+    {"round", "w_t", "threshold", "history", "suspect_tracker"}. Pass
+    this dict straight through as `run_training_loop`'s `resume_from`
+    argument to continue an interrupted run at the round after
+    `round`, with `w_t`/`threshold`/`history`/`suspect_tracker` all
+    restored to exactly where the interrupted run left them.
+    """
+    import torch
+    return torch.load(path, weights_only=False)
+
+
 def run_training_loop(
     model,
     model_dim: int,
@@ -244,6 +289,8 @@ def run_training_loop(
     suspect_tracker: "SuspectTracker" = None,  # FIX.md F7f: what happens to a suspect group. None -> fresh tracker (no history from a previous call to this function). Pass the SAME instance across multiple run_training_loop calls to keep ban/quarantine state across them.
     cheater_client_idx: int = None,  # ATTACK SIMULATION ONLY (FIX.md F7e/F7f Colab gate) -- see round_step_phase2's _cheat_zero_sketch docstring. Never set this for a real round. None -> no cheater, the honest default.
     f7f_share_threshold: int = 4,  # FIX.md F7f (2026-11-15): a SEPARATE, low Shamir threshold for F7f's subgroup reconstruction during bisection -- NEVER the main secagg_share_threshold. The main threshold (default (2n/3)+1, a super-majority chosen for the WHOLE round's dropout/collusion resistance) is almost always bigger than any bisection-floor-sized subgroup, so reusing it for F7f made every leaf group unverifiable and therefore automatically "suspect" regardless of guilt (Gate E caught this: an innocent client got banned, the real cheater never did). This threshold governs a SECOND, independent Shamir sharing of each client's secrets, used ONLY during F7f's subgroup checks -- the main round's security is untouched by this value.
+    checkpoint_path: str = None,  # 2026-11-15, scaling to real multi-hour Colab free-tier runs: if given, save {w_t, threshold, history, suspect_tracker, round} to this path after EVERY round -- a run that spans hours on a free-tier runtime that can disconnect at any time otherwise loses everything on a disconnect. None -> no checkpointing (matches every prior call site's behavior exactly).
+    resume_from: dict = None,  # output of load_checkpoint(checkpoint_path) from an earlier, interrupted call. Restores w_t/threshold/history/suspect_tracker and resumes at the round AFTER the checkpointed one, instead of starting over at round 0. None -> fresh start (default, matches every prior call site).
 ):
     """Runs ARCHITECTURE.md §4's round protocol for `rounds` rounds over
     one model: VRF self-sampling -> local train -> DP noise -> quantize
@@ -326,8 +373,28 @@ def run_training_loop(
     w_t, model_shapes = flatten_state_dict(model)
     threshold = bootstrap_from_server_root(server_root_norms, k=k)
     history = []
+    start_round = 0
 
-    for t_round in range(rounds):
+    # 2026-11-15, scaling to multi-hour free-tier Colab runs: resume from a
+    # checkpoint saved by an earlier, interrupted call instead of starting
+    # over. `resume_from` is exactly what load_checkpoint(checkpoint_path)
+    # returns -- see that function's docstring for the dict's keys. This
+    # restores every piece of mutable state the loop below reads or updates
+    # (w_t, threshold/B_t, history, suspect_tracker) and resumes at the
+    # round AFTER the last one that was successfully checkpointed, rather
+    # than re-running rounds whose cost (real GPU time + crypto) was
+    # already paid for.
+    if resume_from is not None:
+        w_t = resume_from["w_t"]
+        threshold = resume_from["threshold"]
+        history = resume_from["history"]
+        suspect_tracker = resume_from["suspect_tracker"]
+        start_round = resume_from["round"] + 1
+        if verbose:
+            print(f"resuming from checkpoint: round {resume_from['round']} done, "
+                  f"continuing at round {start_round} (of {rounds} total)")
+
+    for t_round in range(start_round, rounds):
         rho_t = f"round-{t_round}".encode()
         rho_e = f"epoch-{t_round // epoch_rounds}".encode()
         vrf_alpha = rho_t
@@ -647,6 +714,16 @@ def run_training_loop(
                       f"({_st['bytes_written']/2**30:.2f} GiB written, "
                       f"{_st['bytes_read']/2**30:.2f} GiB read back)")
             store.close()
+            # Checkpoint AFTER store.close() releases this round's spill
+            # files, and on every path through the try block above
+            # (normal completion, aggregate-mismatch abort, F7/F7e abort)
+            # alike, since `finally` always runs and `history` already
+            # has this round's entry appended by the time we get here.
+            # Cheap insurance against a Colab free-tier disconnect losing
+            # hours of already-paid-for GPU + crypto work -- see
+            # load_checkpoint()'s docstring for the resume path.
+            if checkpoint_path:
+                save_checkpoint(checkpoint_path, t_round, w_t, threshold, history, suspect_tracker)
 
     # IMPORTANT: every call to local_train_delta (inside round_step_phase1,
     # once per client per round) reloads `model` with THAT client's own
