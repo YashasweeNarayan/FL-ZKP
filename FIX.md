@@ -869,19 +869,44 @@ is actually exercised rather than passing because both sides happen to say 8.
   is exact.
 
 **Still open on F7, honestly:**
-- **F7f attributes to a group, never an individual, by design** -- and the
-  bisection's cost is O(log n) rounds of inter-client seed releases, which this
-  simulation performs synchronously inside one `run_round` call. A deployment
-  needs those as real protocol rounds, with a policy for a client that refuses.
-- **`SuspectTracker`'s quarantine/ban state is not yet exercised on Colab.**
-  The module itself is fully unit-tested in isolation; its wiring into
-  `run_training_loop` is code-reviewed against the existing patterns
-  (same as every other `fl/round_loop.py` change) but not yet run
-  end-to-end with real crypto -- that needs a Colab run deliberately
-  constructed to trigger at least one F7f abort so quarantine/ban
-  actually fires, which the existing `VERIFY_FIXES_F6_F7.ipynb` gates do
-  not do (Gate D runs the attack demo through `_check_F7e_aggregate_sketch`
-  directly, not through `run_training_loop`).
+- **F7f attributes to a group, never an individual, by design** -- unchanged,
+  and not something to fix; a single report can't implicate a member of a
+  group without more independent evidence, which is the whole point of
+  `SuspectTracker`'s intersection-narrowing design above.
+- **F7f's bisection primitive now supports real protocol rounds; the
+  simulation still doesn't use it that way (2026-11-14).**
+  `crypto/norm_proof.py::BisectionSession` decomposes `localize_fault`'s
+  loop into explicit `pending_group()` / `submit_result()` steps -- query a
+  group, get an answer, decide the next group, repeat -- so a real
+  deployment can suspend between rounds (each step = one real network round
+  trip) instead of blocking in one Python call. `localize_fault` is now a
+  thin synchronous wrapper around it, byte-for-byte unchanged behavior for
+  every existing caller (9 new tests in `tests/test_norm_proof_bisection.py`
+  confirm agreement with the old implementation on both clean and cheating
+  sets, plus `pending_group` idempotency, `submit_result`'s group-match
+  validation, and the `max_rounds`/`min_group_size` floor). `fl/server.py`'s
+  `_check_F7e_aggregate_sketch` deliberately keeps calling the synchronous
+  wrapper, not `BisectionSession` directly -- this simulation has no real
+  transport layer to suspend across, so using the new primitive here would
+  be decorative, not more correct. A real deployment is the one that needs
+  `BisectionSession` directly, and now can.
+- **`SuspectTracker`'s quarantine/ban state is not yet exercised on Colab,
+  though a gate now exists to do it (2026-11-14).** The module itself was
+  already fully unit-tested in isolation (`tests/test_suspect_tracker.py`).
+  New this round: `fl/client.py::round_step_phase2` gained
+  `_cheat_zero_sketch` (attack-simulation only -- zeroes `y_k` right after
+  the real sketch is computed, so the real training/masking pipeline runs
+  untouched and only the committed sketch is fake) and
+  `fl/round_loop.py::run_training_loop` gained `cheater_client_idx`, which
+  threads that flag to one designated client each round. The notebook's new
+  Gate E (`notebooks/_build_notebooks.py`, 9 clients, 5 rounds, client 5
+  cheating, `quarantine_rounds=1`) runs `SuspectTracker` through
+  `run_training_loop` against this real cheater for the first time, rather
+  than through `_check_F7e_aggregate_sketch` directly (what Gate D does).
+  This is implemented and passing locally (178 tests total, pure-Python
+  group backend) but genuinely unconfirmed until it runs on Colab with real
+  `rbcl` -- same limitation as every other `run_training_loop`-dependent
+  gate in this file.
 - **All four gates run on real Colab GPU with real rbcl bindings
   (2026-11-14).** Gate A: full `pytest tests/ -q` -- 159 passed, 0 skipped,
   110.74s, confirming the entire suite (not just the F7-specific files)
