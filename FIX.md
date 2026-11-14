@@ -1024,9 +1024,20 @@ is actually exercised rather than passing because both sides happen to say 8.
   `f7f_share_threshold` explicitly, matching their own fixture's threshold,
   so the floor and the verifiable threshold stay in lockstep the way the fix
   requires. Full suite: 180 passed (178 + 2 new), pure-Python group backend.
-  **Still needs a Colab re-run** of Gate E against the real cheater through
-  the real pipeline to confirm this against real crypto, not just the
-  synthetic/unit-level reproduction above.
+  **CONFIRMED ON REAL COLAB (2026-11-15), real cheater, real rbcl crypto.**
+  Gate E rerun, 9 clients / 5 rounds / client 5 cheating: client 5 appears in
+  EVERY reported suspect group across all 5 rounds (`[1,7,5,0,2]`,
+  `[5,4,8,6,1]`, `[5,3,4,1]`, `[4,5,1,3]`, `[2,0,7,5]`) -- no other client
+  does -- and the tracker converges to `banned=[5], quarantined={}` by round
+  4 (`PASS: cheater 5 was banned by round 4`). Localization also narrowed
+  further than the earlier buggy run: single suspect groups of 4-5 members in
+  3 bisection steps, versus the old run's 2-3 always-suspect groups covering
+  all 9 clients. Gate B/C's real 8-client/2-round resnet18 loop and Gate D's
+  4/4 attack-demo subset both still pass unaffected (`aggregate=EXACT` both
+  rounds; `4 passed, 11 deselected`), confirming the fix didn't regress
+  anything else F7e/F7f already had working. **Still open: a Colab run of
+  the full 180-test Gate A** (only run locally on the pure-Python backend so
+  far; the 159-test Gate A run on real rbcl predates this fix's 2 new tests).
 
 ## F8 — ristretto255 bindings: wrong library entirely, not a version problem
 
