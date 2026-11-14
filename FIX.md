@@ -1035,9 +1035,11 @@ is actually exercised rather than passing because both sides happen to say 8.
   all 9 clients. Gate B/C's real 8-client/2-round resnet18 loop and Gate D's
   4/4 attack-demo subset both still pass unaffected (`aggregate=EXACT` both
   rounds; `4 passed, 11 deselected`), confirming the fix didn't regress
-  anything else F7e/F7f already had working. **Still open: a Colab run of
-  the full 180-test Gate A** (only run locally on the pure-Python backend so
-  far; the 159-test Gate A run on real rbcl predates this fix's 2 new tests).
+  anything else F7e/F7f already had working. **Gate A rerun on real rbcl
+  (2026-11-15): 180 passed, 0 skipped, 112.59s** -- the 2 new tests from this
+  fix confirmed against real crypto, not just the local pure-Python backend.
+  Nothing left open on this fix; F7f's group-not-individual attribution
+  remains open by design, unchanged, not something to fix.
 
 ## F8 — ristretto255 bindings: wrong library entirely, not a version problem
 
