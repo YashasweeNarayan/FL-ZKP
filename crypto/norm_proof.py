@@ -60,7 +60,7 @@ from __future__ import annotations
 
 import os
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .field import ShamirShare, reconstruct as field_reconstruct
 from .pedersen import H as PEDERSEN_H, Commitment, commit, commit_sum, verify_opening
@@ -636,6 +636,114 @@ class BlameResult:
     rounds_used: int
 
 
+@dataclass
+class BisectionSession:
+    """Resumable form of the group-testing bisection (FIX.md F7f "still
+    open" item: this used to be ONE blocking Python call,
+    `localize_fault` below, run synchronously inside `run_round` --
+    fine for this simulation, where every "client" is reachable
+    in-process, but not a faithful model of a real deployment, where
+    EACH step is a genuine network round trip: the server asks one
+    group's members to release their straddling pair seeds and
+    blinding shares (`fl/client.py::release_straddling_pair_seeds`),
+    which can take real wall-clock time, time out, or be refused.
+
+    This class pulls the bisection's control-flow state (which groups
+    are still queued, which are already suspect, how many rounds have
+    run) out of the call stack and into ordinary, inspectable,
+    trivially-serializable fields, so a caller can suspend between
+    steps for as long as a real round actually takes -- persist this
+    object, come back later with the query's answer, and resume -- and
+    is never left re-deriving where the bisection was partway through.
+
+    Usage, one step at a time:
+        session = BisectionSession.start(accepted_indices, coordinate, seed)
+        while not session.is_done():
+            group = session.pending_group()
+            # <-- a real protocol round happens here: ask `group`'s
+            #     members for their straddling material, verify it,
+            #     however long that actually takes.
+            session.submit_result(group, opened)
+        blame = session.result
+
+    `localize_fault` is the synchronous convenience wrapper for a
+    caller that doesn't need to suspend (every existing caller in this
+    repo, since the simulation has no real transport to suspend
+    across) -- it drives this exact state machine to completion in one
+    call, so the two give IDENTICAL results
+    (test_bisection_session_matches_localize_fault_step_by_step in
+    tests/test_norm_proof_bisection.py drives them side by side, out of
+    order, to confirm it).
+    """
+    coordinate: int
+    seed: bytes
+    min_group_size: int = 4
+    max_rounds: int = 10
+    frontier: list = field(default_factory=list)
+    suspects: list = field(default_factory=list)
+    rounds_used: int = 0
+    _awaiting: list | None = field(default=None, repr=False)
+
+    @classmethod
+    def start(cls, client_ids: list[int], coordinate: int, seed: bytes,
+              min_group_size: int = 4, max_rounds: int = 10) -> "BisectionSession":
+        return cls(coordinate=coordinate, seed=seed, min_group_size=min_group_size,
+                   max_rounds=max_rounds, frontier=[list(client_ids)])
+
+    def is_done(self) -> bool:
+        return self._awaiting is None and (not self.frontier or self.rounds_used >= self.max_rounds)
+
+    def pending_group(self) -> list[int] | None:
+        """The group this session is waiting on an answer for -- query
+        it (in a real deployment: send the request, wait for the
+        reply, however long that takes) and pass the boolean result to
+        `submit_result`. Returns None once `is_done()`. Idempotent:
+        calling this again before `submit_result` returns the SAME
+        group rather than popping a new one, so a caller that crashes
+        or is replaced mid-round-trip can safely re-ask."""
+        if self.is_done():
+            return None
+        if self._awaiting is None:
+            self._awaiting = self.frontier.pop()
+        return list(self._awaiting)
+
+    def submit_result(self, group: list[int], opened: bool) -> None:
+        """`opened=True`: this group's sub-sum matched (cleared, not
+        suspect). `opened=False`: split it (queueing both halves) or,
+        if it is already at `min_group_size`, record it as a suspect
+        group -- the exact logic `localize_fault`'s loop body used to
+        run inline. `group` must be exactly the group `pending_group()`
+        last returned, order aside -- answering any other group is a
+        caller bug, not a valid protocol step, so this raises rather
+        than silently accepting it."""
+        if self._awaiting is None or sorted(self._awaiting) != sorted(group):
+            raise ValueError(
+                f"submit_result got group={sorted(group)}, but the outstanding query "
+                f"was for {sorted(self._awaiting) if self._awaiting is not None else None} "
+                f"-- call pending_group() first and answer exactly that group"
+            )
+        self.rounds_used += 1
+        if not opened:
+            split = partition_group(
+                self._awaiting, self.seed + self.coordinate.to_bytes(4, "little"), self.min_group_size,
+            )
+            if split is None:
+                self.suspects.append(self._awaiting)
+            else:
+                self.frontier.extend(split)
+        self._awaiting = None
+
+    @property
+    def result(self) -> BlameResult:
+        """Valid at any point, not just once `is_done()` -- mid-session
+        it additionally reports whatever is still queued or
+        outstanding as suspect, the same "max_rounds hit, whatever's
+        left is still only suspected" rule `localize_fault` always
+        applied."""
+        leftover = list(self.frontier) + ([self._awaiting] if self._awaiting is not None else [])
+        return BlameResult(suspect_groups=self.suspects + leftover, rounds_used=self.rounds_used)
+
+
 def localize_fault(client_ids: list[int], coordinate: int, seed: bytes,
                     check_group_opens_correctly, min_group_size: int = 4, max_rounds: int = 10) -> BlameResult:
     """Group-testing bisection for ONE bad coordinate (call once per
@@ -649,19 +757,18 @@ def localize_fault(client_ids: list[int], coordinate: int, seed: bytes,
     aggregate sketch. This function only does the bisection control
     flow; it never touches a blinding or commitment directly, so it
     carries no crypto of its own to get wrong.
+
+    Synchronous convenience wrapper around `BisectionSession` above --
+    drives it to completion in one blocking call, for a caller (every
+    one in this repo today) that doesn't need to suspend BETWEEN
+    rounds. A caller that does (a real deployment, where each round is
+    an actual network round trip) drives `BisectionSession` directly
+    instead of calling this.
     """
-    frontier = [client_ids]
-    suspects: list[list[int]] = []
-    rounds = 0
-    while frontier and rounds < max_rounds:
-        rounds += 1
-        group = frontier.pop()
-        if check_group_opens_correctly(group):
-            continue
-        split = partition_group(group, seed + coordinate.to_bytes(4, "little"), min_group_size)
-        if split is None:
-            suspects.append(group)
-            continue
-        frontier.extend(split)
-    frontier_leftover = [g for g in frontier]  # max_rounds hit: whatever's left is still only "suspected"
-    return BlameResult(suspect_groups=suspects + frontier_leftover, rounds_used=rounds)
+    session = BisectionSession.start(client_ids, coordinate, seed, min_group_size, max_rounds)
+    while True:
+        group = session.pending_group()
+        if group is None:
+            break
+        session.submit_result(group, check_group_opens_correctly(group))
+    return session.result
