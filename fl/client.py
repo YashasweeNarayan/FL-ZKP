@@ -49,6 +49,7 @@ class ClientRoundContext:
     ring: list   # list[Point], the full published ring (len 50)
     pairwise_secrets: dict   # {other_client_index: bytes}, from X25519 ECDH (see secagg.py)
     self_mask_secret_int: int   # in Z_L (crypto.secagg.new_self_mask_secret), so its Shamir shares reconstruct it exactly
+    blinding_self_mask_secret_int: int  # FIX.md F7e dropout resilience: a SEPARATE Z_L secret, same reason -- never reuse self_mask_secret_int here
     model_dim: int
     quant_bits: int = 16
 
@@ -285,6 +286,15 @@ def share_self_mask_secret(ctx: ClientRoundContext, holder_ids: list, t: int) ->
     it cannot remove it from a vector it merely claims was dropped.
     """
     return shamir_share_self_secret(ctx.self_mask_secret_int, t, holder_ids)
+
+
+def share_blinding_self_mask_secret(ctx: ClientRoundContext, holder_ids: list, t: int) -> dict:
+    """Same as `share_self_mask_secret`, for the SEPARATE blinding
+    self-mask secret (FIX.md F7e dropout resilience). Shared at the
+    same point in the round (before any masking happens), so the
+    holders can release shares of it later regardless of whether this
+    client is still reachable."""
+    return shamir_share_self_secret(ctx.blinding_self_mask_secret_int, t, holder_ids)
 
 
 def round_step_phase1(
@@ -603,7 +613,10 @@ def round_step_phase2(
         other_idx: pairwise_round_seed(secret, rho_t)
         for other_idx, secret in ctx.pairwise_secrets.items()
     }
-    masked_y_blindings = mask_blinding_vector(y_blindings, ctx.keys.index, pairwise_seeds)
+    masked_y_blindings = mask_blinding_vector(
+        y_blindings, ctx.keys.index, pairwise_seeds,
+        self_secret_bytes(ctx.blinding_self_mask_secret_int), rho_t,
+    )
 
     return ClientSubmissionPhase2(
         sketch_commitment=sketch_commitment,

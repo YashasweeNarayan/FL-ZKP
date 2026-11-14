@@ -208,7 +208,9 @@ def _true_aggregate_sketch(aggregate_quantized, sketch_dim: int, model_dim: int,
 
 def _check_F7e_aggregate_sketch(phase2s: dict, accepted_indices: list, aggregate_quantized,
                                  excluded_pair_seeds: dict, sketch_dim: int, model_dim: int,
-                                 sigma_t: bytes, sketch_projector=None,
+                                 sigma_t: bytes, rho_t: bytes,
+                                 blinding_self_mask_shares: dict, share_threshold: int,
+                                 sketch_projector=None,
                                  blame_material_provider=None):
     """Returns (ok, bad_coordinates, suspect_groups, detail).
 
@@ -230,7 +232,10 @@ def _check_F7e_aggregate_sketch(phase2s: dict, accepted_indices: list, aggregate
             return None, [], [], f"client {k} published no masked blinding vector (pre-F7e submission?)"
         masked_by_client[k] = row
     try:
-        sum_blindings = reconstruct_blinding_sum(masked_by_client, accepted_indices, excluded_pair_seeds, sketch_dim)
+        sum_blindings = reconstruct_blinding_sum(
+            masked_by_client, accepted_indices, excluded_pair_seeds, sketch_dim,
+            blinding_self_mask_shares, share_threshold, rho_t,
+        )
     except (ValueError, KeyError) as e:
         return None, [], [], f"blinding-sum reconstruction unavailable: {e}"
 
@@ -283,9 +288,12 @@ def _check_F7e_aggregate_sketch(phase2s: dict, accepted_indices: list, aggregate
         material = blame_material_provider(group)
         if material is None:
             return False  # cannot verify this subgroup -> leave it suspect; never clear a group on missing evidence
-        partial_q, straddling_seeds = material
+        partial_q, straddling_seeds, group_blinding_self_mask_shares = material
         try:
-            sub_blindings = reconstruct_blinding_sum(masked_by_client, group, straddling_seeds, sketch_dim)
+            sub_blindings = reconstruct_blinding_sum(
+                masked_by_client, group, straddling_seeds, sketch_dim,
+                group_blinding_self_mask_shares, share_threshold, rho_t,
+            )
         except (ValueError, KeyError):
             return False
         sub_true = _true_aggregate_sketch(partial_q, sketch_dim, model_dim, sigma_t, sketch_projector)
@@ -313,6 +321,7 @@ class UnmaskingMaterial:
     self_mask_shares: dict       # {accepted k: [ShamirShare, ...]}
     excluded_pair_seeds: dict    # {(accepted j, excluded k): round_seed bytes}
     share_threshold: int
+    blinding_self_mask_shares: dict = field(default_factory=dict)  # FIX.md F7e dropout resilience: {accepted k: [ShamirShare, ...]} for the SEPARATE blinding self-mask secret
 
 
 def run_round(
@@ -332,7 +341,7 @@ def run_round(
     density: float = 1.0 / 3.0,
     n_tests: int = 8,             # FIX.md F7d: MUST match round_step_phase2's own n_tests, or the server derives a different number of public weight vectors than the client proved against and every honest client fails V3. Threaded explicitly rather than left as two independent hardcoded 8s.
     sketch_projector=None,        # FIX.md F7e: MUST be the same projector class the clients used (see _true_aggregate_sketch); None -> TorchSketchProjector, matching round_step_phase2
-    blame_material_provider=None,  # FIX.md F7f: callable(group) -> (partial_q, straddling_pair_seeds) or None. Omit to abort without attribution on an F7e failure.
+    blame_material_provider=None,  # FIX.md F7f: callable(group) -> (partial_q, straddling_pair_seeds, group_blinding_self_mask_shares) or None. Omit to abort without attribution on an F7e failure.
 ) -> RoundOutcome:
     if sketch_dim is None or sigma_t is None:
         raise ValueError(
@@ -465,7 +474,18 @@ def run_round(
     # that what was summed is what was committed, not what it decodes to.
     accepted_indices = [idx for idx, _ in accepted]
     accepted_set = set(accepted_indices)
-    excluded_indices = [idx for idx, _ in submissions if idx not in accepted_set]
+    # FIX.md F7f: `excluded_indices` must cover every OTHER configured
+    # client (0..n_clients-1), not just the ones that showed up in
+    # `submissions`. A client's masked vector carries pairwise mask terms
+    # against every partner it has a pairwise secret for -- ALL n_clients-1
+    # others, computed once up front, regardless of whether a given
+    # partner submitted anything this round (e.g. sitting out a
+    # suspect-group quarantine). Deriving this from `submissions` alone
+    # would silently leave those uncancelled pairwise terms in the
+    # aggregate whenever `submissions` is a strict subset of the full
+    # client set -- `n_clients` (previously an unused parameter here) is
+    # what makes that distinction available.
+    excluded_indices = [idx for idx in range(n_clients) if idx not in accepted_set]
     material = unmask_provider(accepted_indices, excluded_indices)
     try:
         aggregate_quantized = unmask_aggregate(
@@ -489,7 +509,9 @@ def run_round(
     # (the F1/F5 dependency the original F7 plan already flagged).
     sketch_ok, bad_coords, blame_groups, sketch_detail = _check_F7e_aggregate_sketch(
         phase2s, accepted_indices, aggregate_quantized, material.excluded_pair_seeds,
-        sketch_dim, model_dim, sigma_t, sketch_projector, blame_material_provider,
+        sketch_dim, model_dim, sigma_t, rho_t,
+        material.blinding_self_mask_shares, material.share_threshold,
+        sketch_projector, blame_material_provider,
     )
     if sketch_ok is False:
         # ABORT rather than apply: an aggregate that fails this check is

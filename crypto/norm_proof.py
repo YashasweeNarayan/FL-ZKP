@@ -62,6 +62,7 @@ import os
 import secrets
 from dataclasses import dataclass
 
+from .field import ShamirShare, reconstruct as field_reconstruct
 from .pedersen import H as PEDERSEN_H, Commitment, commit, commit_sum, verify_opening
 from .ristretto import Point, Scalar, fiat_shamir_challenge, group_order, scalar_mul_base
 
@@ -420,10 +421,30 @@ def verify_wraparound_binding(C_prime: Point, proof: SchnorrProof, weights: list
 # sum the server can obtain through the honest path already covers 8
 # clients. The one place smaller sums are legitimately computed is F7f's
 # localization below, which is bounded by its own `min_group_size`
-# floor. A client that drops out after acceptance makes this round's
-# F7e check incomputable (a liveness failure, logged) rather than
-# leaking anything. That is a real, documented gap versus the update
-# path's dropout resilience, not an oversight -- see FIX.md F7e.
+# floor.
+#
+# DROPOUT RESILIENCE (added 2026-11-14, closing a gap FIX.md had logged
+# as open): the blinding vector originally had ONLY the pairwise mask
+# above, so a client that dropped after acceptance made that round's
+# F7e check incomputable -- there was nothing else keeping an
+# individual r_{k,i} hidden if the pairwise terms alone were stripped
+# via excluded-pair seeds, so the design simply never asked a dropped
+# client for anything and reported `None` instead. secagg.py's update
+# vector never had this problem because a SELF-mask, Shamir-shared
+# among the OTHER clients at the start of the round, backs every
+# accepted client's contribution -- unmasking only ever needs
+# `share_t` of those PRE-DISTRIBUTED shares, never the client itself
+# being reachable at verify time. `blinding_self_mask` /
+# `recover_blinding_self_mask` below add the exact same layer, one
+# field up (Z_L): each client draws a second self-mask secret (over
+# Z_L, so Shamir-sharing it reconstructs exactly), Shamir-shares it the
+# same way at the start of the round, and adds `blinding_self_mask` on
+# top of its own r_{k,i} values before masking. The server recovers it
+# from `share_t` shares via `reconstruct_blinding_sum`'s new
+# `self_mask_shares` argument, exactly mirroring `unmask_aggregate`'s
+# per-accepted-client loop. A post-acceptance dropout no longer makes
+# F7e un-runnable, for the same reason the update path was never
+# affected by one.
 # ---------------------------------------------------------------------------
 
 from .prg import derive_stream_key, expand_scalar_stream
@@ -448,17 +469,50 @@ def blinding_pairwise_mask(pair_round_seed: bytes, m: int, sign: int) -> list[in
     return [(-x) % L for x in stream]
 
 
+def blinding_self_mask(self_secret_bytes: bytes, round_nonce: bytes, m: int) -> list[int]:
+    """A client's own private mask on its blinding vector -- m ints mod
+    L, summed INTO `mask_blinding_vector`'s output but never cancelled
+    by any other client's contribution (mirrors `secagg.self_mask`, one
+    field up). `self_secret_bytes` must be 32 bytes; recoverable only
+    via `share_t` Shamir shares of the secret integer it came from
+    (`recover_blinding_self_mask` below), never by combining other
+    clients' pairwise data.
+    """
+    return expand_scalar_stream(
+        derive_stream_key(b"f7e-blinding-self-mask", self_secret_bytes, round_nonce), m,
+    )
+
+
+def recover_blinding_self_mask(shares: list[ShamirShare], round_nonce: bytes, m: int) -> list[int]:
+    """Server side. Reconstructs one client's blinding self-mask secret
+    from >= share_t of its Shamir shares (same shares and threshold the
+    client used for its UPDATE self-mask secret are never reused here --
+    this is a second, distinct secret, Shamir-shared separately -- see
+    `fl/client.py`'s wiring) and expands it back to the mask vector.
+    """
+    secret_int = field_reconstruct(shares)
+    secret_bytes = secret_int.to_bytes(32, "little")
+    return blinding_self_mask(secret_bytes, round_nonce, m)
+
+
 def mask_blinding_vector(y_blindings: list[Scalar], own_index: int,
-                          pairwise_round_seeds: dict[int, bytes]) -> list[int]:
+                          pairwise_round_seeds: dict[int, bytes],
+                          self_secret_bytes: bytes, round_nonce: bytes) -> list[int]:
     """Client side, phase 2. `pairwise_round_seeds` is
     {other_client_index: pairwise_round_seed(shared_secret, rho_t)} --
-    the same per-round seeds secagg's vector path uses. Returns the
-    masked blinding vector (m ints mod L) that goes on the submission;
-    the raw `y_blindings` never leave the client.
+    the same per-round seeds secagg's vector path uses.
+    `self_secret_bytes` is this client's OWN blinding self-mask secret
+    (32 bytes, from a fresh `crypto.secagg.new_self_mask_secret()` drawn
+    for the blinding vector specifically, not reused from the update
+    vector's secret). Returns the masked blinding vector (m ints mod L)
+    that goes on the submission; the raw `y_blindings` never leave the
+    client.
     """
     L = group_order()
     acc = [r.to_int() % L for r in y_blindings]
     m = len(acc)
+    self_mask_vec = blinding_self_mask(self_secret_bytes, round_nonce, m)
+    acc = [(a + b) % L for a, b in zip(acc, self_mask_vec)]
     for other_idx, seed in pairwise_round_seeds.items():
         sign = 1 if own_index < other_idx else -1
         mask = blinding_pairwise_mask(seed, m, sign)
@@ -467,12 +521,25 @@ def mask_blinding_vector(y_blindings: list[Scalar], own_index: int,
 
 
 def reconstruct_blinding_sum(masked_by_client: dict, accepted: list[int],
-                              excluded_pair_seeds: dict, m: int) -> list[Scalar]:
+                              excluded_pair_seeds: dict, m: int,
+                              self_mask_shares: dict, share_threshold: int,
+                              round_nonce: bytes) -> list[Scalar]:
     """Server side. Sums the accepted clients' published masked blinding
-    vectors and strips the pairwise terms that did not cancel because
-    one party was excluded, mirroring `secagg.unmask_aggregate`'s
-    pairwise loop (same seeds, same sign rule, same validation that a
-    seed came from an accepted client about an excluded one).
+    vectors, removes each accepted client's blinding self-mask (via
+    `share_threshold` Shamir shares of it -- pre-distributed at the
+    start of the round, so this works even if that client has since
+    dropped out), and strips the pairwise terms that did not cancel
+    because one party was excluded -- mirroring `secagg.unmask_aggregate`
+    exactly (same two-step structure, same seeds, same sign rule, same
+    validation that a seed came from an accepted client about an
+    excluded one).
+
+    self_mask_shares -- {k: [ShamirShare, ...]} for every k in
+                        `accepted`, at least `share_threshold` distinct
+                        shares each (fewer silently reconstructs a WRONG
+                        secret, which would corrupt the sum with no
+                        error -- so this raises instead, same as
+                        `secagg.unmask_aggregate`).
 
     Returns sum_k r_{k,i} as m `Scalar`s -- the ONLY thing about any
     client's blindings that ever becomes visible.
@@ -485,6 +552,15 @@ def reconstruct_blinding_sum(masked_by_client: dict, accepted: list[int],
         if len(row) != m:
             raise ValueError(f"client {k}: masked blinding vector has length {len(row)}, expected {m}")
         acc = [(a + b) % L for a, b in zip(acc, row)]
+    for k in accepted:
+        distinct = list({sh.index: sh for sh in self_mask_shares.get(k, [])}.values())
+        if len(distinct) < share_threshold:
+            raise ValueError(
+                f"client {k}: only {len(distinct)} distinct blinding self-mask shares, "
+                f"need {share_threshold} -- cannot reconstruct this round"
+            )
+        self_mask_vec = recover_blinding_self_mask(distinct[:share_threshold], round_nonce, m)
+        acc = [(a - b) % L for a, b in zip(acc, self_mask_vec)]
     for (j, k), seed in excluded_pair_seeds.items():
         if j not in accepted_set or k in accepted_set:
             raise ValueError(f"pair ({j}, {k}): seed must come from an accepted client about an excluded one")

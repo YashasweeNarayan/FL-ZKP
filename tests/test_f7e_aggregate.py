@@ -126,6 +126,13 @@ def _build_round(cheater: int | None = None, cheat_scale: int = 1, cheat: str = 
         k: shamir_share_self_secret(self_secrets[k], SHARE_T, list(range(1, N_CLIENTS + 1)))
         for k in range(N_CLIENTS)
     }
+    # FIX.md F7e dropout resilience: a SEPARATE self-mask secret for the
+    # blinding vector, Shamir-shared the same way.
+    blinding_self_secrets = {k: new_self_mask_secret() for k in range(N_CLIENTS)}
+    blinding_shares_held = {
+        k: shamir_share_self_secret(blinding_self_secrets[k], SHARE_T, list(range(1, N_CLIENTS + 1)))
+        for k in range(N_CLIENTS)
+    }
 
     masked_vectors, phase2s = {}, {}
     for k in range(N_CLIENTS):
@@ -151,13 +158,19 @@ def _build_round(cheater: int | None = None, cheat_scale: int = 1, cheat: str = 
         seeds = {j: pairwise_round_seed(secrets[k][j], RHO_T) for j in range(N_CLIENTS) if j != k}
         phase2s[k] = SimpleNamespace(
             sketch_commitment=sc,
-            masked_y_blindings=NP.mask_blinding_vector(y_bl, k, seeds),
+            masked_y_blindings=NP.mask_blinding_vector(
+                y_bl, k, seeds, self_secret_bytes(blinding_self_secrets[k]), RHO_T,
+            ),
         )
 
     return SimpleNamespace(
         projector=projector, secrets=secrets, q_true=q_true, masked_vectors=masked_vectors,
-        shares_held=shares_held, phase2s=phase2s,
+        shares_held=shares_held, blinding_shares_held=blinding_shares_held, phase2s=phase2s,
     )
+
+
+def _blinding_shares_for(env, group):
+    return {k: [env.blinding_shares_held[k][h + 1] for h in group] for k in group}
 
 
 def _unmask_all(env, accepted):
@@ -187,7 +200,7 @@ def _blame_provider(env, accepted):
             partial_q = unmask_aggregate(partial_masked, group, shares, SHARE_T, straddling, RHO_T, MODEL_DIM)
         except ValueError:
             return None
-        return partial_q, straddling
+        return partial_q, straddling, _blinding_shares_for(env, group)
     return provider
 
 
@@ -227,7 +240,7 @@ def test_f7e_passes_for_an_honest_round():
     accepted = list(range(N_CLIENTS))
     agg, excluded_seeds = _unmask_all(env, accepted)
     ok, bad, groups, detail = _check_F7e_aggregate_sketch(
-        env.phase2s, accepted, agg, excluded_seeds, SKETCH_M, MODEL_DIM, SIGMA_T, env.projector,
+        env.phase2s, accepted, agg, excluded_seeds, SKETCH_M, MODEL_DIM, SIGMA_T, RHO_T, _blinding_shares_for(env, accepted), SHARE_T, env.projector,
     )
     assert ok is True, detail
     assert bad == [] and groups == []
@@ -240,7 +253,34 @@ def test_f7e_passes_with_an_excluded_client():
     accepted = [0, 1, 2, 4]
     agg, excluded_seeds = _unmask_all(env, accepted)
     ok, bad, _, detail = _check_F7e_aggregate_sketch(
-        env.phase2s, accepted, agg, excluded_seeds, SKETCH_M, MODEL_DIM, SIGMA_T, env.projector,
+        env.phase2s, accepted, agg, excluded_seeds, SKETCH_M, MODEL_DIM, SIGMA_T, RHO_T, _blinding_shares_for(env, accepted), SHARE_T, env.projector,
+    )
+    assert ok is True, detail
+    assert bad == []
+
+
+def test_f7e_survives_a_post_acceptance_dropout():
+    """FIX.md F7e dropout resilience (2026-11-14). `_build_round` never
+    puts any client's blinding self-mask SECRET on `env` at all (only
+    `blinding_shares_held`, the shares of it ALREADY HELD by the other
+    clients) -- there is nothing on `env` a "dropped" client 2 would
+    need to still be reachable to supply. `_blinding_shares_for` builds
+    the reconstruction material purely from those pre-distributed
+    shares, so this test is the structural proof: client 2's own
+    cooperation at verify time is never part of the data path, mirroring
+    why the UPDATE vector's self-mask was never affected by a
+    post-acceptance dropout either."""
+    env = _build_round()
+    assert not hasattr(env, "blinding_self_secrets"), (
+        "test harness leaked the per-client secret onto env; the "
+        "reconstruction call below must only use blinding_shares_held"
+    )
+    accepted = list(range(N_CLIENTS))
+    agg, excluded_seeds = _unmask_all(env, accepted)
+    blinding_shares = _blinding_shares_for(env, accepted)  # built from shares_held only
+    ok, bad, _, detail = _check_F7e_aggregate_sketch(
+        env.phase2s, accepted, agg, excluded_seeds, SKETCH_M, MODEL_DIM, SIGMA_T, RHO_T,
+        blinding_shares, SHARE_T, env.projector,
     )
     assert ok is True, detail
     assert bad == []
@@ -254,7 +294,7 @@ def test_f7e_catches_a_wraparound_cheater():
     accepted = list(range(N_CLIENTS))
     agg, excluded_seeds = _unmask_all(env, accepted)
     ok, bad, _, detail = _check_F7e_aggregate_sketch(
-        env.phase2s, accepted, agg, excluded_seeds, SKETCH_M, MODEL_DIM, SIGMA_T, env.projector,
+        env.phase2s, accepted, agg, excluded_seeds, SKETCH_M, MODEL_DIM, SIGMA_T, RHO_T, _blinding_shares_for(env, accepted), SHARE_T, env.projector,
     )
     assert ok is False, detail
     assert len(bad) >= 1
@@ -268,7 +308,7 @@ def test_f7e_reports_none_when_it_cannot_run():
     agg, excluded_seeds = _unmask_all(env, accepted)
     env.phase2s[2].masked_y_blindings = None
     ok, bad, groups, detail = _check_F7e_aggregate_sketch(
-        env.phase2s, accepted, agg, excluded_seeds, SKETCH_M, MODEL_DIM, SIGMA_T, env.projector,
+        env.phase2s, accepted, agg, excluded_seeds, SKETCH_M, MODEL_DIM, SIGMA_T, RHO_T, _blinding_shares_for(env, accepted), SHARE_T, env.projector,
     )
     assert ok is None
     assert "no masked blinding vector" in detail
@@ -280,7 +320,7 @@ def test_f7e_reports_none_on_incomplete_released_seeds():
     agg, excluded_seeds = _unmask_all(env, accepted)
     broken = {k: v for k, v in excluded_seeds.items() if k != (0, 3)}
     ok, _, _, detail = _check_F7e_aggregate_sketch(
-        env.phase2s, accepted, agg, broken, SKETCH_M, MODEL_DIM, SIGMA_T, env.projector,
+        env.phase2s, accepted, agg, broken, SKETCH_M, MODEL_DIM, SIGMA_T, RHO_T, _blinding_shares_for(env, accepted), SHARE_T, env.projector,
     )
     # A missing seed leaves an uncancelled mask: the sum is wrong, which
     # surfaces as a mismatch rather than an exception. Either way it must
@@ -297,7 +337,7 @@ def test_f7f_not_localized_without_a_provider():
     accepted = list(range(N_CLIENTS))
     agg, excluded_seeds = _unmask_all(env, accepted)
     ok, bad, groups, detail = _check_F7e_aggregate_sketch(
-        env.phase2s, accepted, agg, excluded_seeds, SKETCH_M, MODEL_DIM, SIGMA_T, env.projector,
+        env.phase2s, accepted, agg, excluded_seeds, SKETCH_M, MODEL_DIM, SIGMA_T, RHO_T, _blinding_shares_for(env, accepted), SHARE_T, env.projector,
         blame_material_provider=None,
     )
     assert ok is False
@@ -310,7 +350,7 @@ def test_f7f_localizes_the_cheater_to_a_small_group():
     accepted = list(range(N_CLIENTS))
     agg, excluded_seeds = _unmask_all(env, accepted)
     ok, bad, groups, detail = _check_F7e_aggregate_sketch(
-        env.phase2s, accepted, agg, excluded_seeds, SKETCH_M, MODEL_DIM, SIGMA_T, env.projector,
+        env.phase2s, accepted, agg, excluded_seeds, SKETCH_M, MODEL_DIM, SIGMA_T, RHO_T, _blinding_shares_for(env, accepted), SHARE_T, env.projector,
         blame_material_provider=_blame_provider(env, accepted),
     )
     assert ok is False, detail
@@ -329,9 +369,10 @@ def test_f7f_subgroup_check_clears_an_honest_subgroup():
     accepted = list(range(N_CLIENTS))
     provider = _blame_provider(env, accepted)
     honest = [0, 1, 2]
-    partial_q, straddling = provider(honest)
+    partial_q, straddling, blinding_shares = provider(honest)
     sub_blindings = NP.reconstruct_blinding_sum(
         {k: env.phase2s[k].masked_y_blindings for k in honest}, honest, straddling, SKETCH_M,
+        blinding_shares, SHARE_T, RHO_T,
     )
     sub_true = _true_aggregate_sketch(partial_q, SKETCH_M, MODEL_DIM, SIGMA_T, env.projector)
     ok, bad = NP.verify_aggregate_sketch(
@@ -345,9 +386,10 @@ def test_f7f_subgroup_check_flags_a_subgroup_holding_the_cheater():
     accepted = list(range(N_CLIENTS))
     provider = _blame_provider(env, accepted)
     guilty = [3, 4, 5]
-    partial_q, straddling = provider(guilty)
+    partial_q, straddling, blinding_shares = provider(guilty)
     sub_blindings = NP.reconstruct_blinding_sum(
         {k: env.phase2s[k].masked_y_blindings for k in guilty}, guilty, straddling, SKETCH_M,
+        blinding_shares, SHARE_T, RHO_T,
     )
     sub_true = _true_aggregate_sketch(partial_q, SKETCH_M, MODEL_DIM, SIGMA_T, env.projector)
     ok, _ = NP.verify_aggregate_sketch(
@@ -381,7 +423,7 @@ def test_f7e_catches_the_lying_sketch():
     accepted = list(range(N_CLIENTS))
     agg, excluded_seeds = _unmask_all(env, accepted)
     ok, bad, _, detail = _check_F7e_aggregate_sketch(
-        env.phase2s, accepted, agg, excluded_seeds, SKETCH_M, MODEL_DIM, SIGMA_T, env.projector,
+        env.phase2s, accepted, agg, excluded_seeds, SKETCH_M, MODEL_DIM, SIGMA_T, RHO_T, _blinding_shares_for(env, accepted), SHARE_T, env.projector,
     )
     assert ok is False, f"F7e must catch a sketch that does not match the masked update: {detail}"
     assert len(bad) >= 1
@@ -392,7 +434,7 @@ def test_f7f_localizes_the_lying_sketch_cheater():
     accepted = list(range(N_CLIENTS))
     agg, excluded_seeds = _unmask_all(env, accepted)
     ok, bad, groups, detail = _check_F7e_aggregate_sketch(
-        env.phase2s, accepted, agg, excluded_seeds, SKETCH_M, MODEL_DIM, SIGMA_T, env.projector,
+        env.phase2s, accepted, agg, excluded_seeds, SKETCH_M, MODEL_DIM, SIGMA_T, RHO_T, _blinding_shares_for(env, accepted), SHARE_T, env.projector,
         blame_material_provider=_blame_provider(env, accepted),
     )
     assert ok is False, detail

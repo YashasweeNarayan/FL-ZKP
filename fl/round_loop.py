@@ -33,13 +33,14 @@ from crypto.sketch import TorchSketchProjector
 
 from .client import (
     ClientKeys, ClientRoundContext, round_step_phase1, round_step_phase2, quantize, center_mod_p_mask,
-    share_self_mask_secret,
+    share_self_mask_secret, share_blinding_self_mask_secret,
 )
 from .server import run_round, apply_update, UnmaskingMaterial
 from .vector_store import (
     RoundVectorStore, DEFAULT_BUDGET_BYTES, DEFAULT_SKETCH_BATCH_BYTES, suggested_batch_size,
 )
 from .norm_rule import bootstrap_from_server_root, update_threshold_ema
+from .suspect_tracker import SuspectTracker
 from .models import flatten_state_dict, unflatten_to_state_dict
 
 
@@ -240,6 +241,7 @@ def run_training_loop(
     vector_budget_bytes: int = DEFAULT_BUDGET_BYTES,
     sketch_batch_budget_bytes: int = DEFAULT_SKETCH_BATCH_BYTES,
     spill_dir: str = None,
+    suspect_tracker: "SuspectTracker" = None,  # FIX.md F7f: what happens to a suspect group. None -> fresh tracker (no history from a previous call to this function). Pass the SAME instance across multiple run_training_loop calls to keep ban/quarantine state across them.
 ):
     """Runs ARCHITECTURE.md §4's round protocol for `rounds` rounds over
     one model: VRF self-sampling -> local train -> DP noise -> quantize
@@ -294,6 +296,8 @@ def run_training_loop(
     """
     n_clients = len(client_datasets)
     rounds = rounds if rounds is not None else CFG["mvp_scope"]["rounds_per_run"]
+    if suspect_tracker is None:
+        suspect_tracker = SuspectTracker()
     # FIX.md F6: local-training hyperparameters now come from CFG's
     # local_training section by default (gold-standard FedAvg: multiple
     # local epochs, each a real mini-batch pass, not one full-batch step
@@ -347,10 +351,21 @@ def run_training_loop(
         # full MVP sweep (45 rounds x 50 clients x 2 models) is hours or
         # days at this rate, and which half of the pipeline to optimize
         # first if it needs to be faster.
+        # FIX.md F7f: clients the tracker has banned or currently has
+        # quarantined sit this round out entirely -- they submit nothing,
+        # rather than being excluded later at the verification stage.
+        eligible_this_round = suspect_tracker.eligible(range(n_clients))
+        if verbose and len(eligible_this_round) < n_clients:
+            excluded_this_round = sorted(set(range(n_clients)) - set(eligible_this_round))
+            print(f"  round {t_round}: {excluded_this_round} sitting out "
+                  f"(banned: {sorted(suspect_tracker.banned)}, "
+                  f"quarantined: {sorted(suspect_tracker.quarantined)})")
+
         _t_phase1_start = time.time()
         ctx_by_client = {}
         phase1_by_client = {}
         self_mask_shares_held = {}   # {k: {holder_id: ShamirShare}} -- held by the OTHER clients, not the server
+        blinding_self_mask_shares_held = {}  # FIX.md F7e dropout resilience: same shape, SEPARATE secret
         holder_ids = list(range(1, n_clients + 1))
         # FIX.md F5: q_k and x_k go here instead of staying on the
         # submissions, so peak RAM stops scaling with n_clients. Closed
@@ -366,16 +381,18 @@ def run_training_loop(
             # its tests stay in the repo for a future pair-ordered redesign,
             # but round_loop.py must not pass a cache here until one exists.
             pairwise_mask_cache_this_round = None
-            for client_idx in range(n_clients):
+            for client_idx in eligible_this_round:
                 ctx = ClientRoundContext(
                     keys=ClientKeys(sk=client_sks[client_idx], pk=ring[client_idx], index=client_idx),
                     ring=ring,
                     pairwise_secrets=pairwise_secrets[client_idx],
                     self_mask_secret_int=new_self_mask_secret(),
+                    blinding_self_mask_secret_int=new_self_mask_secret(),
                     model_dim=model_dim,
                 )
                 ctx_by_client[client_idx] = ctx
                 self_mask_shares_held[client_idx] = share_self_mask_secret(ctx, holder_ids, share_t)
+                blinding_self_mask_shares_held[client_idx] = share_blinding_self_mask_secret(ctx, holder_ids, share_t)
 
                 def _sink(q_k, masked, _k=client_idx):
                     store.put(("q", _k), q_k)
@@ -402,7 +419,7 @@ def run_training_loop(
             # real per-client cost: one project_int() call plus sketch_m
             # per-coordinate square proofs plus the wraparound bindings.
             phase2_by_client = {}
-            for client_idx in range(n_clients):
+            for client_idx in eligible_this_round:
                 phase2_by_client[client_idx] = round_step_phase2(
                     ctx_by_client[client_idx], phase1_by_client[client_idx],
                     sigma_t, sketch_m, threshold.B_t, rho_t, rho_e, vrf_alpha,
@@ -411,9 +428,10 @@ def run_training_loop(
             _t_phase2 = time.time() - _t_phase2_start
 
             _t_verify_start = time.time()
-            submissions = [(i, phase1_by_client[i]) for i in range(n_clients)]
+            submissions = [(i, phase1_by_client[i]) for i in eligible_this_round]
 
-            def unmask_provider(accepted_idx, excluded_idx, _held=self_mask_shares_held, _rho=rho_t):
+            def unmask_provider(accepted_idx, excluded_idx, _held=self_mask_shares_held,
+                                 _bheld=blinding_self_mask_shares_held, _rho=rho_t):
                 # Simulates the accepted (alive) clients' replies in the
                 # unmasking round. One ShareReleasePolicy for the round
                 # stands in for every honest client applying the same rule:
@@ -421,17 +439,25 @@ def run_training_loop(
                 # seeds, never both.
                 policy = ShareReleasePolicy()
                 shares = {}
+                blinding_shares = {}
                 for k in accepted_idx:
                     policy.release_self_share(k)
                     shares[k] = [_held[k][h + 1] for h in accepted_idx]
+                    # FIX.md F7e dropout resilience: same shares-held-by-the-
+                    # OTHER-accepted-clients pattern, SEPARATE secret -- these
+                    # are released regardless of whether client k itself is
+                    # still reachable, which is the actual dropout fix.
+                    blinding_shares[k] = [_bheld[k][h + 1] for h in accepted_idx]
                 seeds = {}
                 for k in excluded_idx:
                     policy.release_pairwise_seed(k)
                     for j in accepted_idx:
                         seeds[(j, k)] = pairwise_round_seed(pairwise_secrets[j][k], _rho)
-                return UnmaskingMaterial(shares, seeds, share_t)
+                return UnmaskingMaterial(shares, seeds, share_t, blinding_shares)
 
-            def blame_material_provider(group, _held=self_mask_shares_held, _rho=rho_t, _store=store):
+            def blame_material_provider(group, _held=self_mask_shares_held,
+                                         _bheld=blinding_self_mask_shares_held,
+                                         _rho=rho_t, _store=store):
                 """FIX.md F7f. Simulates what the clients IN `group`
                 release when the server bisects a failed F7e check:
                 their per-round pair seeds about every accepted client
@@ -445,6 +471,12 @@ def run_training_loop(
                 self-mask shares to reconstruct (below `share_t`), so
                 the server leaves that group suspect rather than
                 clearing it on evidence it could not actually check.
+
+                Returns (partial_q, straddling, group_blinding_self_mask_shares)
+                -- the third element is the SAME shares-held-by-the-other-
+                group-members pattern, for the blinding vector's self-mask
+                secret, so `_check_F7e_aggregate_sketch`'s subgroup test can
+                reconstruct that subgroup's blinding sum too.
                 """
                 group = list(group)
                 group_set = set(group)
@@ -463,7 +495,8 @@ def run_training_loop(
                     )
                 except ValueError:
                     return None
-                return partial_q, straddling
+                blinding_shares = {k: [_bheld[k][h + 1] for h in group] for k in group}
+                return partial_q, straddling, blinding_shares
 
             outcome = run_round(submissions, phase2_by_client, rho_t, rho_e, vrf_alpha, threshold.B_t, n_clients, model_dim,
                                 unmask_provider=unmask_provider,
@@ -472,6 +505,14 @@ def run_training_loop(
                                 sketch_projector=TorchSketchProjector(seed=sigma_t, m=sketch_m, d=model_dim),
                                 blame_material_provider=blame_material_provider)
             _t_verify = time.time() - _t_verify_start
+
+            # FIX.md F7f: what happens to a suspect group. Record whatever
+            # groups F7f attributed THIS round (a no-op if there were none),
+            # then tick quarantines down -- once per round, win or lose, so
+            # a round where nobody was reported still counts toward letting
+            # an earlier quarantine expire.
+            suspect_tracker.record(outcome.aggregate_sketch_suspect_groups)
+            suspect_tracker.tick()
 
             if verbose:
                 print(f"  round {t_round} timing: phase1(train+most-crypto)={_t_phase1:.1f}s, "

@@ -796,23 +796,92 @@ is actually exercised rather than passing because both sides happen to say 8.
   aborting + localizing the lying-sketch cheat. Also the gap worth knowing:
   that cheat passes every other check, which is what makes F7e load-bearing
   rather than defense-in-depth.
-- 159 tests pass with a group backend live; 105 pass + 4 skip without one.
+- 169 tests pass with a group backend live; see below for the breakdown.
+
+**Two of the three gaps above closed (2026-11-14):**
+
+- **Blinding-vector dropout resilience, fixed.** The blinding vector now
+  gets a SECOND self-mask layer, over Z_L, exactly mirroring
+  `secagg.self_mask`/`secagg.unmask_aggregate`'s pattern for the update
+  vector: each client draws a separate `blinding_self_mask_secret_int`
+  (`crypto.secagg.new_self_mask_secret()`, never reused from the update
+  vector's own secret), Shamir-shares it among the other clients at the
+  start of the round, and adds `norm_proof.blinding_self_mask` on top of
+  its own r_{k,i} values before publishing. The server recovers it from
+  `share_t` pre-distributed shares via `reconstruct_blinding_sum`'s new
+  `self_mask_shares`/`share_threshold`/`round_nonce` arguments -- so a
+  client that drops out after acceptance no longer makes that round's
+  F7e check un-runnable; reconstruction never depended on that client
+  being reachable, same as the update path never did. Wired through
+  `fl/client.py` (`ClientRoundContext.blinding_self_mask_secret_int`,
+  `share_blinding_self_mask_secret`), `fl/server.py`
+  (`UnmaskingMaterial.blinding_self_mask_shares`, threaded into
+  `_check_F7e_aggregate_sketch` and its F7f subgroup path -- the
+  `blame_material_provider` contract is now a 3-tuple,
+  `(partial_q, straddling_seeds, group_blinding_self_mask_shares)`), and
+  `fl/round_loop.py` (a second `blinding_self_mask_shares_held` dict,
+  populated and released the same way as the existing one). New test:
+  `test_f7e_survives_a_post_acceptance_dropout` in
+  `tests/test_f7e_aggregate.py` -- asserts the check still passes using
+  ONLY the pre-distributed shares, with the per-client secret never put
+  anywhere the reconstruction call could read it.
+- **What happens to a suspect group, decided and implemented.**
+  `fl/suspect_tracker.py::SuspectTracker` turns F7f's suspect-group
+  reports into an actual policy without ever violating F7f's own
+  design (it still never names an individual): a FIRST report
+  quarantines every member of the reported group for
+  `quarantine_rounds` rounds -- a suspect group alone is not proof
+  against any one member of it, so nothing is banned yet. If the SAME
+  client keeps showing up across independent, structurally different
+  bisections (`localize_fault`'s own partition seed differs per
+  round), the INTERSECTION of the groups they've appeared in only ever
+  shrinks, and once it narrows to `narrow_threshold` (default 1) or
+  fewer members, those members are banned outright -- pure set
+  arithmetic over disclosures F7f already made, spending no additional
+  privacy budget. Wired into `fl/round_loop.py::run_training_loop` (new
+  optional `suspect_tracker` parameter, `None` -> fresh tracker): every
+  round calls `tracker.record(outcome.aggregate_sketch_suspect_groups)`
+  then `tracker.tick()`, and each round's participant set is
+  `tracker.eligible(range(n_clients))` rather than the unconditional
+  full ring. Fully unit-tested (8 tests, pure logic, no backend to gate
+  on): `tests/test_suspect_tracker.py`.
+
+  **A real bug this wiring surfaced, caught before it shipped:**
+  restricting the participant set broke `fl/server.py::run_round`'s
+  `excluded_indices` computation, which derived it from `submissions`
+  alone (`[idx for idx, _ in submissions if idx not in accepted_set]`).
+  A client absent from `submissions` entirely (quarantined, never
+  submitted) is NOT the same as a client present but rejected -- but
+  every OTHER client's masked vector still carries a pairwise mask term
+  against that absent client (masking iterates over every configured
+  partner in `ctx.pairwise_secrets`, computed once up front for the
+  full ring, regardless of per-round eligibility). Deriving
+  `excluded_indices` from `submissions` meant that absent client's
+  pairwise seed was never requested, so its uncancelled mask term would
+  have silently corrupted the aggregate. Fixed by deriving it from the
+  `n_clients` parameter instead (`[idx for idx in range(n_clients) if
+  idx not in accepted_set]`) -- previously an unused parameter, now
+  load-bearing. Regression test:
+  `test_aggregate_is_exact_when_a_configured_client_never_submits_at_all`
+  in `tests/test_round_end_to_end.py` -- a 9-configured-client round
+  where the 9th never appears in `submissions` at all, asserting (a)
+  its index is still in `excluded_idx` and (b) the unmasked aggregate
+  is exact.
 
 **Still open on F7, honestly:**
-- **No self-mask on the blinding vector, so no dropout resilience.** A client
-  that drops out after acceptance makes that round's F7e check un-runnable
-  (`f7e_passed: None`), where the update path would have recovered via Shamir.
-  The accepted set is fixed and k_min-floored before any rho is used, so this
-  is a liveness gap, not a privacy one -- but it is a real asymmetry with the
-  vector path.
 - **F7f attributes to a group, never an individual, by design** -- and the
   bisection's cost is O(log n) rounds of inter-client seed releases, which this
   simulation performs synchronously inside one `run_round` call. A deployment
   needs those as real protocol rounds, with a policy for a client that refuses.
-- **What happens to a suspect group is not decided.** `run_round` records it
-  and aborts; nothing excludes a repeat offender from future rounds yet. That
-  policy (and its interaction with the ring's anonymity set) is a protocol
-  question, not wiring.
+- **`SuspectTracker`'s quarantine/ban state is not yet exercised on Colab.**
+  The module itself is fully unit-tested in isolation; its wiring into
+  `run_training_loop` is code-reviewed against the existing patterns
+  (same as every other `fl/round_loop.py` change) but not yet run
+  end-to-end with real crypto -- that needs a Colab run deliberately
+  constructed to trigger at least one F7f abort so quarantine/ban
+  actually fires, which the existing `VERIFY_FIXES_F6_F7.ipynb` gates do
+  not do (Gate D runs the attack demo through `_check_F7e_aggregate_sketch`
+  directly, not through `run_training_loop`).
 - **All four gates run on real Colab GPU with real rbcl bindings
   (2026-11-14).** Gate A: full `pytest tests/ -q` -- 159 passed, 0 skipped,
   110.74s, confirming the entire suite (not just the F7-specific files)

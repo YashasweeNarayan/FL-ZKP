@@ -103,6 +103,13 @@ def _build_env(cheater: int | None = None):
         k: shamir_share_self_secret(self_secrets[k], SHARE_T, list(range(1, N_CLIENTS + 1)))
         for k in range(N_CLIENTS)
     }
+    # FIX.md F7e dropout resilience: a SEPARATE self-mask secret for the
+    # blinding vector, Shamir-shared the same way as the update vector's.
+    blinding_self_secrets = {k: new_self_mask_secret() for k in range(N_CLIENTS)}
+    blinding_shares_held = {
+        k: shamir_share_self_secret(blinding_self_secrets[k], SHARE_T, list(range(1, N_CLIENTS + 1)))
+        for k in range(N_CLIENTS)
+    }
 
     submissions, phase2s, masked_vectors = [], {}, {}
     for k in range(N_CLIENTS):
@@ -159,16 +166,19 @@ def _build_env(cheater: int | None = None):
             identity_binding_proof=prove_identity_binding(
                 sks[k], RHO_T, RHO_E, VRF_ALPHA, b"r_cons:" + commitment.point.b
             ),
-            masked_y_blindings=NP.mask_blinding_vector(y_bl, k, seeds),
+            masked_y_blindings=NP.mask_blinding_vector(
+                y_bl, k, seeds, self_secret_bytes(blinding_self_secrets[k]), RHO_T,
+            ),
         )
 
     def unmask_provider(accepted_idx, excluded_idx):
         shares = {k: [shares_held[k][h + 1] for h in accepted_idx] for k in accepted_idx}
+        blinding_shares = {k: [blinding_shares_held[k][h + 1] for h in accepted_idx] for k in accepted_idx}
         seeds = {}
         for k in excluded_idx:
             for j in accepted_idx:
                 seeds[(j, k)] = pairwise_round_seed(secrets[j][k], RHO_T)
-        return UnmaskingMaterial(shares, seeds, SHARE_T)
+        return UnmaskingMaterial(shares, seeds, SHARE_T, blinding_shares)
 
     def blame_material_provider(group):
         group = list(group)
@@ -185,7 +195,8 @@ def _build_env(cheater: int | None = None):
             partial_q = unmask_aggregate(partial, group, shares, SHARE_T, straddling, RHO_T, MODEL_DIM)
         except ValueError:
             return None
-        return partial_q, straddling
+        blinding_shares = {k: [blinding_shares_held[k][h + 1] for h in group] for k in group}
+        return partial_q, straddling, blinding_shares
 
     return SimpleNamespace(
         submissions=submissions, phase2s=phase2s, masked_vectors=masked_vectors,
@@ -307,3 +318,123 @@ def test_f7e_not_run_is_reported_as_none_not_failure():
     out = _run(env)
     assert not out.aborted, out.abort_reason
     assert out.aggregate_sketch_check_passed is None
+
+
+def test_aggregate_is_exact_when_a_configured_client_never_submits_at_all():
+    """FIX.md F7f regression: a client the server knows about (has a
+    pairwise secret with every submitter, counted in `n_clients`) but
+    that never appears in `submissions` at all -- e.g. sitting out a
+    suspect-group quarantine -- must still have its pairwise mask terms
+    stripped from everyone else's masked vector. Before this fix,
+    `run_round` derived `excluded_indices` from `submissions` alone, so
+    a client absent from `submissions` (as opposed to merely rejected)
+    was never asked about, and its uncancelled pairwise terms corrupted
+    the aggregate silently. TOTAL=9 configured clients; client 8 never
+    submits anything, but every submitter's masked vector still carries
+    a pairwise term against client 8 (precomputed up front, exactly as
+    `fl/round_loop.py` does for every configured pair regardless of
+    per-round eligibility)."""
+    TOTAL = 9
+    GHOST = 8  # never in `submissions`/`phase2s`, but every pairwise secret below includes it
+    rng = np.random.default_rng(13)
+    projector = SketchProjector(seed=SIGMA_T, m=SKETCH_M, d=MODEL_DIM)
+    sks = [Scalar.random() for _ in range(N_CLIENTS)]
+    ring = [scalar_mul_base(sk) for sk in sks]
+    pk_trace = Point.hash_to_point(b"e2e-ghost-pk-trace")
+
+    secrets = {}
+    for a, b in itertools.combinations(range(TOTAL), 2):
+        s = hashlib.sha256(f"e2e-ghost-pair-{a}-{b}".encode()).digest()
+        secrets.setdefault(a, {})[b] = s
+        secrets.setdefault(b, {})[a] = s
+
+    q_true = {k: rng.integers(-300, 300, size=MODEL_DIM).astype(np.int64) for k in range(N_CLIENTS)}
+    self_secrets = {k: new_self_mask_secret() for k in range(N_CLIENTS)}
+    shares_held = {
+        k: shamir_share_self_secret(self_secrets[k], SHARE_T, list(range(1, N_CLIENTS + 1)))
+        for k in range(N_CLIENTS)
+    }
+    blinding_self_secrets = {k: new_self_mask_secret() for k in range(N_CLIENTS)}
+    blinding_shares_held = {
+        k: shamir_share_self_secret(blinding_self_secrets[k], SHARE_T, list(range(1, N_CLIENTS + 1)))
+        for k in range(N_CLIENTS)
+    }
+
+    submissions, phase2s, masked_vectors = [], {}, {}
+    for k in range(N_CLIENTS):  # N_CLIENTS=8 real submitters; GHOST=8 is never included here
+        masked = q_true[k] % P_MASK
+        for j in range(TOTAL):  # <-- masks against ALL 9 configured partners, GHOST included
+            if j == k:
+                continue
+            sign = 1 if k < j else -1
+            masked = (masked + pairwise_mask(secrets[k][j], RHO_T, MODEL_DIM, sign)) % P_MASK
+        masked = (masked + self_mask(self_secret_bytes(self_secrets[k]), RHO_T, MODEL_DIM)) % P_MASK
+        masked_vectors[k] = masked
+
+        blinding = Scalar.random()
+        commitment = pedersen_commit(Scalar.from_int(weighted_digest(masked, seed=RHO_T)), blinding)
+        escrow = elgamal_encrypt(ring[k], pk_trace)
+        masked_hash = hashlib.sha256(b"janus-f7a-masked:" + masked.tobytes()).digest()
+        message = commitment.point.b + escrow.c1.b + escrow.c2.b + masked_hash
+        sig = clsag_sign(sks[k], k, ring, message, RHO_T, RHO_E)
+        submissions.append((k, ClientSubmissionPhase1(
+            commitment_point=commitment.point, escrow_ciphertext=escrow,
+            key_image_round=sig.key_image_round, key_image_epoch=sig.key_image_epoch,
+            ring_signature=sig, masked_vector_hash=masked_hash, was_sampled=True,
+            _secret_blinding=blinding,
+        )))
+
+        y = [int(v) for v in projector.project_int(q_true[k])]
+        transcript = b"norm_proof:" + commitment.point.b
+        sc, y_bl, _ = NP.commit_sketch(y, transcript)
+        weights_list = NP.subset_sum_challenge(seed=SIGMA_T, m=SKETCH_M, n_tests=N_TESTS)
+        window = NP.wraparound_window(SKETCH_M, MODEL_DIM, DENSITY, QUANT_BITS)
+        n_bits = max(8, int(np.ceil(np.log2(max(2 * window + 2, 2)))))
+        bindings, rps = [], []
+        for j, w in enumerate(weights_list):
+            tx = transcript + b":wrap:" + j.to_bytes(4, "little")
+            s = sum(wi * yi for wi, yi in zip(w, y))
+            shifted = min(max(s + window, 0), (1 << n_bits) - 1)
+            rp, agg_bl = prove_range(shifted, n_bits)
+            bindings.append(NP.prove_wraparound_binding(y, y_bl, w, window, tx, recompose_commitment(rp), agg_bl))
+            rps.append(rp)
+        seeds = {j: pairwise_round_seed(secrets[k][j], RHO_T) for j in range(TOTAL) if j != k}
+        phase2s[k] = ClientSubmissionPhase2(
+            sketch_commitment=sc, wraparound_bindings=bindings, wraparound_range_proofs=rps,
+            identity_binding_proof=prove_identity_binding(
+                sks[k], RHO_T, RHO_E, VRF_ALPHA, b"r_cons:" + commitment.point.b
+            ),
+            masked_y_blindings=NP.mask_blinding_vector(
+                y_bl, k, seeds, self_secret_bytes(blinding_self_secrets[k]), RHO_T,
+            ),
+        )
+
+    def unmask_provider(accepted_idx, excluded_idx):
+        # `excluded_idx` must include GHOST (8) -- that is the property
+        # under test. Without the server.py fix, `excluded_idx` would be
+        # derived from `submissions` alone and never contain it.
+        assert GHOST in excluded_idx, (
+            f"GHOST client {GHOST} missing from excluded_idx={excluded_idx} -- "
+            f"run_round is deriving it from `submissions` again, not `n_clients`"
+        )
+        shares = {k: [shares_held[k][h + 1] for h in accepted_idx] for k in accepted_idx}
+        blinding_shares = {k: [blinding_shares_held[k][h + 1] for h in accepted_idx] for k in accepted_idx}
+        seeds = {}
+        for k in excluded_idx:
+            for j in accepted_idx:
+                seeds[(j, k)] = pairwise_round_seed(secrets[j][k], RHO_T)
+        return UnmaskingMaterial(shares, seeds, SHARE_T, blinding_shares)
+
+    out = run_round(
+        submissions, phase2s, RHO_T, RHO_E, VRF_ALPHA, B_T, TOTAL, MODEL_DIM,
+        unmask_provider=unmask_provider,
+        masked_vector_provider=lambda k: masked_vectors[k],
+        sketch_dim=SKETCH_M, sigma_t=SIGMA_T, quant_bits=QUANT_BITS, density=DENSITY,
+        n_tests=N_TESTS, sketch_projector=projector,
+    )
+    assert not out.aborted, f"{out.abort_reason} / {out.rejected_reasons}"
+    expected = aggregate_masked(q_true[k] for k in out.accepted_client_indices)
+    assert np.array_equal(out.aggregate_quantized, expected), (
+        "aggregate does not match the true sum -- GHOST's uncancelled "
+        "pairwise mask terms leaked into it"
+    )
