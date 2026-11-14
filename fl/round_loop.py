@@ -243,6 +243,7 @@ def run_training_loop(
     spill_dir: str = None,
     suspect_tracker: "SuspectTracker" = None,  # FIX.md F7f: what happens to a suspect group. None -> fresh tracker (no history from a previous call to this function). Pass the SAME instance across multiple run_training_loop calls to keep ban/quarantine state across them.
     cheater_client_idx: int = None,  # ATTACK SIMULATION ONLY (FIX.md F7e/F7f Colab gate) -- see round_step_phase2's _cheat_zero_sketch docstring. Never set this for a real round. None -> no cheater, the honest default.
+    f7f_share_threshold: int = 4,  # FIX.md F7f (2026-11-15): a SEPARATE, low Shamir threshold for F7f's subgroup reconstruction during bisection -- NEVER the main secagg_share_threshold. The main threshold (default (2n/3)+1, a super-majority chosen for the WHOLE round's dropout/collusion resistance) is almost always bigger than any bisection-floor-sized subgroup, so reusing it for F7f made every leaf group unverifiable and therefore automatically "suspect" regardless of guilt (Gate E caught this: an innocent client got banned, the real cheater never did). This threshold governs a SECOND, independent Shamir sharing of each client's secrets, used ONLY during F7f's subgroup checks -- the main round's security is untouched by this value.
 ):
     """Runs ARCHITECTURE.md §4's round protocol for `rounds` rounds over
     one model: VRF self-sampling -> local train -> DP noise -> quantize
@@ -371,6 +372,16 @@ def run_training_loop(
         phase1_by_client = {}
         self_mask_shares_held = {}   # {k: {holder_id: ShamirShare}} -- held by the OTHER clients, not the server
         blinding_self_mask_shares_held = {}  # FIX.md F7e dropout resilience: same shape, SEPARATE secret
+        # FIX.md F7f (2026-11-15): a SECOND, independent Shamir sharing of
+        # the SAME two secrets (self_mask_secret_int, blinding_self_mask_secret_int)
+        # at the much lower f7f_share_threshold -- a fresh random polynomial
+        # each time (crypto/field.py::ShamirPolynomial draws new coefficients
+        # per call), so this is cryptographically a completely separate
+        # sharing, not a derivative of the main one. Used ONLY by
+        # blame_material_provider below, during F7f bisection; the main
+        # round's unmask_provider never touches these.
+        accountability_self_mask_shares_held = {}
+        accountability_blinding_shares_held = {}
         holder_ids = list(range(1, n_clients + 1))
         # FIX.md F5: q_k and x_k go here instead of staying on the
         # submissions, so peak RAM stops scaling with n_clients. Closed
@@ -398,6 +409,11 @@ def run_training_loop(
                 ctx_by_client[client_idx] = ctx
                 self_mask_shares_held[client_idx] = share_self_mask_secret(ctx, holder_ids, share_t)
                 blinding_self_mask_shares_held[client_idx] = share_blinding_self_mask_secret(ctx, holder_ids, share_t)
+                # FIX.md F7f: SAME two secrets, SECOND independent sharing at
+                # the low f7f_share_threshold -- see this function's docstring
+                # on f7f_share_threshold for why this must not reuse share_t.
+                accountability_self_mask_shares_held[client_idx] = share_self_mask_secret(ctx, holder_ids, f7f_share_threshold)
+                accountability_blinding_shares_held[client_idx] = share_blinding_self_mask_secret(ctx, holder_ids, f7f_share_threshold)
 
                 def _sink(q_k, masked, _k=client_idx):
                     store.put(("q", _k), q_k)
@@ -461,8 +477,9 @@ def run_training_loop(
                         seeds[(j, k)] = pairwise_round_seed(pairwise_secrets[j][k], _rho)
                 return UnmaskingMaterial(shares, seeds, share_t, blinding_shares)
 
-            def blame_material_provider(group, _held=self_mask_shares_held,
-                                         _bheld=blinding_self_mask_shares_held,
+            def blame_material_provider(group, _held=accountability_self_mask_shares_held,
+                                         _bheld=accountability_blinding_shares_held,
+                                         _acc_t=f7f_share_threshold,
                                          _rho=rho_t, _store=store):
                 """FIX.md F7f. Simulates what the clients IN `group`
                 release when the server bisects a failed F7e check:
@@ -473,20 +490,39 @@ def run_training_loop(
                 subgroup -- which is exactly the privacy cost `localize_fault`'s
                 min_group_size floor bounds; see fl/server.py's F7f comment.
 
-                Returns None when the subgroup is too small for the
-                self-mask shares to reconstruct (below `share_t`), so
-                the server leaves that group suspect rather than
-                clearing it on evidence it could not actually check.
+                FIX.md F7f (2026-11-15): reconstructs using the SECOND,
+                low-threshold (`f7f_share_threshold`) share sets
+                (`accountability_self_mask_shares_held` /
+                `accountability_blinding_shares_held`), NOT the main
+                round's `self_mask_shares_held` / `share_t` -- those are a
+                super-majority threshold sized for the WHOLE round's
+                dropout tolerance, almost always bigger than any subgroup
+                bisection ever reaches, which is what made every leaf
+                group unverifiable (and therefore automatically flagged
+                suspect) regardless of guilt. This accountability-only
+                sharing is a genuinely separate Shamir sharing of the
+                SAME secrets, at a threshold chosen to actually be
+                reachable by a bisection-floor-sized subgroup; the main
+                round's security is untouched by it.
 
-                Returns (partial_q, straddling, group_blinding_self_mask_shares)
-                -- the third element is the SAME shares-held-by-the-other-
-                group-members pattern, for the blinding vector's self-mask
-                secret, so `_check_F7e_aggregate_sketch`'s subgroup test can
-                reconstruct that subgroup's blinding sum too.
+                Returns None when the subgroup is too small for even
+                THIS lower threshold's shares to reconstruct (below
+                `f7f_share_threshold`), so the server leaves that group
+                suspect rather than clearing it on evidence it could not
+                actually check.
+
+                Returns (partial_q, straddling, group_blinding_self_mask_shares,
+                group_share_threshold) -- the third element is the SAME
+                shares-held-by-the-other-group-members pattern, for the
+                blinding vector's self-mask secret, so
+                `_check_F7e_aggregate_sketch`'s subgroup test can
+                reconstruct that subgroup's blinding sum too; the fourth
+                is the threshold THIS provider actually used, so the
+                caller never has to independently guess/match it.
                 """
                 group = list(group)
                 group_set = set(group)
-                if len(group) < share_t:
+                if len(group) < _acc_t:
                     return None
                 outside = [k for k in range(n_clients) if k not in group_set]
                 straddling = {}
@@ -497,19 +533,20 @@ def run_training_loop(
                 shares = {k: [_held[k][h + 1] for h in group] for k in group}
                 try:
                     partial_q = unmask_aggregate(
-                        partial_masked, group, shares, share_t, straddling, _rho, model_dim,
+                        partial_masked, group, shares, _acc_t, straddling, _rho, model_dim,
                     )
                 except ValueError:
                     return None
                 blinding_shares = {k: [_bheld[k][h + 1] for h in group] for k in group}
-                return partial_q, straddling, blinding_shares
+                return partial_q, straddling, blinding_shares, _acc_t
 
             outcome = run_round(submissions, phase2_by_client, rho_t, rho_e, vrf_alpha, threshold.B_t, n_clients, model_dim,
                                 unmask_provider=unmask_provider,
                                 masked_vector_provider=lambda k: store.get(("x", k)),
                                 sketch_dim=sketch_m, sigma_t=sigma_t,
                                 sketch_projector=TorchSketchProjector(seed=sigma_t, m=sketch_m, d=model_dim),
-                                blame_material_provider=blame_material_provider)
+                                blame_material_provider=blame_material_provider,
+                                f7f_share_threshold=f7f_share_threshold)
             _t_verify = time.time() - _t_verify_start
 
             # FIX.md F7f: what happens to a suspect group. Record whatever

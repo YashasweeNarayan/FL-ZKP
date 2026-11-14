@@ -211,7 +211,8 @@ def _check_F7e_aggregate_sketch(phase2s: dict, accepted_indices: list, aggregate
                                  sigma_t: bytes, rho_t: bytes,
                                  blinding_self_mask_shares: dict, share_threshold: int,
                                  sketch_projector=None,
-                                 blame_material_provider=None):
+                                 blame_material_provider=None,
+                                 f7f_share_threshold: int = 4):
     """Returns (ok, bad_coordinates, suspect_groups, detail).
 
     `ok` is None (not False) when the check could not be RUN at all --
@@ -288,11 +289,21 @@ def _check_F7e_aggregate_sketch(phase2s: dict, accepted_indices: list, aggregate
         material = blame_material_provider(group)
         if material is None:
             return False  # cannot verify this subgroup -> leave it suspect; never clear a group on missing evidence
-        partial_q, straddling_seeds, group_blinding_self_mask_shares = material
+        # FIX.md F7f (2026-11-15): 4-tuple now -- the 4th element is
+        # whatever threshold the PROVIDER actually used for its
+        # accountability-only share sets (its own f7f_share_threshold,
+        # NOT this function's `share_threshold` param, which is the
+        # main round's super-majority number and almost never matches
+        # what a subgroup this small can actually reconstruct with).
+        # Trusting the provider's own reported threshold here, rather
+        # than reusing `share_threshold`, is what makes this call
+        # succeed for a bisection-floor-sized group instead of always
+        # raising "not enough shares".
+        partial_q, straddling_seeds, group_blinding_self_mask_shares, group_share_threshold = material
         try:
             sub_blindings = reconstruct_blinding_sum(
                 masked_by_client, group, straddling_seeds, sketch_dim,
-                group_blinding_self_mask_shares, share_threshold, rho_t,
+                group_blinding_self_mask_shares, group_share_threshold, rho_t,
             )
         except (ValueError, KeyError):
             return False
@@ -303,7 +314,13 @@ def _check_F7e_aggregate_sketch(phase2s: dict, accepted_indices: list, aggregate
         )
         return sub_ok
 
-    blame = localize_fault(list(accepted_indices), coordinate, sigma_t, _group_opens_correctly)
+    # min_group_size = f7f_share_threshold: never test a group smaller
+    # than what blame_material_provider can actually verify (combined
+    # with partition_group's own floor-respecting split, this is what
+    # stops every leaf from degenerating into an automatic, guilt-blind
+    # "suspect" -- see crypto/norm_proof.py::partition_group's docstring).
+    blame = localize_fault(list(accepted_indices), coordinate, sigma_t, _group_opens_correctly,
+                            min_group_size=f7f_share_threshold)
     return False, bad, blame.suspect_groups, (
         f"{len(bad)} mismatched coordinate(s), first={bad[:4]}; localized on coordinate "
         f"{coordinate} to {len(blame.suspect_groups)} suspect group(s) in "
@@ -341,7 +358,8 @@ def run_round(
     density: float = 1.0 / 3.0,
     n_tests: int = 8,             # FIX.md F7d: MUST match round_step_phase2's own n_tests, or the server derives a different number of public weight vectors than the client proved against and every honest client fails V3. Threaded explicitly rather than left as two independent hardcoded 8s.
     sketch_projector=None,        # FIX.md F7e: MUST be the same projector class the clients used (see _true_aggregate_sketch); None -> TorchSketchProjector, matching round_step_phase2
-    blame_material_provider=None,  # FIX.md F7f: callable(group) -> (partial_q, straddling_pair_seeds, group_blinding_self_mask_shares) or None. Omit to abort without attribution on an F7e failure.
+    blame_material_provider=None,  # FIX.md F7f: callable(group) -> (partial_q, straddling_pair_seeds, group_blinding_self_mask_shares, group_share_threshold) or None. Omit to abort without attribution on an F7e failure.
+    f7f_share_threshold: int = 4,  # FIX.md F7f (2026-11-15): bisection's min_group_size floor -- MUST be <= whatever threshold blame_material_provider's own subgroup reconstruction actually uses, or every leaf group becomes unverifiable regardless of guilt (see fl/round_loop.py's f7f_share_threshold docstring). NOT the main secagg share_threshold.
 ) -> RoundOutcome:
     if sketch_dim is None or sigma_t is None:
         raise ValueError(
@@ -511,7 +529,7 @@ def run_round(
         phase2s, accepted_indices, aggregate_quantized, material.excluded_pair_seeds,
         sketch_dim, model_dim, sigma_t, rho_t,
         material.blinding_self_mask_shares, material.share_threshold,
-        sketch_projector, blame_material_provider,
+        sketch_projector, blame_material_provider, f7f_share_threshold,
     )
     if sketch_ok is False:
         # ABORT rather than apply: an aggregate that fails this check is

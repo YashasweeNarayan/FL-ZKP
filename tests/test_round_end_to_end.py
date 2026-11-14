@@ -196,7 +196,10 @@ def _build_env(cheater: int | None = None):
         except ValueError:
             return None
         blinding_shares = {k: [blinding_shares_held[k][h + 1] for h in group] for k in group}
-        return partial_q, straddling, blinding_shares
+        # FIX.md F7f (2026-11-15): 4-tuple -- 4th element is the
+        # threshold THIS provider actually used (SHARE_T, same as
+        # before).
+        return partial_q, straddling, blinding_shares, SHARE_T
 
     return SimpleNamespace(
         submissions=submissions, phase2s=phase2s, masked_vectors=masked_vectors,

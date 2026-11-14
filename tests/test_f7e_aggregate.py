@@ -200,7 +200,11 @@ def _blame_provider(env, accepted):
             partial_q = unmask_aggregate(partial_masked, group, shares, SHARE_T, straddling, RHO_T, MODEL_DIM)
         except ValueError:
             return None
-        return partial_q, straddling, _blinding_shares_for(env, group)
+        # FIX.md F7f (2026-11-15): 4-tuple now -- 4th element is the
+        # threshold THIS provider actually used (SHARE_T here, same as
+        # before; see fl/round_loop.py's real provider for why a real
+        # deployment uses a SEPARATE, lower one instead).
+        return partial_q, straddling, _blinding_shares_for(env, group), SHARE_T
     return provider
 
 
@@ -351,7 +355,7 @@ def test_f7f_localizes_the_cheater_to_a_small_group():
     agg, excluded_seeds = _unmask_all(env, accepted)
     ok, bad, groups, detail = _check_F7e_aggregate_sketch(
         env.phase2s, accepted, agg, excluded_seeds, SKETCH_M, MODEL_DIM, SIGMA_T, RHO_T, _blinding_shares_for(env, accepted), SHARE_T, env.projector,
-        blame_material_provider=_blame_provider(env, accepted),
+        blame_material_provider=_blame_provider(env, accepted), f7f_share_threshold=SHARE_T,
     )
     assert ok is False, detail
     assert groups, f"expected at least one suspect group, got none: {detail}"
@@ -369,7 +373,7 @@ def test_f7f_subgroup_check_clears_an_honest_subgroup():
     accepted = list(range(N_CLIENTS))
     provider = _blame_provider(env, accepted)
     honest = [0, 1, 2]
-    partial_q, straddling, blinding_shares = provider(honest)
+    partial_q, straddling, blinding_shares, _ = provider(honest)
     sub_blindings = NP.reconstruct_blinding_sum(
         {k: env.phase2s[k].masked_y_blindings for k in honest}, honest, straddling, SKETCH_M,
         blinding_shares, SHARE_T, RHO_T,
@@ -386,7 +390,7 @@ def test_f7f_subgroup_check_flags_a_subgroup_holding_the_cheater():
     accepted = list(range(N_CLIENTS))
     provider = _blame_provider(env, accepted)
     guilty = [3, 4, 5]
-    partial_q, straddling, blinding_shares = provider(guilty)
+    partial_q, straddling, blinding_shares, _ = provider(guilty)
     sub_blindings = NP.reconstruct_blinding_sum(
         {k: env.phase2s[k].masked_y_blindings for k in guilty}, guilty, straddling, SKETCH_M,
         blinding_shares, SHARE_T, RHO_T,
@@ -435,7 +439,7 @@ def test_f7f_localizes_the_lying_sketch_cheater():
     agg, excluded_seeds = _unmask_all(env, accepted)
     ok, bad, groups, detail = _check_F7e_aggregate_sketch(
         env.phase2s, accepted, agg, excluded_seeds, SKETCH_M, MODEL_DIM, SIGMA_T, RHO_T, _blinding_shares_for(env, accepted), SHARE_T, env.projector,
-        blame_material_provider=_blame_provider(env, accepted),
+        blame_material_provider=_blame_provider(env, accepted), f7f_share_threshold=SHARE_T,
     )
     assert ok is False, detail
     flat = set()

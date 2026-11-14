@@ -612,10 +612,28 @@ def verify_aggregate_sketch(y_commitments_by_client: list[list[Commitment]],
 # ---------------------------------------------------------------------------
 
 def partition_group(client_ids: list[int], seed: bytes, min_group_size: int = 4) -> tuple[list[int], list[int]] | None:
-    """Public, round-seeded 50/50 split of `client_ids`. None if the
-    group is already at or below the privacy floor (caller should stop
-    bisecting)."""
-    if len(client_ids) <= min_group_size:
+    """Public, round-seeded 50/50 split of `client_ids`. None if
+    splitting would produce a half BELOW `min_group_size` (caller should
+    stop bisecting and report the whole current group as suspect
+    instead, rather than testing a half it can't come back from).
+
+    FIX.md F7f (2026-11-15, Gate E): this used to check only
+    `len(client_ids) <= min_group_size` -- i.e. whether the CURRENT
+    group was already at the floor -- not whether splitting it would
+    produce a CHILD below the floor. A group of size 9 with
+    min_group_size=4 would split into 4/5, BOTH already <= the floor,
+    so every leaf from then on is untestable (the verifier can't
+    reconstruct anything for a group that small) and gets reported
+    suspect regardless of which half actually contains the fault.
+    Gate E's real Colab run hit exactly this: an innocent client got
+    banned off a false narrowing while the real cheater was never
+    isolated. The smaller of the two halves is always
+    `len(client_ids) // 2`; stop BEFORE splitting once that would
+    already be below the floor, so every group this function ever
+    returns is independently >= min_group_size.
+    """
+    half = len(client_ids) // 2
+    if half < min_group_size:
         return None
     import hashlib
     ordered = sorted(client_ids)
@@ -624,7 +642,6 @@ def partition_group(client_ids: list[int], seed: bytes, min_group_size: int = 4)
         h = hashlib.sha256(seed + b":part:" + cid.to_bytes(8, "little")).digest()
         keyed.append((h, cid))
     keyed.sort()
-    half = len(keyed) // 2
     left = [cid for _, cid in keyed[:half]]
     right = [cid for _, cid in keyed[half:]]
     return left, right

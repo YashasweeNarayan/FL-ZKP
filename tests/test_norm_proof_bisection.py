@@ -23,6 +23,7 @@ if _backend_name() is None:
     )
 
 from crypto.norm_proof import BisectionSession, localize_fault, partition_group
+from fl.suspect_tracker import SuspectTracker
 
 
 def _guilty_predicate(guilty: set[int]):
@@ -140,3 +141,76 @@ def test_partition_group_returns_none_at_the_floor():
     left, right = partition_group(list(range(10)), b"seed", min_group_size=2)
     assert sorted(left + right) == list(range(10))
     assert set(left).isdisjoint(right)
+
+
+def test_partition_group_never_produces_a_child_below_the_floor():
+    """FIX.md F7f (2026-11-15, Gate E): the bug that let an innocent
+    client get banned on real Colab -- a group of 9 with
+    min_group_size=4 used to split into 4/5, BOTH already too small to
+    verify, and from then on every leaf was unverifiable (and therefore
+    reported suspect) regardless of guilt. The fix: never split if
+    either resulting half would land below the floor."""
+    for n in range(1, 40):
+        for floor in range(1, 10):
+            result = partition_group(list(range(n)), b"seed", min_group_size=floor)
+            if result is None:
+                continue
+            left, right = result
+            assert len(left) >= floor and len(right) >= floor, (
+                f"n={n}, floor={floor}: produced a child below the floor "
+                f"({len(left)}, {len(right)})"
+            )
+
+
+def test_f7f_with_matched_threshold_never_bans_an_innocent_client():
+    """Regression for the Gate E failure itself (FIX.md F7f,
+    2026-11-15): on real Colab, with 9 clients and the MAIN secagg
+    threshold's usual formula ((2n/3)+1 = 7 for n=9), `blame_material_
+    provider` could only verify a subgroup >= 7, while bisection's
+    min_group_size floor was 4 -- every leaf it ever tested was
+    therefore BELOW 7, hence unverifiable BY CONSTRUCTION regardless of
+    guilt, and `SuspectTracker`'s cross-round intersection banned
+    whichever INNOCENT client's two random partitions happened to
+    overlap down to a singleton first (client 0, in the actual run),
+    while the real cheater (client 5) was never isolated.
+
+    The fix -- a SEPARATE, low accountability-only threshold
+    (`fl/round_loop.py`'s `f7f_share_threshold`) used as bisection's
+    min_group_size, instead of the main round's super-majority
+    threshold -- means `check_group_opens_correctly` is NEVER asked
+    about a group it cannot verify. This oracle mirrors the real one
+    exactly: `False` both when the group is too small to verify AND
+    when the cheater is inside it (the two failure modes
+    `blame_material_provider`/`_group_opens_correctly` conflate in
+    production, for the same reason -- no evidence either way is not
+    innocence). With the floor matched to what the oracle can actually
+    check, the "too small to verify" branch is never reached, so only
+    groups that genuinely contain the cheater are ever reported --
+    and only the cheater's own per-client intersection can ever narrow
+    to a singleton.
+    """
+    N = 9
+    ACC_T = 4          # the LOW, accountability-only threshold (the fix)
+    CHEATER = 5
+
+    def oracle(group, _t=ACC_T, _c=CHEATER):
+        if len(group) < _t:
+            return False  # unverifiable -- never happens once min_group_size == _t
+        return _c not in group
+
+    tracker = SuspectTracker(quarantine_rounds=1)
+    for round_idx in range(10):
+        eligible = tracker.eligible(range(N))
+        if CHEATER not in eligible:
+            break
+        blame = localize_fault(eligible, 0, f"round-{round_idx}".encode(), oracle, min_group_size=ACC_T)
+        newly_banned = tracker.record(blame.suspect_groups)
+        tracker.tick()
+        assert newly_banned <= {CHEATER}, (
+            f"round {round_idx}: banned an innocent client {newly_banned - {CHEATER}} "
+            f"-- suspect groups were {blame.suspect_groups}"
+        )
+    assert CHEATER in tracker.banned or CHEATER in tracker.quarantined, (
+        f"cheater {CHEATER} was never even quarantined after 10 rounds; "
+        f"banned={tracker.banned}, quarantined={tracker.quarantined}"
+    )
