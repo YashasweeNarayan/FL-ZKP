@@ -939,6 +939,94 @@ is actually exercised rather than passing because both sides happen to say 8.
   the pure-Python backend** -- all four gates passed; the timing anomalies
   above are the only unresolved items from this pass.
 - Depends on F1 (F7e needs the true aggregate) -- satisfied, F1 is fixed.
+- **Gate E's first real run found a genuine correctness bug in F7f/SuspectTracker
+  -- not a flaky run (2026-11-14 run, fixed 2026-11-15).** The 9-client, 5-round,
+  real-cheater Colab run came back wrong in exactly the way accountability
+  must never be wrong: across 4 rounds it banned clients **0, 1, 2, 6, 8** --
+  all innocent -- and never isolated client 5, the actual cheater.
+
+  **Root cause, traced through two independent bugs:**
+
+  1. `fl/round_loop.py`'s `blame_material_provider` reconstructed a bisected
+     subgroup's real partial aggregate (`partial_q`, needed to recompute what
+     its sketch *should* be) using the MAIN round's self-mask shares, gated on
+     `len(group) < share_t` where `share_t = (2*n_clients)//3+1` -- a
+     super-majority chosen for the WHOLE round's dropout/collusion tolerance,
+     not an accountability-specific choice. For n=9, `share_t=7`. Bisection's
+     own floor (`min_group_size`, default 4) is smaller than that, so EVERY
+     leaf group the bisection ever reached was below 7 -- `blame_material_provider`
+     returned `None` for all of them, and `_group_opens_correctly`'s own stated
+     policy ("never clear a group on missing evidence") then reported every
+     one of them suspect, **regardless of whether the cheater was actually in
+     it**. `SuspectTracker`'s cross-round intersection-narrowing assumed only
+     the true cheater would keep showing up in narrowing reports; instead,
+     EVERY client showed up in some always-suspect bucket every round, and
+     whichever client's two random bisection partitions happened to overlap
+     to a singleton first got banned -- pure chance, unrelated to guilt.
+  2. Independently, `crypto/norm_proof.py::partition_group` only checked
+     whether the CURRENT group was already at `min_group_size` before
+     splitting -- not whether the resulting HALVES would land below it. A
+     9-client group split into 4/5, both already at/below the floor, so this
+     bug alone guaranteed every leaf was undersized even before bug #1's
+     threshold mismatch is considered.
+
+  Bug #1 means lowering `min_group_size` alone cannot fix this: the
+  cryptographic floor for reconstructing a subgroup's real `partial_q` is set
+  by whatever Shamir threshold its self-mask shares actually use, not by a
+  bisection policy constant.
+
+  **Fix, in two parts:**
+
+  1. `crypto/norm_proof.py::partition_group` now refuses to split if EITHER
+     resulting half would land below `min_group_size` (checks `len//2 <
+     min_group_size` before splitting, not `len <= min_group_size` on the
+     group about to be split) -- every group `localize_fault`/`BisectionSession`
+     ever tests is now independently `>= min_group_size`, by construction.
+  2. F7f's subgroup checks now use a SECOND, cryptographically independent,
+     LOW-threshold Shamir sharing of each client's two secrets
+     (`self_mask_secret_int` and `blinding_self_mask_secret_int`) --
+     `fl/round_loop.py`'s new `f7f_share_threshold` parameter (default 4),
+     producing `accountability_self_mask_shares_held` /
+     `accountability_blinding_shares_held` via a SECOND call to the existing
+     `share_self_mask_secret`/`share_blinding_self_mask_secret` functions
+     (each draws a fresh random polynomial per call -- `crypto/field.py::
+     ShamirPolynomial` -- so this is a genuinely separate sharing of the same
+     secret, not a derivative of the main one). `blame_material_provider` now
+     reconstructs using THESE shares and THIS threshold, never the main
+     round's `share_t` -- the main round's dropout/collusion-resistance
+     threshold is completely untouched by this change. `blame_material_provider`'s
+     return contract widened from a 3-tuple to a 4-tuple -- `(partial_q,
+     straddling_seeds, group_blinding_self_mask_shares, group_share_threshold)`
+     -- so `_check_F7e_aggregate_sketch` always reconstructs the subgroup's
+     blinding sum at the threshold the provider ACTUALLY used, rather than
+     needing to independently guess/match it. `fl/server.py::run_round` and
+     `_check_F7e_aggregate_sketch` both gained the matching `f7f_share_threshold`
+     parameter (default 4), used as `localize_fault`'s `min_group_size`.
+
+  **Checks.** Two new tests in `tests/test_norm_proof_bisection.py`:
+  `test_partition_group_never_produces_a_child_below_the_floor` (exhaustive
+  check over n=1..39, floor=1..9: every split `partition_group` returns has
+  both halves `>= floor`) and `test_f7f_with_matched_threshold_never_bans_an_
+  innocent_client` -- reproduces the Gate E failure's exact shape (9 clients,
+  a persistent cheater, several independent rounds with fresh bisection
+  seeds, a synthetic oracle that fails both "too small to verify" and
+  "cheater present" the same way the real code conflates them) and asserts
+  the core invariant Gate E violated: no round may ever ban anyone but the
+  cheater. Pure logic, no real crypto, runs in milliseconds -- this is now a
+  permanent regression test, not something that only gets caught on a Colab
+  GPU run. `tests/test_f7e_aggregate.py` and `tests/test_round_end_to_end.py`'s
+  own hand-built blame providers updated to the 4-tuple contract (both pass
+  their own fixed threshold as the 4th element, unchanged behavior for
+  them -- their N_CLIENTS/SHARE_T combinations never actually hit this bug,
+  which is exactly why it took a realistic Colab-scale run, not a unit test,
+  to surface it). Two localization tests (`test_f7f_localizes_the_cheater_to_
+  a_small_group`, `test_f7f_localizes_the_lying_sketch_cheater`) now pass
+  `f7f_share_threshold` explicitly, matching their own fixture's threshold,
+  so the floor and the verifiable threshold stay in lockstep the way the fix
+  requires. Full suite: 180 passed (178 + 2 new), pure-Python group backend.
+  **Still needs a Colab re-run** of Gate E against the real cheater through
+  the real pipeline to confirm this against real crypto, not just the
+  synthetic/unit-level reproduction above.
 
 ## F8 — ristretto255 bindings: wrong library entirely, not a version problem
 
