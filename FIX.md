@@ -808,10 +808,36 @@ is actually exercised rather than passing because both sides happen to say 8.
   and aborts; nothing excludes a repeat offender from future rounds yet. That
   policy (and its interaction with the ring's anonymity set) is a protocol
   question, not wiring.
-- **Not yet run on Colab/real rbcl.** Everything above is pure-Python-backend
-  only. `notebooks/VERIFY_FIXES_F6_F7.ipynb` is the pass that settles it, and
-  also the first measurement of F7's real per-client cost (predicted ~8x the
-  old single range proof; unverified until that notebook runs).
+- **Gates B/C/D run on real Colab GPU (2026-11-14); Gate A result not yet
+  reported back.** `notebooks/VERIFY_FIXES_F6_F7.ipynb`'s real 8-client,
+  2-round loop (resnet18) came back `accepted=8/8, V5=PASS, F7e=PASS,
+  aggregate=EXACT` on both rounds, and Gate D's attack-demo subset
+  (`-k "lying_sketch or wraparound_cheater"`) passed 4/4 on real rbcl. Measured
+  per-round cost against the documented pre-F7 baseline
+  (`phase1=45.8s, phase2=31.9s, verify=8.7s`):
+
+  | phase | pre-F7 | round 0 | round 1 | factor |
+  |---|---|---|---|---|
+  | phase1 (train+most-crypto) | 45.8s | 62.9s | 84.8s | 1.4-1.85x |
+  | phase2 (sketch+rangeproof) | 31.9s | 237.6s | 237.9s | ~7.45x |
+  | verify | 8.7s | 121.0s | 122.9s | ~14x |
+
+  phase2's ~7.45x lands right where FIX.md's own estimate said it would
+  (~8x the old single range proof) -- the m=8192 sketch dimension does not
+  need revisiting on that number. Two things weren't predicted and are worth
+  tracking rather than explaining away: verify grew faster than phase2 did
+  (~14x vs ~7.45x) even though both scale with roughly the same per-coordinate
+  proof count, and phase1 -- which should be "roughly unchanged" since F7 adds
+  no phase-1 work -- grew 1.4-1.85x on its own, with round 1 noticeably slower
+  than round 0 within the same process (84.8s vs 62.9s). Neither has a root
+  cause identified yet; both could be ordinary Colab/GPU run-to-run variance
+  (shared tenancy, allocator warm-up) rather than anything F7-shaped, but
+  that's a guess, not a finding. RSS grew modestly (1.68 -> 2.08 GiB) over the
+  two rounds. Gate A (`pytest tests/ -q` asserting `backend_name() == "rbcl"`
+  and 0 skipped -- the only gate that actually proves the real libsodium
+  bindings exercise all 159 tests, not just the ones Gate D cherry-picks) has
+  not been reported back yet; until it is, "validated on real rbcl" covers
+  Gates B/C/D only, not the full suite.
 - Depends on F1 (F7e needs the true aggregate) -- satisfied, F1 is fixed.
 
 ## F8 — ristretto255 bindings: wrong library entirely, not a version problem
