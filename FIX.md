@@ -624,11 +624,16 @@ now pass across the repo (16 files).
 
 ## F7 — V3 norm check
 
-**Status: F7a/b/c/d IMPLEMENTED and wired into `fl/client.py` + `fl/server.py`,
-tested under the test-only pure-Python ristretto255 backend (`tests/test_f7_norm_proof.py`,
-`tests/test_ristretto_backend.py`). F7e/F7f are real, independently-tested
-primitives in `crypto/norm_proof.py` but NOT YET wired into `fl/server.py::run_round`
--- see "wiring" below. Not yet run on Colab (needs real `rbcl`; see F8).**
+**Status: FIXED AND WIRED (F7a-f), CONFIRMED ON COLAB WITH REAL RBCL
+(2026-11-14).** F7a-d and F7e/F7f are all implemented and wired into
+`fl/client.py` + `fl/server.py::run_round`. 159/159 tests pass against real
+`rbcl` bindings (not just the pure-Python stand-in), a real 8-client
+resnet18 round loop runs `V5=PASS, F7e=PASS, aggregate=EXACT`, and the
+lying-sketch/wraparound attack demo passes against real crypto -- see
+"Gates B/C/D" and "Gate A" below for the actual numbers. Open items are
+the timing anomalies and the handful of protocol-policy questions listed
+under "Still open on F7, honestly" -- none of them are wiring or
+correctness gaps.
 
 Cause (unchanged from the original diagnosis): three gaps between
 `ARCHITECTURE.md` and the implementation --
@@ -808,8 +813,11 @@ is actually exercised rather than passing because both sides happen to say 8.
   and aborts; nothing excludes a repeat offender from future rounds yet. That
   policy (and its interaction with the ring's anonymity set) is a protocol
   question, not wiring.
-- **Gates B/C/D run on real Colab GPU (2026-11-14); Gate A result not yet
-  reported back.** `notebooks/VERIFY_FIXES_F6_F7.ipynb`'s real 8-client,
+- **All four gates run on real Colab GPU with real rbcl bindings
+  (2026-11-14).** Gate A: full `pytest tests/ -q` -- 159 passed, 0 skipped,
+  110.74s, confirming the entire suite (not just the F7-specific files)
+  exercises real libsodium, not the pure-Python stand-in.
+  `notebooks/VERIFY_FIXES_F6_F7.ipynb`'s real 8-client,
   2-round loop (resnet18) came back `accepted=8/8, V5=PASS, F7e=PASS,
   aggregate=EXACT` on both rounds, and Gate D's attack-demo subset
   (`-k "lying_sketch or wraparound_cheater"`) passed 4/4 on real rbcl. Measured
@@ -833,11 +841,9 @@ is actually exercised rather than passing because both sides happen to say 8.
   cause identified yet; both could be ordinary Colab/GPU run-to-run variance
   (shared tenancy, allocator warm-up) rather than anything F7-shaped, but
   that's a guess, not a finding. RSS grew modestly (1.68 -> 2.08 GiB) over the
-  two rounds. Gate A (`pytest tests/ -q` asserting `backend_name() == "rbcl"`
-  and 0 skipped -- the only gate that actually proves the real libsodium
-  bindings exercise all 159 tests, not just the ones Gate D cherry-picks) has
-  not been reported back yet; until it is, "validated on real rbcl" covers
-  Gates B/C/D only, not the full suite.
+  two rounds. **F7e/F7f are now validated end-to-end on real rbcl, not just
+  the pure-Python backend** -- all four gates passed; the timing anomalies
+  above are the only unresolved items from this pass.
 - Depends on F1 (F7e needs the true aggregate) -- satisfied, F1 is fixed.
 
 ## F8 — ristretto255 bindings: wrong library entirely, not a version problem
