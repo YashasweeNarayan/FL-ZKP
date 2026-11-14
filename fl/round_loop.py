@@ -242,6 +242,7 @@ def run_training_loop(
     sketch_batch_budget_bytes: int = DEFAULT_SKETCH_BATCH_BYTES,
     spill_dir: str = None,
     suspect_tracker: "SuspectTracker" = None,  # FIX.md F7f: what happens to a suspect group. None -> fresh tracker (no history from a previous call to this function). Pass the SAME instance across multiple run_training_loop calls to keep ban/quarantine state across them.
+    cheater_client_idx: int = None,  # ATTACK SIMULATION ONLY (FIX.md F7e/F7f Colab gate) -- see round_step_phase2's _cheat_zero_sketch docstring. Never set this for a real round. None -> no cheater, the honest default.
 ):
     """Runs ARCHITECTURE.md §4's round protocol for `rounds` rounds over
     one model: VRF self-sampling -> local train -> DP noise -> quantize
@@ -360,6 +361,10 @@ def run_training_loop(
             print(f"  round {t_round}: {excluded_this_round} sitting out "
                   f"(banned: {sorted(suspect_tracker.banned)}, "
                   f"quarantined: {sorted(suspect_tracker.quarantined)})")
+        if verbose and cheater_client_idx is not None:
+            still_active = cheater_client_idx in eligible_this_round
+            print(f"  round {t_round}: cheater {cheater_client_idx} "
+                  f"{'still submitting' if still_active else 'excluded this round -- tracker caught up'}")
 
         _t_phase1_start = time.time()
         ctx_by_client = {}
@@ -424,6 +429,7 @@ def run_training_loop(
                     ctx_by_client[client_idx], phase1_by_client[client_idx],
                     sigma_t, sketch_m, threshold.B_t, rho_t, rho_e, vrf_alpha,
                     _secret_q_override=store.get(("q", client_idx)),
+                    _cheat_zero_sketch=(client_idx == cheater_client_idx),
                 )
             _t_phase2 = time.time() - _t_phase2_start
 

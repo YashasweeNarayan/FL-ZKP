@@ -903,6 +903,90 @@ a suspect group containing the cheater, smaller than the whole accepted set).
 The same for the wraparound variant, which V3 and F7d also catch independently
 -- F7e is defense-in-depth there rather than the only line."""),
 
+    ("md", """## Gate E \u2014 does the suspect-group policy actually ban a repeat cheater?
+
+Gate D shows F7e/F7f catching and localizing the cheat ONCE, by calling
+`_check_F7e_aggregate_sketch` directly. This gate exercises the next link in
+the chain: `fl/suspect_tracker.py::SuspectTracker`, wired into
+`run_training_loop` itself, across SEVERAL real rounds -- the first time
+anything in this notebook runs the cheat through the actual training loop
+(real local training, real ring signatures, real masking) rather than a
+hand-built submission.
+
+One client (`CHEATER_IDX`) is put into `_cheat_zero_sketch` mode every round
+it is still eligible to submit (`fl/client.py::round_step_phase2`'s
+attack-simulation-only hook \u2014 never set for a real round). It keeps
+committing the sketch of the zero vector while masking a real, ordinary
+update, so V1-V5 keep passing and only F7e/F7f ever see it. `GATE_E_CLIENTS`
+is one more than `SMOKE_CLIENTS` specifically so quarantining the cheater
+still leaves `k_min=8` clients eligible -- otherwise the round would abort
+for too few participants, which would hide the actual thing under test.
+`quarantine_rounds=1` (not the default 3) only to make a short Colab run
+demonstrate the ban within a handful of rounds; the mechanism itself does not
+depend on that value.
+
+Expected: the cheater is QUARANTINED the first time F7f localizes it, then
+(because `localize_fault`'s bisection partitions the accepted set differently
+each round, from a fresh `sigma_t`) BANNED outright once a second,
+independent localization narrows the intersection of suspect groups down to
+just the cheater -- pure set arithmetic over F7f's own disclosures, see
+`fl/suspect_tracker.py`'s docstring. If it is not banned by the end, the
+per-round printout below should still show it being quarantined at least
+once; report that printout back either way."""),
+    ("code", """from fl.suspect_tracker import SuspectTracker
+
+GATE_E_ROUNDS = 5
+GATE_E_CLIENTS = 9   # SMOKE_CLIENTS(8) + 1: quarantining the cheater must still leave k_min=8 eligible
+CHEATER_IDX = 5
+
+_model_name = MODELS_TO_RUN[0]
+_model = models[_model_name]
+_dim = flat_weights[_model_name].numel()
+
+root_norms_e = bootstrap_norms_from_model_dim(
+    model_dim=_dim,
+    sketch_dim=CFG['sketch']['m'],
+    sketch_seed=b"bootstrap-gate-e",
+    quant_bits=16,
+    rng=np.random.default_rng(CFG['seed'] + 1),
+)
+
+tracker = SuspectTracker(quarantine_rounds=1)
+
+final_w_t_e, history_e = run_training_loop(
+    model=_model,
+    model_dim=_dim,
+    client_datasets=case2_data['client_train'][:GATE_E_CLIENTS],
+    ring=ring[:GATE_E_CLIENTS],
+    client_sks=client_sks[:GATE_E_CLIENTS],
+    pairwise_secrets={i: {j: pairwise_secrets[i][j] for j in range(GATE_E_CLIENTS) if j != i} for i in range(GATE_E_CLIENTS)},
+    pk_trace=PK_trace,
+    server_root_norms=root_norms_e,
+    CFG=CFG,
+    rounds=GATE_E_ROUNDS,
+    suspect_tracker=tracker,
+    cheater_client_idx=CHEATER_IDX,
+)
+release_gpu_memory()
+
+print("\\nper-round summary:")
+ever_flagged = False
+for h in history_e:
+    tag = "ABORTED" if h.get("aborted") else "ok"
+    groups = h.get("f7e_suspect_groups") or []
+    if any(CHEATER_IDX in g for g in groups):
+        ever_flagged = True
+    print(f"  round {h.get('round')}: {tag}, f7e_passed={h.get('f7e_passed')}, suspect_groups={groups}")
+
+print(f"\\nfinal tracker state: banned={sorted(tracker.banned)}, quarantined={tracker.quarantined}")
+if CHEATER_IDX in tracker.banned:
+    print(f"PASS: cheater {CHEATER_IDX} was banned by round {GATE_E_ROUNDS - 1}.")
+elif ever_flagged or CHEATER_IDX in tracker.quarantined:
+    print(f"PARTIAL: cheater {CHEATER_IDX} was caught/quarantined at least once but not yet banned "
+          f"-- report the per-round summary above as-is, this may just need more rounds.")
+else:
+    print(f"FAIL: cheater {CHEATER_IDX} was never caught at all -- report the per-round summary above.")"""),
+
     ("md", """## If something fails
 
 Send the full output and traceback. Most useful, whichever cell broke:
@@ -914,11 +998,12 @@ Send the full output and traceback. Most useful, whichever cell broke:
 4. for Gate B/C: the per-round `timing:` lines and the `accepted=.../V5=.../F7e=...`
    lines verbatim, plus `RSS before/after`
 5. for a `F7e=FAIL` or an abort: the `F7e suspect groups:` line
+6. for Gate E: the full per-round summary and the final tracker state line,
+   whatever the PASS/PARTIAL/FAIL verdict says
 
-What I already know is NOT yet covered, so no need to report it as a surprise:
-F7e's blinding sums are reconstructed from pairwise-masked vectors with no
-self-mask, so a client dropping out *after* acceptance makes that round's F7e
-check un-runnable (`f7e_passed: None`) rather than failing it. See FIX.md F7e."""),
+What this notebook does NOT yet cover, so no need to report it as a surprise:
+F7f's bisection still runs synchronously inside one `run_round` call rather
+than as real separate protocol rounds (see FIX.md F7's \"still open\" list)."""),
 ]
 
 

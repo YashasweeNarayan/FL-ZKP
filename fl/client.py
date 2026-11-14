@@ -493,6 +493,7 @@ def round_step_phase2(
     vrf_alpha: bytes,
     n_tests: int = 8,
     _secret_q_override: np.ndarray | None = None,
+    _cheat_zero_sketch: bool = False,
 ) -> ClientSubmissionPhase2:
     """Steps 8-10, run AFTER the server reveals sigma_t.
 
@@ -540,6 +541,23 @@ def round_step_phase2(
     `sketch_phase1_batch`. Leave as `None` for the real per-client
     cost -- this builds and uses its own `TorchSketchProjector` exactly
     as before.
+
+    `_cheat_zero_sketch`: ATTACK SIMULATION ONLY, never set by an honest
+    client and never set by anything in this function's own control
+    flow -- a caller (e.g. `fl/round_loop.py`'s `cheater_client_idx`,
+    used only by the F7e/F7f Colab demonstration notebook) opts one
+    designated client into this to reproduce FIX.md F7's "lying sketch"
+    cheat on REAL crypto/REAL local training, the same cheat
+    `tests/test_f7e_aggregate.py::_build_round(cheat="lying_sketch")`
+    exercises by hand: everything below this point sketches the ZERO
+    vector instead of the real `signed_q`, while `phase1`'s masked
+    vector (already built, in a separate call, before this function
+    ever runs) still carries the real update untouched. V1-V5 all
+    still pass -- only F7e's cross-client aggregate check can tell the
+    two apart. Leave False for every real round; this exists so F7e/F7f
+    (and, downstream, `fl/suspect_tracker.py`) have something to catch
+    when exercised end to end, since no honest round ever produces
+    this on its own.
     """
     secret_q = _secret_q_override if _secret_q_override is not None else phase1._secret_q
     if secret_q is None:
@@ -552,6 +570,14 @@ def round_step_phase2(
     signed_q = center_mod_p_mask(secret_q).astype(np.int64)
     sketch = TorchSketchProjector(seed=sketch_seed, m=sketch_dim, d=ctx.model_dim)
     y_k = sketch.project_int(signed_q)  # exact integers (FIX.md F7b), not the float estimate
+    if _cheat_zero_sketch:
+        # ATTACK SIMULATION ONLY -- see this function's docstring. Every
+        # remaining line below (commitment, square proofs, wraparound
+        # tests) operates on this fake y_k, not the real one, which is
+        # exactly what makes the cheat internally self-consistent (and
+        # exactly why only F7e, comparing against the server's OWN
+        # recomputed true aggregate sketch, catches it).
+        y_k = np.zeros_like(y_k)
 
     transcript = b"norm_proof:" + phase1.commitment_point.b
     sketch_commitment, y_blindings, sq_blindings = commit_sketch(list(int(v) for v in y_k), transcript)
