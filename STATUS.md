@@ -65,7 +65,7 @@ reset).
 
 ## attacks/ and verifier/
 
-Each is a thin, direct exercise of already-listed EC-dependent crypto calls (no new primitives), written to assert the SPECIFIC defense ARCHITECTURE.md's Table in §10 claims for that attack. **🟢 DRY-RUN CONFIRMED on the pure-Python EC test backend, 2026-11-15** (all 8 `run_attack*` variants across A1/A3/A4/A5/A7, all `defense_triggered=True` — see the fifteenth-bug entry below for the one real bug this caught, F10). **🟡 Still NOT run against real `rbcl`/libsodium** — `notebooks/RUN_ATTACKS.ipynb` exists and is ready for that, but hasn't been executed on Colab yet. Don't trust the attack-rejection numbers in any figure until that real-crypto run confirms the same result.
+Each is a thin, direct exercise of already-listed EC-dependent crypto calls (no new primitives), written to assert the SPECIFIC defense ARCHITECTURE.md's Table in §10 claims for that attack. **🟢 CONFIRMED on real Colab with real `rbcl`, 2026-11-15**: all 8 `run_attack*` variants across A1/A3/A4/A5/A7, all `defense_triggered=True` (preceded by the same result on the pure-Python EC test backend, which caught one real bug first — F10). **🟡 Still open**: this confirms each defense primitive in isolation (hand-crafted inputs, no honest co-participants, no real round around it) -- NOT the stronger claim "caught during real federated training," which is what A1/A3/A4/A5 (the per-round attacks; A7 is correctly out-of-band, see FIX.md F10) still need, injected into a real `run_training_loop` call the same way the F7e cheater demo (Gate D/E) already proved out. Not started yet.
 
 ## Gate 1 — PASSED (2026-11-11, Colab)
 
