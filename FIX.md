@@ -1081,6 +1081,65 @@ is actually exercised rather than passing because both sides happen to say 8.
 - **Notes for the paper**: none -- this is scaffolding for producing a
   result, not part of the protocol itself; doesn't belong in the paper.
 
+## Model choice corrected: tiny_cnn replaces resnet18 for the first real result (2026-11-15)
+
+- **What was wrong**: the first real (non-smoke) Colab run of
+  `notebooks/RUN_MVP_RESNET18_MNIST.ipynb` (resnet18, n_clients=50,
+  20 rounds planned) showed `n_clients=50` accepted every round at
+  ~85-87s/client, ~71-73 min/round -- not the ~13 active clients/round
+  and ~11.5 min/round the scope-cut plan assumed. Root cause: this
+  implementation's `sampling_rate` (`fl/client.py::round_step_phase1`,
+  step 0/1, VRF self-sampling `b_k`) only decides whether a client
+  trains on its real local data or contributes a zero delta -- it does
+  NOT exempt non-selected clients from masking, sketching, range-proofs,
+  or verification. Every one of n_clients pays the full crypto cost
+  every round regardless of sampling_rate. (This is a real design
+  property of the protocol as implemented, not a bug -- ARCHITECTURE.md
+  never claimed otherwise; the plan's time-budget math simply assumed
+  something the code doesn't do, and nobody checked `round_step_phase1`
+  against that assumption before estimating. Flagging the assumption
+  error here rather than silently revising the estimate.) Real cost:
+  ~24h for 20 rounds at resnet18's 11.2M params, not ~3.8h.
+- **Second finding, same investigation**: a literature check across
+  recent privacy-preserving/anonymous FL papers (not plain-FedAvg
+  scalability papers) -- specifically WhiteCloak (NDSS 2026, solving
+  the same anonymous-accountability-in-secure-aggregation problem as
+  this repo's F7f/SuspectTracker) and PQS-BFL (2025, post-quantum
+  blockchain FL) -- found every one of them deliberately uses a SMALL
+  model (19K-818K params across both papers' four+ configs), precisely
+  so the measured per-round cost is the crypto's, not the model's.
+  resnet18 (11.2M params) is ~500x bigger than WhiteCloak's MNIST CNN
+  (19K params) and ~500x bigger than PQS-BFL's MNIST CNN (~21.8K
+  params) -- two independent papers converging on the same ~20K-param
+  scale for MNIST specifically. Since mask generation, sketching, and
+  range proofs are all O(model_dim) (same reason `build_resnet18`'s own
+  docstring gives for preferring it over resnet50), resnet18's size is
+  the dominant driver of the ~72min/round cost, not an implementation
+  inefficiency.
+- **Fix**: `fl/models.py` gained `build_tiny_cnn(num_classes,
+  in_channels)` -- conv(1->16,3x3)-GroupNorm-ReLU-maxpool ->
+  conv(16->32,3x3)-GroupNorm-ReLU-maxpool -> flatten -> linear, ~20.6K
+  params for MNIST (num_classes=10), landing directly between
+  WhiteCloak's 19K and PQS-BFL's 21.8K -- sized to match the cited
+  precedent, not arbitrary. Added to `MVP_MODEL_BUILDERS` as
+  `"tiny_cnn"` (distinct from the existing `build_tiny_debug_model`,
+  which is explicitly NOT a real backbone and stays excluded from
+  `MVP_MODEL_BUILDERS` -- this is a real model meant to appear in the
+  paper). `notebooks/RUN_MVP_RESNET18_MNIST.ipynb` renamed to
+  `RUN_MVP_TINY_CNN_MNIST.ipynb` and its model-build cell switched from
+  `REAL_MODEL = 'resnet18'` to `REAL_MODEL = 'tiny_cnn'`; every other
+  cell (data load, ring/DKG, checkpointing, round count) is unchanged,
+  since `REAL_MODEL` is read generically throughout.
+- **Checks**: `python3 -m py_compile fl/models.py` clean; full local
+  pure-Python suite rerun, unaffected (113 passed, 5 skipped -- same as
+  before, `build_tiny_cnn` is TORCH-DEPENDENT like every other model
+  builder in this file and not exercised in this sandbox). Not yet run
+  on real Colab -- flagging as untested-on-real-infra, not proven.
+- **Notes for the paper**: the model-scale choice (and its citation
+  anchor: WhiteCloak NDSS'26, PQS-BFL 2025, both landing at ~19-22K
+  params on MNIST independently) belongs in the Evaluation Setup
+  section as the justification for not using a larger backbone.
+
 ## F8 — ristretto255 bindings: wrong library entirely, not a version problem
 
 **Status: FIXED, CONFIRMED ON COLAB (2026-11-13).** `rbcl` imports and its

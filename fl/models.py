@@ -155,10 +155,57 @@ def build_tiny_debug_model(num_classes: int, in_channels: int = 1):
     )
 
 
+def build_tiny_cnn(num_classes: int, in_channels: int = 1):
+    """A small real CNN (NOT the wiring-smoke-test `build_tiny_debug_model`
+    above -- this one is meant to go in the paper), 2026-11-15, added to
+    match the model scale this paper's actual peer group uses, not
+    ResNet-18/50-scale backbones: a literature check across recent
+    accountable/anonymous secure-aggregation FL papers (not plain-FedAvg
+    scalability papers) found every one of them deliberately uses a
+    SMALL model (so the measured cost is the crypto's, not the model's),
+    with MNIST specifically landing at ~19-22K params in TWO independent,
+    recent papers -- WhiteCloak (NDSS 2026, the closest peer: anonymous
+    accountability in secure aggregation, same problem as this repo's
+    F7f/SuspectTracker) uses a 19K-param CNN on MNIST; PQS-BFL (2025,
+    post-quantum blockchain FL) independently lands on a ~21.8K-param
+    LeNet-style CNN on MNIST. Two unrelated groups converging on the
+    same scale for the same dataset is as strong a citation anchor as
+    this sub-field offers -- so this model is sized to land in that same
+    band, not chosen arbitrarily.
+
+    Architecture: conv(1->16,3x3)-GroupNorm-ReLU-maxpool(2x2) ->
+    conv(16->32,3x3)-GroupNorm-ReLU-maxpool(2x2) -> flatten -> linear(->num_classes).
+    For MNIST (28x28x1 in, num_classes=10): conv1 160 + conv2 4640 +
+    GroupNorm 96 + fc (32*7*7=1568 -> 10) 15690 = ~20.6K params --
+    landing directly between WhiteCloak's 19K and PQS-BFL's 21.8K.
+    GroupNorm kept (not BatchNorm) for the same cross-client-statistic
+    reason as every other builder in this file, even though this run is
+    IID MNIST and wouldn't itself expose the non-IID BatchNorm failure
+    mode -- consistency with the rest of this file's models, not a new
+    requirement for this one.
+    """
+    _require_torch()
+    import torch.nn as nn
+
+    return nn.Sequential(
+        nn.Conv2d(in_channels, 16, kernel_size=3, padding=1),
+        nn.GroupNorm(4, 16),
+        nn.ReLU(inplace=True),
+        nn.MaxPool2d(2),  # 28x28 -> 14x14
+        nn.Conv2d(16, 32, kernel_size=3, padding=1),
+        nn.GroupNorm(8, 32),
+        nn.ReLU(inplace=True),
+        nn.MaxPool2d(2),  # 14x14 -> 7x7
+        nn.Flatten(),
+        nn.Linear(32 * 7 * 7, num_classes),
+    )
+
+
 MVP_MODEL_BUILDERS = {
     "resnet18": build_resnet18,
     "resnet50": build_resnet50,  # kept for the later large-model scalability ablation, see build_resnet18's docstring
     "mobilenet_v2": build_mobilenet_v2,
+    "tiny_cnn": build_tiny_cnn,  # 2026-11-15: matches WhiteCloak/PQS-BFL's MNIST model scale, see build_tiny_cnn's docstring
     # "efficientnet_b0" intentionally omitted -- see module docstring
     # and ROADMAP.md §0.1's 3-day scope cut.
 }
