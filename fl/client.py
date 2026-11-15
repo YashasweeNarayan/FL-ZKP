@@ -351,7 +351,44 @@ def round_step_phase1(
         delta = np.zeros(ctx.model_dim, dtype=np.float64)
 
     # Step 2: DP noise share.
-    noise_shares = split_noise(sigma_dp, n_shares=1, dim=ctx.model_dim, rng=np.random.default_rng())
+    #
+    # FIX.md (2026-11-15, found from a real Colab run stuck at ~15%
+    # MNIST accuracy after 12 rounds of otherwise-clean training --
+    # every round accepted=50/50, V5=PASS, F7e=PASS, aggregate=EXACT,
+    # so the bug is in what gets aggregated, not whether the crypto
+    # checks pass): ARCHITECTURE.md §4 step 2 specifies
+    # "nu_k <- share of distributed Gaussian noise (sigma_DP / sqrt(p*n))"
+    # -- each client's OWN noise share should already be scaled down by
+    # sqrt(p*n) (p=sampling_rate, n=n_clients) so that, once ~p*n
+    # clients' shares are summed during aggregation, the TOTAL injected
+    # noise lands at the configured aggregate sigma_DP, not at
+    # sigma_DP again per client. This call previously passed
+    # `sigma_dp` straight into `split_noise` with `n_shares=1`, which
+    # (per split_noise's own docstring: "each share is
+    # N(0, total_sigma^2/n_shares)") computes `per_share_sigma =
+    # sigma_dp/sqrt(1) = sigma_dp` -- i.e. EVERY client independently
+    # added a FULL sigma_dp=2.5-std draw per coordinate, not a
+    # sqrt(p*n)-times-smaller share of it. Since every client (sampled
+    # or not, per Step 1's "train or contribute zero") adds this noise
+    # unconditionally, summing it across n_clients accepted submissions
+    # inflates the AGGREGATE noise to roughly sqrt(n_clients) times the
+    # intended sigma_dp -- for n_clients=50, ~7.07x too large --
+    # swamping real per-coordinate gradient magnitudes (~1e-2 to 1,
+    # per quantize()'s own docstring) well before averaging. V5/F7e
+    # stay PASS throughout because they check that the committed,
+    # masked, (correctly-or-not) noised vector is internally consistent
+    # -- never whether the noise magnitude itself is sane; this is an
+    # ML-validity bug, not a crypto-correctness one, same category as
+    # FIX.md F6's local-training-realism fix.
+    #
+    # Fix: scale down to the PER-CLIENT target sigma from
+    # ARCHITECTURE.md's own formula before calling split_noise, and
+    # ask split_noise for exactly `n_shares=1` draw AT that already-
+    # scaled sigma (not conflating "how many shares to generate" with
+    # "the sqrt(p*n) scaling factor" -- those are two different things
+    # split_noise's own parameters happened to let collide here).
+    per_client_sigma = sigma_dp / np.sqrt(max(sampling_rate * n_clients, 1e-9))
+    noise_shares = split_noise(per_client_sigma, n_shares=1, dim=ctx.model_dim, rng=np.random.default_rng())
     nu_k = noise_shares[0]
 
     # Step 3: quantize.

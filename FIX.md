@@ -1266,3 +1266,87 @@ updated to match. **Not yet run on Colab** — the actual import of `rbcl`
 and every group operation built on it needs that run before any of F1/F2/
 F4/F5's Colab confirmation can proceed again, since all of them sit on top
 of this module.
+
+## F9 — DP noise scaled per-aggregate, applied per-client (ML-validity, not crypto-correctness)
+
+**Symptom (real Colab run, 2026-11-15).** `tiny_cnn` on MNIST, `n_clients=50`,
+`sampling_rate=0.25`, 12 real rounds completed. Every single round reported
+clean crypto: `accepted=50/50, V5=PASS, F7e=PASS, aggregate=EXACT`. Despite
+that, evaluating the resulting checkpoint gave:
+
+```
+tiny_cnn @ round 11: official MNIST test accuracy = 0.1538 (10000 images)
+tiny_cnn @ round 11: held-out global_val accuracy = 0.1669 (2499 images)
+```
+
+~15% on a 10-class problem is barely above the 10% random-guess floor —
+after 12 rounds of real FedAvg-style training this should already be well
+above 90%. Since every crypto check passed every round, the bug had to be
+in what the checks were validating, not in whether they ran.
+
+**Root cause.** `fl/client.py::round_step_phase1`, Step 2 (DP noise share):
+
+```python
+noise_shares = split_noise(sigma_dp, n_shares=1, dim=ctx.model_dim, rng=np.random.default_rng())
+nu_k = noise_shares[0]
+```
+
+`ARCHITECTURE.md` §4 step 2 specifies the per-client share as
+`ν_k ← σ_DP / √(p·n)` (p = sampling_rate, n = n_clients) — i.e. each
+client's own noise draw is supposed to already be shrunk by `√(p·n)`, so
+that once the ~p·n sampled clients' shares are summed during aggregation,
+the *aggregate* injected noise lands back at the configured `σ_DP`.
+
+The code instead called `split_noise(sigma_dp, n_shares=1, ...)`.
+`crypto/dp.py::split_noise`'s own contract (`per_share_sigma = total_sigma
+/ √n_shares`) means `n_shares=1` applies no scaling at all — every client
+added a *full* `σ_DP=2.5`-std draw per coordinate, independently, every
+round, regardless of whether it was VRF-sampled to train on real data in
+Step 1. Summing that over `n_clients=50` accepted submissions before the
+server's FedAvg mean-division inflates the aggregate noise to roughly
+`√50 ≈ 7.07x` the intended `σ_DP` — a per-coordinate noise std around the
+2.5 raw / ~0.35 post-mean-division range, which is comparable to or larger
+than real per-coordinate gradient magnitudes (`quantize()`'s own docstring
+puts typical deltas in the ~1e-2 to 1 range). That is consistent with the
+observed near-random accuracy: the signal was being drowned by noise, not
+corrupted or dropped by the crypto pipeline.
+
+This is an **ML-validity bug**, not a crypto-correctness bug — same
+category as F6 (local-training realism). `tests/test_dp.py` only exercises
+`split_noise` and `RDPAccountant` directly and confirms `split_noise`
+itself behaves exactly as documented; `round_step_phase1` (where the bug
+actually lived) is torch-dependent and has never been exercised by the
+local pure-Python test suite, which is why 113 passing local tests never
+caught this — it required a real multi-round accuracy evaluation on Colab
+to surface.
+
+**Fix.** Compute the correctly-scaled per-client sigma from
+`ARCHITECTURE.md`'s own formula before calling `split_noise`:
+
+```python
+per_client_sigma = sigma_dp / np.sqrt(max(sampling_rate * n_clients, 1e-9))
+noise_shares = split_noise(per_client_sigma, n_shares=1, dim=ctx.model_dim, rng=np.random.default_rng())
+nu_k = noise_shares[0]
+```
+
+`sampling_rate` and `n_clients` were already in-scope parameters of
+`round_step_phase1` — no new plumbing needed. The `max(..., 1e-9)` guards
+against division by zero if either is misconfigured to 0.
+
+**Checks.** Full local suite re-run after the fix: 113 passed, 5 skipped —
+unchanged, because (as above) this code path isn't reachable from the
+local, torch-free test suite. No regression possible to detect locally;
+the real confirmation has to come from a fresh Colab run.
+
+**Honestly incomplete / notes for the paper.** This fix has **not yet been
+confirmed on Colab** — that is the immediate next step. The first 12
+rounds of the run that surfaced this bug trained under the *wrong*,
+over-noised DP mechanism; that checkpoint is likely not meaningfully
+better than random initialization and should not be treated as a valid
+partial result or cited in any figure. The paper's privacy-utility
+tradeoff numbers (accuracy vs. ε) must be collected only from a run
+started fresh with this fix in place, not resumed from the buggy
+checkpoint. The fix does not change `crypto/dp.py::RDPAccountant`'s
+ε accounting math — only how `sigma_dp` is divided between clients before
+the noise is drawn — so privacy budget numbers already reported are
+unaffected; only the realized model utility at a given budget was wrong.
