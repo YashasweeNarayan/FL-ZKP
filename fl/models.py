@@ -124,6 +124,104 @@ def build_mobilenet_v2(num_classes: int, in_channels: int = 1):
     return model
 
 
+def build_small_resnet(num_classes: int, in_channels: int = 1):
+    """A small residual network (~263K params for MNIST/10-class),
+    2026-11-15, added as the SECOND backbone -- replacing
+    `mobilenet_v2` in `MVP_MODEL_BUILDERS` -- for the same reason
+    `build_tiny_cnn` replaced `resnet18`: matching this paper's actual
+    peer group's model scale, not an arbitrary size.
+
+    Specifically anchored to WhiteCloak (NDSS 2026, this repo's closest
+    peer -- same anonymous-accountability-in-secure-aggregation problem
+    as F7f/SuspectTracker)'s OWN second model: their CIFAR-10-L config
+    uses a ResNet at 273K parameters (WhiteCloak Table II / Section
+    VIII). This builder lands at ~263K for MNIST (num_classes=10), within ~4%
+    of that number -- not a different paper's unrelated size, but the
+    *same* paper's own second configuration. Combined with
+    `build_tiny_cnn` (~20.6K, anchored to WhiteCloak's MNIST CNN at 19K
+    and PQS-BFL's MNIST CNN at ~21.8K), this repo's two MVP backbones
+    now mirror WhiteCloak's own two reported model sizes end to end --
+    a stronger citation story than defending two unrelated choices
+    against two different papers.
+
+    Why a residual network specifically, not just "something at 263K
+    params": `build_tiny_cnn` is a plain CNN, so pairing it with another
+    plain CNN would only vary SIZE, not architecture family. A model
+    with real residual (skip) connections demonstrates the protocol
+    works across architecture classes, not just across parameter
+    counts -- which is what ROADMAP.md §0.1's "2 backbones" was for.
+
+    Architecture (GroupNorm throughout, not BatchNorm, same reasoning
+    as every other builder in this file -- see module docstring):
+    stem conv(in->32,3x3) -> residual block (32->32, two 3x3 convs) ->
+    maxpool(2x2) -> residual block (32->64, 1x1 projection on the skip
+    path since channels change) -> maxpool(2x2) -> residual block
+    (64->112, 1x1 projection) -> global average pool -> linear(->num_classes).
+    For MNIST (28x28x1 in, num_classes=10): stem 384 + block1 18,624 +
+    block2 57,792 + block3 185,248 + head 1,130 = ~263K.
+    """
+    _require_torch()
+    import torch
+    import torch.nn as nn
+
+    def groupnorm(channels, max_groups=8):
+        g = max_groups
+        while channels % g != 0 and g > 1:
+            g -= 1
+        return nn.GroupNorm(g, channels)
+
+    class ResidualBlock(nn.Module):
+        """Two 3x3 convs + GroupNorm on the main path; a 1x1 conv on
+        the skip path only when in_ch != out_ch (so the add is always
+        shape-valid), matching the standard ResNet basic-block pattern
+        this repo already follows for resnet18/resnet50 (just built by
+        hand here instead of via torchvision, since torchvision has no
+        "tiny ResNet" preset at this param scale)."""
+
+        def __init__(self, in_ch, out_ch):
+            super().__init__()
+            self.conv_a = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
+            self.gn_a = groupnorm(out_ch)
+            self.conv_b = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1)
+            self.gn_b = groupnorm(out_ch)
+            self.relu = nn.ReLU(inplace=True)
+            self.proj = None if in_ch == out_ch else nn.Conv2d(in_ch, out_ch, kernel_size=1)
+
+        def forward(self, x):
+            skip = x if self.proj is None else self.proj(x)
+            out = self.relu(self.gn_a(self.conv_a(x)))
+            out = self.gn_b(self.conv_b(out))
+            return self.relu(out + skip)
+
+    class SmallResNet(nn.Module):
+        def __init__(self, in_channels, num_classes):
+            super().__init__()
+            self.stem = nn.Sequential(
+                nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
+                groupnorm(32),
+                nn.ReLU(inplace=True),
+            )
+            self.block1 = ResidualBlock(32, 32)
+            self.pool1 = nn.MaxPool2d(2)   # 28x28 -> 14x14
+            self.block2 = ResidualBlock(32, 64)
+            self.pool2 = nn.MaxPool2d(2)   # 14x14 -> 7x7
+            self.block3 = ResidualBlock(64, 112)
+            self.head = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Linear(112, num_classes),
+            )
+
+        def forward(self, x):
+            x = self.stem(x)
+            x = self.pool1(self.block1(x))
+            x = self.pool2(self.block2(x))
+            x = self.block3(x)
+            return self.head(x)
+
+    return SmallResNet(in_channels, num_classes)
+
+
 def build_tiny_debug_model(num_classes: int, in_channels: int = 1):
     """A tiny (~8K-param) single-linear-layer model for validating the
     ROUND-LOOP WIRING (fl/round_loop.py) quickly -- NOT a real MVP
@@ -204,8 +302,14 @@ def build_tiny_cnn(num_classes: int, in_channels: int = 1):
 MVP_MODEL_BUILDERS = {
     "resnet18": build_resnet18,
     "resnet50": build_resnet50,  # kept for the later large-model scalability ablation, see build_resnet18's docstring
-    "mobilenet_v2": build_mobilenet_v2,
-    "tiny_cnn": build_tiny_cnn,  # 2026-11-15: matches WhiteCloak/PQS-BFL's MNIST model scale, see build_tiny_cnn's docstring
+    "tiny_cnn": build_tiny_cnn,  # 2026-11-15: matches WhiteCloak/PQS-BFL's MNIST CNN scale (19K/~21.8K), see build_tiny_cnn's docstring
+    "small_resnet": build_small_resnet,  # 2026-11-15: replaces mobilenet_v2, matches WhiteCloak's CIFAR-10-L ResNet scale (273K), see build_small_resnet's docstring
+    # "mobilenet_v2" removed from the MVP set (2026-11-15) -- no
+    # comparable paper in this sub-field uses it, and standard
+    # mobilenet_v2 is ~2-2.5M params, ~8-35x bigger than any model this
+    # paper's peer group actually reports. build_mobilenet_v2 itself is
+    # kept below, just not registered as a current MVP backbone -- same
+    # treatment as resnet50 above.
     # "efficientnet_b0" intentionally omitted -- see module docstring
     # and ROADMAP.md §0.1's 3-day scope cut.
 }

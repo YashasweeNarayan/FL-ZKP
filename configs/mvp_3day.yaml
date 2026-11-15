@@ -16,10 +16,16 @@ mvp_scope:
   rounds_per_run: 45         # cut from 120-150 (ROADMAP.md §0.1)
   n_seeds: 1                 # cut from 3
   models:
-    - resnet18                # swapped from resnet50 2026-11-13: FL-benchmark convention, and
-                               # ~47% of resnet50's model_dim -- see fl/models.py build_resnet18
-                               # docstring and FIX.md. resnet50 kept as a later scalability ablation.
-    - mobilenet_v2           # efficientnet_b0 intentionally dropped, see fl/models.py
+    - tiny_cnn                # swapped from resnet18 2026-11-15: resnet18 (11.2M params) is ~500x
+                               # bigger than any model this paper's actual peer group (anonymous/
+                               # accountable secure-aggregation FL) reports -- WhiteCloak (NDSS'26)
+                               # and PQS-BFL (2025) both land at ~19-22K params for MNIST. tiny_cnn
+                               # (~20.6K) matches that; see fl/models.py build_tiny_cnn docstring
+                               # and FIX.md/STATUS.md 2026-11-15 entries.
+    - small_resnet            # swapped from mobilenet_v2 2026-11-15: matches WhiteCloak's own
+                               # second reported model (CIFAR-10-L ResNet, 273K params) instead of
+                               # an unrelated-scale backbone -- see fl/models.py build_small_resnet
+                               # docstring. efficientnet_b0 intentionally dropped, see fl/models.py.
   attacks:                   # cut from 7 to 5 (A2, A6 deferred -- compute-heavy, orthogonal to crypto claims)
     - a1_scaling
     - a3_sybil

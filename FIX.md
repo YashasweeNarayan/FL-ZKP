@@ -1140,6 +1140,43 @@ is actually exercised rather than passing because both sides happen to say 8.
   params on MNIST independently) belongs in the Evaluation Setup
   section as the justification for not using a larger backbone.
 
+## Second backbone: small_resnet replaces mobilenet_v2 (2026-11-15)
+
+- **Why**: same reasoning as the resnet18 -> tiny_cnn swap above.
+  Standard `mobilenet_v2` with a 10-class head is ~2-2.5M params --
+  8-35x bigger than any model this paper's actual peer group reports,
+  and no comparable paper (WhiteCloak, PQS-BFL, AFLBCRS, AIFL) uses
+  mobilenet_v2 at all, so there was no literature precedent to defend
+  it with regardless of size.
+- **Fix**: `fl/models.py` gains `build_small_resnet` (~263K params for
+  MNIST/10-class) -- a hand-built residual network (3 residual blocks,
+  GroupNorm, 1x1 projection on the skip path where channels change,
+  global-average-pool head; torchvision has no "tiny ResNet" preset at
+  this scale, so this is built directly with `nn.Module`, not adapted
+  from a torchvision model like every other builder in this file).
+  Anchored specifically to WhiteCloak's OWN second reported model
+  (CIFAR-10-L: a ResNet at 273K parameters) -- landing within ~4% of
+  that number, not an unrelated size. Combined with `build_tiny_cnn`
+  (~20.6K, anchored to WhiteCloak's MNIST CNN at 19K), this repo's two
+  MVP backbones now mirror WhiteCloak's own two reported model sizes
+  end to end, rather than defending two separately-chosen sizes.
+  `MVP_MODEL_BUILDERS` updated: `"mobilenet_v2"` removed,
+  `"small_resnet"` added (`build_mobilenet_v2` itself is untouched,
+  just no longer registered -- same treatment `build_resnet50` already
+  gets as a kept-but-unused later ablation). `configs/mvp_3day.yaml`'s
+  `mvp_scope.models` updated to `[tiny_cnn, small_resnet]`.
+- **Checks**: `python3 -m py_compile fl/models.py` clean; `yaml.safe_load`
+  on the config confirms it parses; `fl.models.MVP_MODEL_BUILDERS` keys
+  confirmed as `['resnet18', 'resnet50', 'tiny_cnn', 'small_resnet']`
+  (import-only check -- `_require_torch()` isn't triggered by importing
+  the dict, only by calling a builder, so this doesn't itself prove the
+  forward pass runs). Full local pure-Python suite unaffected: 113
+  passed, 5 skipped. Not yet run on real Colab -- `build_small_resnet`
+  is TORCH-DEPENDENT like every other builder in this file.
+- **Notes for the paper**: same note as the tiny_cnn entry above --
+  this model-scale choice and its citation anchor belong in the
+  Evaluation Setup section.
+
 ## F8 — ristretto255 bindings: wrong library entirely, not a version problem
 
 **Status: FIXED, CONFIRMED ON COLAB (2026-11-13).** `rbcl` imports and its

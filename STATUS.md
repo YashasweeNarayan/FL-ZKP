@@ -168,6 +168,8 @@ Still open: the timing breakdown (why resnet50 at 8 clients took ~40 min wall ti
 
 Still open, flagged but not addressed: ROADMAP's "2 arms [baseline, JANUS-FL]" comparison has no baseline (no-crypto) arm implemented anywhere in the codebase yet -- only the full JANUS-FL crypto path exists.
 
+**Second backbone swapped too, same day:** `mobilenet_v2` (~2-2.5M params, no precedent in this sub-field) replaced by `fl/models.py::build_small_resnet` (~263K params, hand-built residual network, anchored to WhiteCloak's own CIFAR-10-L ResNet at 273K -- see FIX.md for the full writeup). `MVP_MODEL_BUILDERS` and `configs/mvp_3day.yaml`'s `mvp_scope.models` both updated to `[tiny_cnn, small_resnet]`. The run notebook (`RUN_MVP_TINY_CNN_MNIST.ipynb`) doesn't need any code change to run `small_resnet` next -- every cell reads `REAL_MODEL` generically (including the checkpoint filename), so switching to the second backbone after the first finishes is just `REAL_MODEL = 'small_resnet'` in the model-build cell. Not yet run on real Colab.
+
 ## What is NOT cut, scope-wise (for context when reading the above)
 
 Per `ROADMAP.md` §0.1: all 13 crypto primitives, both circuit specifications, the full `R_cons` relation, the committee consent rule, double-masking, the mix cascade, and the V5 aggregation check are all present in this repo (as 🟡 or ✅ above) — none of the crypto/security surface was cut for the 3-day MVP, only the ML-scale parameters (2 backbones instead of 3, ~45 rounds instead of 120-150, 1 seed instead of 3, 5 attacks instead of 7).
