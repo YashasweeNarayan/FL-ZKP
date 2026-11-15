@@ -365,10 +365,6 @@ def round_step_phase1(
 
     if _force_delta is not None:
         delta = _force_delta  # ATTACK SIMULATION ONLY -- see this function's docstring.
-        import os as _os  # TEMPORARY DEBUG (2026-11-15, investigating A1-gate finding) -- remove after diagnosis
-        if _os.environ.get("JANUS_DEBUG_V3"):
-            print(f"    [FORCE_DELTA DEBUG] client {ctx.keys.index}: override applied, "
-                  f"delta norm={np.linalg.norm(delta):.3e}, b_k_was={b_k}")
 
     # Step 2: DP noise share.
     #
