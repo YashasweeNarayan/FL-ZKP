@@ -514,7 +514,21 @@ def run_training_loop(
                     ctx_by_client[client_idx], phase1_by_client[client_idx],
                     sigma_t, sketch_m, threshold.B_t, rho_t, rho_e, vrf_alpha,
                     _secret_q_override=store.get(("q", client_idx)),
-                    _cheat_zero_sketch=(client_idx == cheater_client_idx),
+                    # FIX.md F11 (2026-11-15): this used to fire unconditionally
+                    # for cheater_client_idx -- fine for the original F7e/F7f
+                    # "lying zero sketch" demo (Gate D/E), wrong once
+                    # cheater_force_delta exists for a DIFFERENT attack (A1):
+                    # with both set, client 5 got a genuinely oversized masked
+                    # delta AND a lying zero sketch at once, so the sketch
+                    # commitment's v=0 regardless of how big cheater_force_delta
+                    # was -- V3 was never actually exercised against an
+                    # honestly-sketched oversized update, and the round only
+                    # ever failed via F7e's "sketch doesn't match the real
+                    # masked vector" cross-check, which is a different (true,
+                    # but not the intended) finding. Only cheat-zero-sketch
+                    # when no cheater_force_delta is given, so the two cheater
+                    # mechanisms stay independent.
+                    _cheat_zero_sketch=(client_idx == cheater_client_idx and cheater_force_delta is None),
                 )
             _t_phase2 = time.time() - _t_phase2_start
 
