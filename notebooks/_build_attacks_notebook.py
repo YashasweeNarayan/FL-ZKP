@@ -279,6 +279,117 @@ if n_caught < len(df):
     print(df[~df['defense_triggered']][['attack_name', 'detail']].to_string(index=False))
 """),
 
+("md", """## Gate — A1 injected into a REAL round, not tested in isolation
+
+Fair question raised after the first run of this notebook: every result
+above tests a defense primitive directly (a ring of keys, a DKG
+committee, hand-crafted inputs) -- it proves V3/V2/V1/V4/R_cons/the
+threshold/the mix cascade are each correct in isolation, but it is NOT
+the same claim as "JANUS-FL rejects this attack during real federated
+training." This gate closes that gap for A1: one malicious client, sitting
+among genuinely honest clients, inside a real multi-round `tiny_cnn`/MNIST
+`run_training_loop` call -- same pattern already proven once for the F7e
+cheater (`VERIFY_FIXES_F6_F7.ipynb`'s Gate E), extended here with a new
+`cheater_force_delta` parameter on `run_training_loop` (and `_force_delta`
+on `round_step_phase1`) that substitutes a crafted delta for one client's
+real trained delta while every other step of its submission -- ring
+signature, VRF, masking, sketching, the real range proof -- runs exactly
+as it would for an honest client.
+
+A3 (Sybil) and A4-replay are also genuinely per-round attacks and belong
+here too in a future pass; A4-false-claim and A5 are proof-forgery tests
+that the honest pipeline has no code path to produce on its own (there is
+no "lie about my VRF output" branch to inject into), so the isolated
+result above is already the right shape for those. A7 is correctly
+out-of-band (it targets `fl/trace.py`'s identity-opening protocol, which
+runs on accumulated evidence between rounds, not inside one) -- isolated
+testing is also already the right shape for it.
+"""),
+
+("code", """from fl.models import build_model, flatten_state_dict
+from fl.data_iid import prepare_case1
+from fl.round_loop import (
+    run_training_loop, bootstrap_norms_from_model_dim, release_gpu_memory,
+    build_x25519_keys, precompute_pairwise_secrets,
+)
+from attacks.a1_scaling import craft_scaled_update
+
+GATE_A1_CLIENTS = 9   # k_min(8) + 1, same reasoning as Gate E: quarantining/rejecting the attacker must still leave k_min eligible
+GATE_A1_ROUNDS = 3
+CHEATER_IDX = 5
+
+gate_a1_model = build_model('tiny_cnn', num_classes=10, in_channels=1)
+gate_a1_flat, _ = flatten_state_dict(gate_a1_model)
+gate_a1_dim = gate_a1_flat.numel()
+print("gate A1 model_dim:", gate_a1_dim)
+
+gate_a1_data = prepare_case1(seed=CFG['seed'], source="torchvision")
+
+gate_a1_sks = [Scalar.random() for _ in range(GATE_A1_CLIENTS)]
+gate_a1_ring = [scalar_mul_base(sk) for sk in gate_a1_sks]
+gate_a1_x25519_sks, gate_a1_x25519_pks = build_x25519_keys(GATE_A1_CLIENTS)
+gate_a1_pairwise_secrets = precompute_pairwise_secrets(gate_a1_x25519_sks, gate_a1_x25519_pks)
+
+# reuse the SAME committee (pk_trace) already established above -- it
+# doesn't depend on which clients participate, only on the key holders.
+gate_a1_root_norms = bootstrap_norms_from_model_dim(
+    model_dim=gate_a1_dim,
+    sketch_dim=CFG['sketch']['m'],
+    sketch_seed=b"bootstrap-gate-a1",
+    quant_bits=16,
+    rng=np.random.default_rng(CFG['seed'] + 2),
+)
+
+# craft the malicious delta ONCE, the same way the standalone A1 test
+# did: gamma*(w_target - w_t) against the model's actual initial weights,
+# far enough from a random target that it should never pass V3 regardless
+# of which round it's submitted in.
+w_target_gate = np.random.default_rng(CFG['seed']).normal(0, 1.0, size=gate_a1_dim)
+gate_a1_malicious_delta = craft_scaled_update(gate_a1_flat.numpy().astype(np.float64), w_target_gate)
+print("crafted malicious delta, raw norm:", np.linalg.norm(gate_a1_malicious_delta))
+"""),
+
+("code", """final_w_t_a1, history_a1 = run_training_loop(
+    model=gate_a1_model,
+    model_dim=gate_a1_dim,
+    client_datasets=gate_a1_data['client_train'][:GATE_A1_CLIENTS],
+    ring=gate_a1_ring,
+    client_sks=gate_a1_sks,
+    pairwise_secrets=gate_a1_pairwise_secrets,
+    pk_trace=pk_trace,
+    server_root_norms=gate_a1_root_norms,
+    CFG=CFG,
+    rounds=GATE_A1_ROUNDS,
+    cheater_client_idx=CHEATER_IDX,
+    cheater_force_delta=gate_a1_malicious_delta,
+)
+release_gpu_memory()
+
+print("\\nper-round summary:")
+cheater_ever_rejected = False
+cheater_ever_accepted = False
+for h in history_a1:
+    if h.get("aborted"):
+        print(f"  round {h.get('round')}: ABORTED -- {h.get('reason')}")
+        continue
+    reasons = h.get("rejected_reasons", {})
+    accepted_idxs = h.get("accepted_client_indices", [])
+    cheater_rejected_this_round = CHEATER_IDX in reasons
+    cheater_accepted_this_round = CHEATER_IDX in accepted_idxs
+    cheater_ever_rejected |= cheater_rejected_this_round
+    cheater_ever_accepted |= cheater_accepted_this_round
+    print(f"  round {h.get('round')}: accepted={h.get('accepted')}, "
+          f"cheater rejected={cheater_rejected_this_round} (reasons={reasons.get(CHEATER_IDX)}), "
+          f"aggregate_exact={h.get('aggregate_exact')}")
+
+if cheater_ever_accepted:
+    print(f"\\nFAIL: cheater {CHEATER_IDX}'s scaled update was accepted at least once -- a real defense failure, report this.")
+elif cheater_ever_rejected:
+    print(f"\\nPASS: cheater {CHEATER_IDX}'s scaled update was rejected by V3 every round it was eligible, while the round still completed normally for honest clients.")
+else:
+    print(f"\\nINCONCLUSIVE: cheater {CHEATER_IDX} was never sampled/eligible in any of these {GATE_A1_ROUNDS} rounds -- re-run with more rounds or check sampling_rate.")
+"""),
+
 ("md", "## Save the results table (optional, for the paper)"),
 
 ("code", """from google.colab import drive

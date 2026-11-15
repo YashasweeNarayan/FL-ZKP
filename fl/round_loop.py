@@ -288,6 +288,7 @@ def run_training_loop(
     spill_dir: str = None,
     suspect_tracker: "SuspectTracker" = None,  # FIX.md F7f: what happens to a suspect group. None -> fresh tracker (no history from a previous call to this function). Pass the SAME instance across multiple run_training_loop calls to keep ban/quarantine state across them.
     cheater_client_idx: int = None,  # ATTACK SIMULATION ONLY (FIX.md F7e/F7f Colab gate) -- see round_step_phase2's _cheat_zero_sketch docstring. Never set this for a real round. None -> no cheater, the honest default.
+    cheater_force_delta: "np.ndarray | None" = None,  # ATTACK SIMULATION ONLY (FIX.md F10's follow-up, attacks/a1_scaling.py run through a real round). Only takes effect when cheater_client_idx is also set -- that client's round_step_phase1 call gets _force_delta=cheater_force_delta instead of its real (trained-or-zero) delta, so a crafted model-replacement-scale update goes through the REAL masking/sketching/range-proof pipeline alongside genuinely honest clients in the same round, rather than a hand-built submission tested in isolation. None -> no override (default; also a no-op if cheater_client_idx is None).
     f7f_share_threshold: int = 4,  # FIX.md F7f (2026-11-15): a SEPARATE, low Shamir threshold for F7f's subgroup reconstruction during bisection -- NEVER the main secagg_share_threshold. The main threshold (default (2n/3)+1, a super-majority chosen for the WHOLE round's dropout/collusion resistance) is almost always bigger than any bisection-floor-sized subgroup, so reusing it for F7f made every leaf group unverifiable and therefore automatically "suspect" regardless of guilt (Gate E caught this: an innocent client got banned, the real cheater never did). This threshold governs a SECOND, independent Shamir sharing of each client's secrets, used ONLY during F7f's subgroup checks -- the main round's security is untouched by this value.
     checkpoint_path: str = None,  # 2026-11-15, scaling to real multi-hour Colab free-tier runs: if given, save {w_t, threshold, history, suspect_tracker, round} to this path after EVERY round -- a run that spans hours on a free-tier runtime that can disconnect at any time otherwise loses everything on a disconnect. None -> no checkpointing (matches every prior call site's behavior exactly).
     resume_from: dict = None,  # output of load_checkpoint(checkpoint_path) from an earlier, interrupted call. Restores w_t/threshold/history/suspect_tracker and resumes at the round AFTER the checkpointed one, instead of starting over at round 0. None -> fresh start (default, matches every prior call site).
@@ -492,6 +493,7 @@ def run_training_loop(
                     batch_size=batch_size, momentum=momentum,
                     _sim_pairwise_mask_cache=pairwise_mask_cache_this_round,
                     vector_sink=_sink,
+                    _force_delta=(cheater_force_delta if client_idx == cheater_client_idx else None),
                 )
             _t_phase1 = time.time() - _t_phase1_start
 
@@ -697,6 +699,8 @@ def run_training_loop(
                 "round": t_round,
                 "aborted": False,
                 "accepted": len(outcome.accepted_client_indices),
+                "accepted_client_indices": outcome.accepted_client_indices,  # 2026-11-15: added alongside cheater_force_delta so a per-round attack's rejection is visible without re-deriving it from the count alone -- symmetric with the aborted branch above, which already logs this detail.
+                "rejected_reasons": outcome.rejected_reasons,  # client_index -> list[str]; empty dict on an all-honest round, matches the aborted branch's own key name
                 "v5_passed": audit.v5_passed,
                 "f7e_passed": outcome.aggregate_sketch_check_passed,   # True / None (not run); False never reaches here, it aborts above
                 "aggregate_exact": aggregate_exact,

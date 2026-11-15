@@ -315,6 +315,7 @@ def round_step_phase1(
     momentum: float = 0.0,
     _sim_pairwise_mask_cache: dict | None = None,
     vector_sink=None,
+    _force_delta: np.ndarray | None = None,
 ) -> ClientSubmissionPhase1:
     """Steps 0-7 of ARCHITECTURE.md §4's round protocol.
 
@@ -336,6 +337,18 @@ def round_step_phase1(
     both arrays stay on the submission exactly as before -- that is
     still the right shape for a single client in isolation, and for
     tests.
+
+    `_force_delta`: ATTACK SIMULATION ONLY (FIX.md F10's follow-up --
+    `attacks/a1_scaling.py`'s model-replacement attack, run through
+    the REAL round pipeline alongside real honest clients, not in
+    isolation). Never set this for an honest client. When given,
+    overrides whatever Step 1 computed (real trained delta, or the
+    zero vector) with this array instead -- everything downstream
+    (DP noise, quantize, masking, sketching, the real range proof)
+    still runs exactly as it would for an honest client's delta, so
+    this exercises V3's rejection of a genuinely oversized update
+    inside a real round's full pipeline, not a hand-built
+    substitute for it. `None` -> no override, the honest default.
     """
     # Step 0: VRF self-sampling.
     vrf_out = vrf_evaluate(ctx.keys.sk, ctx.keys.pk, vrf_alpha)
@@ -349,6 +362,9 @@ def round_step_phase1(
             raise FloatingPointError(f"client {ctx.keys.index}: {e}") from e
     else:
         delta = np.zeros(ctx.model_dim, dtype=np.float64)
+
+    if _force_delta is not None:
+        delta = _force_delta  # ATTACK SIMULATION ONLY -- see this function's docstring.
 
     # Step 2: DP noise share.
     #
