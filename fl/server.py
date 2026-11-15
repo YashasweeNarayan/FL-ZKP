@@ -388,6 +388,9 @@ def run_round(
     rejected_reasons = {}
     for client_index, submission in submissions:
         phase2 = phase2s[client_index]
+        import os as _os  # TEMPORARY DEBUG (2026-11-15, investigating A1-gate finding) -- remove after diagnosis
+        if _os.environ.get("JANUS_DEBUG_V3"):
+            print(f"    [V3 DEBUG by-client] client {client_index}: sc.v={phase2.sketch_commitment.v}")
         result = verify_submission(submission, phase2, rho_t, rho_e, vrf_alpha, B_t, seen_key_images,
                                     sketch_dim=sketch_dim, model_dim=model_dim, sigma_t=sigma_t,
                                     quant_bits=quant_bits, density=density, n_tests=n_tests)
