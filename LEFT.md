@@ -37,6 +37,86 @@ checkpoint automatically, from this run's checkpoint, not the old one.
   there may be a second issue to chase, and we want to know that
   TODAY, not during drafting.
 
+## 1.5. [after #1 confirms good, before drafting] Fused end-to-end run: attack INSIDE the full training run
+
+**Why**: #1 proves utility (converges under real overhead), F11
+proves security (catches A1 inside a real loop, but only at toy
+scale -- 9 clients, 3 rounds). Neither alone is "attackers sitting
+inside the FULL 50-client/20-round run, caught every round, while the
+honest majority still converges normally." That combined claim is the
+strongest single result this paper can show, and it's cheap to get:
+`cheater_client_idx`/`cheater_force_delta` are already proven correct
+(F11).
+
+**Malicious-client count, decided 2026-11-16**: **7 of 50 (14%)**, not
+1. This matches `ARCHITECTURE.md`'s own stated experimental target
+(contributions table, N7: "n=50 ... 7 adversaries") -- using any other
+number would make the paper inconsistent with what it already claims
+to validate. The system's theoretical tolerance is `f < n/2 = 25`
+(§2.2, A2) -- that ceiling is for a stress-test/sensitivity figure
+only (see #1.6 below), not the main result.
+
+**Plan**: a second run, same model/rounds/client-count as #1, with 7
+clients forced malicious via `craft_scaled_update` the whole time
+(same construction F11 used, same crafted delta reused across all 7 --
+noted as a simplifying choice, not independently-drawn attacks).
+Produces a second accuracy-vs-round curve to put next to #1's clean
+one -- "convergence with vs. without 14% active attackers" is a
+strong, easy-to-read figure. Round-availability math (below) also
+matters here: with 7 malicious clients excluded from `k_min=8`
+eligibility, abort probability rises from ~4.5% to ~9.4% -- expect,
+don't be alarmed by, more ABORTED rounds in this run's log than in
+#1's.
+
+## 1.6. [after #1 confirms good, before drafting] Attack-type x malicious-fraction grid + one concurrent-mixed run
+
+**Decided 2026-11-16, after discussing what a reviewer will ask for.**
+Two separate things, both needed, for different reasons -- do not
+substitute one for the other:
+
+1. **Grid**: {A1, A3, A4-replay, A5} x {10%, 20%, 30%} malicious
+   clients, ONE attack type per run (not mixed) -- gives a clean,
+   attributable defense-trigger-rate table per attack/fraction cell.
+   This is what makes the result comparable to prior Byzantine-FL work
+   (Krum/Trimmed-mean/FLTrust/RoFL all report a fraction sweep, never
+   a single fixed point). Run at **5 rounds**, not 20 -- the security
+   claim ("defense fires, round still completes for honest clients")
+   doesn't need a long run to be valid, only the *accuracy* curves in
+   #1/#1.5 do. State this scope explicitly in the paper's experimental
+   setup section.
+2. **One concurrent-mixed run**: 30% malicious, but split across
+   attack TYPES on different clients simultaneously (not all A1) --
+   this is the composition stress test. Your paper's actual novelty
+   (`R_cons` closing the identity-laundering hole between an escrow
+   ciphertext and a commitment) is a claim about composition
+   specifically; a reviewer's natural question is "does this still
+   hold when different adversaries act in different roles at once,"
+   and the per-attack grid above never answers that. One run at 5
+   rounds answers it.
+
+Computed abort-probability table (exact, from this config's
+`p=0.25, n=50, k_min=8`; `f`=malicious count, excluded from
+`k_min`-eligibility):
+
+| malicious | honest | E[sampled] | P(round aborts) |
+|---|---|---|---|
+| 0% (f=0) | 50 | 12.50 | 4.53% |
+| 10% (f=5) | 45 | 11.25 | 9.41% |
+| 20% (f=10) | 40 | 10.00 | 18.20% |
+| 30% (f=15) | 35 | 8.75 | 32.23% |
+
+Reproduces ARCHITECTURE.md line 339's stated ~4.5% at f=0, confirming
+the model -- this table itself is worth a line in the experimental
+setup section, since it predicts (and explains) why the 30% cells
+will show more aborted rounds than the 10% cells, independent of
+whether any defense is working correctly.
+
+**Engineering needed before this can run**: `cheater_client_idx` is
+currently a single int in `fl/round_loop.py::run_training_loop` --
+needs generalizing to accept multiple indices (for both the 7-client
+fused run in #1.5 and the 5/10/15-client grid cells here) before any
+of this can be built. This is the next thing being built now.
+
 ## 2. [after #1 confirms good] Pull final numbers together
 
 No new experiments — this is just collecting what already exists:
@@ -47,9 +127,43 @@ No new experiments — this is just collecting what already exists:
   this, done)
 - Per-round timing breakdown (phase1/phase2/verify) — already have
   real numbers from every Colab run this session, including #1
+- Grid + mixed-run results from #1.6
 
 Tell me when #1's numbers are in and I'll build the tables/figures
 from them directly.
+
+## 2.5. Traceability status — answered 2026-11-16, one real gap flagged
+
+Three separate mechanisms, not one — status differs across them:
+
+1. **Core identity-opening** (`shamir.py`/`dkg.py`/`elgamal_threshold.py`/
+   `reshare.py`): **confirmed working**, real Colab/`rbcl`. 7-of-10
+   holders recover, 6-of-10 correctly fail; the secret survives a
+   committee reshare. One real bug found+fixed along the way (`dkg.py`
+   wasn't wrapping shares as proper `ShamirShare` objects, commit
+   `cc9a59b`).
+2. **Accountability/blame path** (F7f's bisection, `SuspectTracker`,
+   its own independent `f7f_share_threshold=4` Shamir sharing):
+   **confirmed working, after a real bug and a real fix** — first
+   Colab run banned 5 innocent clients and missed the real cheater
+   (reused the main round's threshold=7, so every bisection leaf group
+   was unverifiable by construction). Fixed by giving F7f its own
+   threshold, matched to the bisection floor (`min_group_size=4`).
+   Re-run: converges correctly on the real cheater, no false bans.
+3. **`trace.py` itself — the actual end-to-end "open this identity"
+   orchestration — has NEVER been run.** No local test file, no Colab
+   run. All three things it calls are individually confirmed; the
+   function tying them together isn't. This is a real, not-yet-closed
+   gap: **if the paper asserts the full end-to-end traceability claim
+   (not just "the pieces work"), `trace.py` needs at least one real
+   run before that claim is made.** Candidate for a cheap addition if
+   time allows after #1/#1.5/#1.6 — flagging here so it isn't
+   forgotten, not scheduling it yet given the timeline.
+
+Also noted, not a bug: `r_cons.py`'s sampling-disjunction OR-proof has
+its exact encoding left generic (module's own docstring) — a design
+decision not yet finalized, should be stated as a scope limitation if
+the paper's writing doesn't already resolve it.
 
 ## 3. [SKIP for this submission, unless #1 finishes with hours to spare]
 
