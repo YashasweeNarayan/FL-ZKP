@@ -1424,3 +1424,52 @@ PASS: cheater 5's scaled update was rejected by V3 every round it was eligible, 
 ```
 
 All three rounds: V3 alone (no F7e involvement) rejects the model-replacement attack; `accepted=8/9`, `V5=PASS`, `F7e=PASS`, `aggregate=EXACT` every round; `B_t` tightens round-over-round (48.6M -> 38.9M -> 32.0M) as the honest clients' real training converges, exactly as `update_threshold_ema` is meant to do. **F11 closed**: A1 is now confirmed caught by V3 inside a real multi-round `tiny_cnn`/MNIST training loop, not just in isolation.
+
+## F12 — multi-cheater generalization + trace.py's first real run (2026-11-16)
+
+**Context**: after locking in the experimental design (LEFT.md #1.5/#1.6
+-- 7 malicious clients for the fused run, matching ARCHITECTURE.md's own
+N7 target, 10%/20%/30% grid for the attack-type sweep), `cheater_client_idx`
+needed to support more than one cheater at once; it was a bare int.
+
+**Fix**: `fl/round_loop.py::run_training_loop` normalizes `cheater_client_idx`
+to a set once, at the top of the function (`None` -> empty set, a bare int
+-> one-element set, a list/set -> itself). Every downstream check
+(`_force_delta`'s and `_cheat_zero_sketch`'s conditionals, the per-round
+verbose eligibility print) became a set-membership test instead of an
+equality check. A bare int still works exactly as before -- every existing
+call site (F11's gate, VERIFY_FIXES_F6_F7's Gate D/E) is unaffected.
+113 passed, 5 skipped, unchanged. Used immediately by the new
+`RUN_MVP_TINY_CNN_MNIST_WITH_ATTACK.ipynb` (7 of 50 clients malicious,
+14%, same crafted delta on all 7 -- noted as a simplifying choice, not
+independently-drawn attacks per client).
+
+**Separately, same session**: `fl/trace.py` -- the actual "merge t-of-n_c
+keys to open a real identity" orchestration -- had never been run (STATUS.md
+had carried it as "WRITTEN, NOT RUN" since it was first written). Added a
+gate to `RUN_ATTACKS.ipynb`, right after the A1 real-round gate, that runs
+the real `OpeningRequest`/`collect_partial_from_holder`/`run_opening_protocol`
+flow against the SAME client A1 just caught cheating: 7 of the 10 named
+key holders correctly recover its real public key (checked against the
+real ring key, not just "didn't crash"); 6 of the 10, same real function,
+correctly fail with "need t=7". Step 5 (R_cons re-binding, needs a live
+round's proof object) and `evidence_total`/`theta` (fl/evidence.py's own
+calibration) are explicitly scoped out in the gate's own markdown, not
+silently skipped.
+
+Before committing, ran this gate's exact logic in this sandbox against
+`crypto/_ristretto_py.py`'s test-only pure-Python ristretto255 backend
+(`JANUS_ALLOW_PURE_PYTHON_GROUP=1`) -- confirms the control-flow and
+object-wiring is correct (7-of-10 opens and names the right client,
+6-of-10 correctly refuses) independent of the real `rbcl` backend this
+sandbox can't install. The real Colab run with `rbcl` is still what
+closes this per STATUS.md's standard for every other EC-dependent module
+-- not done yet, flagged in STATUS.md as "control-flow verified in
+sandbox, not yet real-Colab-confirmed."
+
+Also added, user-requested: an explicit `MALICIOUS CLIENTS IN THIS RUN:
+[...]` banner printed immediately before `run_training_loop` is called,
+in both the A1 gate and the new fused 7-attacker notebook -- so a
+reviewer reading the notebook's own output sees which clients are
+malicious stated plainly, not left implicit in a variable assigned
+earlier in the file.
