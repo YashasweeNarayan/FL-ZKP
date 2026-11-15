@@ -1412,3 +1412,15 @@ A7_collusion_mixnet      3hop_mix_cascade        CAUGHT
 **Lesson for future cheater-simulation params**: `cheater_client_idx` is now host to two independent, mutually-exclusive attack mechanisms (`_cheat_zero_sketch` for F7e/F7f, `cheater_force_delta` for A1/V3). Any THIRD mechanism added later under the same `cheater_client_idx` must be checked against both existing ones for this same silent-composition failure mode before trusting a result.
 
 **Checks**: 113 passed, 5 skipped locally throughout (none of this is torch-exercisable off Colab). All temporary debug prints added mid-investigation have been removed from `crypto/norm_proof.py`, `fl/client.py`, `fl/server.py`.
+
+**Final clean 3-round confirmation, real Colab, 2026-11-16** (fresh runtime, no debug instrumentation):
+
+```
+round 0: accepted=8, cheater rejected=True (V3_norm_bound_exceeded, v=2437103467890242433137, norm_bound_sq=6460287050031617024, B_t=48639775.669), aggregate_exact=True
+round 1: accepted=8, cheater rejected=True (V3_norm_bound_exceeded, v=2377761683253871082067, norm_bound_sq=4137176608505554944, B_t=38924019.890), aggregate_exact=True
+round 2: accepted=8, cheater rejected=True (V3_norm_bound_exceeded, v=2338202999870878286652, norm_bound_sq=2792888172045597696, B_t=31981028.686), aggregate_exact=True
+
+PASS: cheater 5's scaled update was rejected by V3 every round it was eligible, while the round still completed normally for honest clients.
+```
+
+All three rounds: V3 alone (no F7e involvement) rejects the model-replacement attack; `accepted=8/9`, `V5=PASS`, `F7e=PASS`, `aggregate=EXACT` every round; `B_t` tightens round-over-round (48.6M -> 38.9M -> 32.0M) as the honest clients' real training converges, exactly as `update_threshold_ema` is meant to do. **F11 closed**: A1 is now confirmed caught by V3 inside a real multi-round `tiny_cnn`/MNIST training loop, not just in isolation.
