@@ -187,6 +187,9 @@ def verify_sketch_commitment(sc: SketchCommitment, transcript: bytes, norm_bound
     public integer bound (`crypto.sketch.int_sketch_norm_sq_bound`).
     Does NOT see any y_i, y_i^2, or individual blinding factor.
     """
+    import os as _os  # TEMPORARY DEBUG (2026-11-15, investigating A1-gate finding) -- remove after diagnosis
+    if _os.environ.get("JANUS_DEBUG_V3"):
+        print(f"    [V3 DEBUG] sc.v={sc.v}, norm_bound_sq={norm_bound_sq}, ratio={sc.v / norm_bound_sq if norm_bound_sq else float('inf'):.3f}, in_bound={0 <= sc.v <= norm_bound_sq}")
     m = len(sc.y_commitments)
     if not (len(sc.sq_commitments) == len(sc.square_proofs) == m):
         return False
