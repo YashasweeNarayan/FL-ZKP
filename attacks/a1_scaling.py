@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 
 from . import AttackResult
-from fl.client import quantize
+from fl.client import quantize, center_mod_p_mask
 from fl.norm_rule import compute_threshold, flag_anomalous
 from crypto.rangeproof import prove_range, verify_range
 
@@ -27,8 +27,25 @@ def run_attack(w_t: np.ndarray, w_target: np.ndarray, B_t: float, sketch_norm_bi
     malicious_delta = craft_scaled_update(w_t, w_target)
     # same quantize->sketch->range-proof pipeline an honest client uses
     # (fl/client.py's round_step_phase2), just with a hostile delta.
+    #
+    # FIX.md (2026-11-15, found live the first time this module was
+    # ever actually run, against real quantize()/P_MASK rather than
+    # imagined): computing the norm straight off quantize()'s own
+    # output is meaningless -- quantize() reduces every entry mod
+    # P_MASK (~2.3e18), so a negative coordinate wraps to a value near
+    # P_MASK regardless of how small the real update is, and that
+    # wraparound swamps the norm (empirically ~1e19-1e20 for both a
+    # tiny honest delta and a deliberately huge attack one, at
+    # dim=2000 -- the two were indistinguishable). This is the exact
+    # same mod-wrap bug class STATUS.md already documents being found
+    # and fixed in `server.py`'s V3 check and the B_t-EMA sketch path
+    # (`center_mod_p_mask` was added there for exactly this reason) --
+    # it just was never applied HERE, because this module had never
+    # been run before. Fixed the same way: center back to the signed
+    # representation before taking the norm, matching what the real
+    # client/server pipeline actually sketches and bounds.
     q = quantize(malicious_delta)
-    estimated_norm = int(np.linalg.norm(q.astype(np.float64)))
+    estimated_norm = int(np.linalg.norm(center_mod_p_mask(q).astype(np.float64)))
 
     # the attacker MUST produce a valid range proof for whatever value
     # it claims, or V3 rejects outright on malformed proof; so the
