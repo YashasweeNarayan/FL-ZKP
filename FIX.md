@@ -1473,3 +1473,43 @@ in both the A1 gate and the new fused 7-attacker notebook -- so a
 reviewer reading the notebook's own output sees which clients are
 malicious stated plainly, not left implicit in a variable assigned
 earlier in the file.
+
+## F13 — Drive dependency removed from real-training notebooks, git-backed checkpointing (2026-11-16)
+
+**Context**: user can't mount Google Drive this session (personal
+reasons), which both real-training notebooks (`RUN_MVP_TINY_CNN_MNIST.ipynb`,
+its `_WITH_ATTACK.ipynb` companion) depended on for checkpoint
+durability across a Colab disconnect.
+
+**Fix**: `fl/round_loop.py::run_training_loop` gained an
+`on_checkpoint_saved(checkpoint_path, round_idx)` callback, fired right
+after every per-round `save_checkpoint()` call -- the library stays
+git-agnostic (no subprocess/git import here), the notebooks supply their
+own persistence. Both notebooks now clone a SEPARATE checkout
+(`/content/FL-ZKP-checkpoints`, never the code checkout the notebook
+imports from) onto a dedicated `colab-checkpoints` branch (never `main`
+-- checkpoints are run artifacts, not paper code, and don't belong in
+the history a reviewer clones), and commit+push the checkpoint file
+there after every round. A GitHub PAT is entered via `getpass` (hidden,
+never written to disk or committed). A push failure only costs a retry
+next round -- it's wrapped so it never raises and never stops training.
+
+Checkpoint size was checked first, not assumed: `tiny_cnn` is ~20.6K
+params, so a checkpoint is well under 1MB -- the usual argument against
+committing checkpoints into git (binary-blob repo bloat) doesn't bite
+at this model's scale, which is why this is git and not, say, git-lfs.
+
+**Verified the resume mechanism itself before handing it to the user**,
+against a real throwaway local git remote (not the actual FL-ZKP repo):
+session 1 pushes 3 round-checkpoints to a fresh `colab-checkpoints`
+branch; the local checkout is then deleted (simulating exactly what a
+real Colab disconnect does to `/content`); session 2 re-clones, detects
+the branch already exists on the remote, fetches it, and recovers the
+exact checkpoint content session 1 last pushed -- then pushes 3 more
+rounds on top without error. This caught one real bug before it shipped:
+a plain `git fetch origin <branch>` only updates `FETCH_HEAD`, not
+`refs/remotes/origin/<branch>`, so the resume-detection `checkout -B`
+step failed even though the fetch itself reported success. Fixed with
+an explicit destination refspec (`<branch>:refs/remotes/origin/<branch>`).
+
+113 passed, 5 skipped, unchanged.
