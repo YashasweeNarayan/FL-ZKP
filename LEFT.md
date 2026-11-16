@@ -180,6 +180,54 @@ exercised end-to-end on Colab yet, higher chance of a first-run
 surprise worth catching early rather than on the last run before
 drafting).
 
+## 1.8. [for the paper's discussion/limitations section] V3 catches A1 every round, but never bans the repeat offender -- argue this as a strength, not a gap
+
+**Added 2026-11-16, live during the first real attack-notebook run.**
+Observed: A1 (model-replacement, 7/50 malicious) gets caught and
+rejected by V3 EVERY round (confirmed via `accepted_client_indices`/
+`rejected_reasons` in the checkpoint history -- exactly the 7
+attacker indices, every round, round completes `aggregate=EXACT`
+with only the 43 honest clients contributing). The 7 keep
+re-submitting every round regardless, since nothing persistently
+excludes them.
+
+**Decided not to change this.** Checked `fl/round_loop.py` directly:
+`SuspectTracker`'s quarantine/ban IS wired into the loop, but only
+reacts to F7e/F7f's `aggregate_sketch_suspect_groups` signal (needed
+there because a single round's evidence is ambiguous among an
+anonymous ring and requires narrowing across rounds) -- ordinary V3
+rejections never feed it. This is deliberate, not an oversight to
+rush-fix before drafting:
+
+1. **Per-round-only filtering is the field's own gold standard for
+   this attack class.** Krum, trimmed-mean/median, Bulyan, FLTrust --
+   the baselines any reviewer will compare this against -- all
+   re-evaluate every client fresh every round, no persistent ban.
+   Cross-round reputation (FoolsGold, FLDetector, CONTRA) exists for
+   attacks a single round genuinely can't resolve (sybils, slow-drift
+   poisoning) -- not the case here; V3 resolves A1 unambiguously every
+   time, with no detection gap a ban would close.
+2. **Write this as the STRONGER result, not a weaker one**: "V3
+   rejects the attack every round under sustained, repeated attack
+   across the full run, with zero degradation to the honest
+   aggregate" > "V3 rejects the attack once." State this explicitly in
+   the experimental-results writeup.
+3. **An ad-hoc ban-by-client_idx would contradict the paper's own
+   anonymity model.** The ring signature's epoch-pseudonym design
+   (ARCHITECTURE.md line 275-282) is unlinkable across rounds outside
+   the epoch tag by design -- banning a raw simulation index uses
+   information a real deployment wouldn't have. The PRINCIPLED
+   persistent-exclusion mechanism this paper actually contributes is
+   traceability (accumulate evidence -> 7-of-10 trace -> reveal real
+   identity -> out-of-band revocation), not a bolted-on per-round
+   heuristic. `SuspectTracker` already follows exactly that pattern
+   for the one attack class (F7e/F7f) that genuinely needs it.
+
+If a reviewer DOES ask "why not also quarantine on repeated V3
+hits" -- answer with point 1 above, and note it's a natural, well-
+motivated extension (not required for the current claims) rather than
+conceding a hole.
+
 ## 2. [after #1 confirms good] Pull final numbers together
 
 No new experiments — this is just collecting what already exists:
