@@ -1571,3 +1571,80 @@ remain valid -- this bug lives entirely in the ML-validity layer (same
 category as F6/F9), not the cryptographic-correctness layer.
 
 113 passed, 5 skipped, unchanged.
+
+## F15 — model training ran entirely on CPU even on a GPU Colab runtime (2026-11-16)
+
+**Context**: asked directly whether the pipeline is GPU-optimized "at
+its peak." Checked by direct code inspection rather than assuming --
+the answer was no, and not just "not fully optimized": the actual
+model training loop was never placed on GPU at all.
+
+**Root cause**: `fl/models.py::build_model` returns a plain `nn.Module`
+on CPU; no call site anywhere in `fl/` or any notebook ever moved it,
+or the per-batch training/eval tensors, onto CUDA. `fl/client.py::
+local_train_delta`'s forward/backward pass (`model(batch_images)`) is
+the ONLY `model(...)` call in the entire codebase (confirmed via
+`grep -rn "model(" fl/*.py`), and it ran on whatever device the model
+happened to be on -- CPU, always, since nothing ever changed it. The
+only part of the stack that WAS already GPU-aware is `crypto/
+sketch.py`'s JL-projection module (`self.device = "cuda" if torch.
+cuda.is_available() else "cpu"`), set up independently of the model.
+This fully explains the ~1.5GB GPU-memory footprint observed on real
+runs: that's CUDA context + the sketch matrix, not the model's own
+compute, which was running on CPU the entire time.
+
+(The ZKP/crypto layer itself -- Bulletproofs, Sigma-NIZKs, CLSAG,
+Shamir/threshold-ElGamal -- is scalar/group-element arithmetic over
+ristretto255, not matrix-heavy, so it genuinely would not benefit from
+GPU acceleration; that part of the "why isn't everything GPU-optimized"
+question, discussed earlier, was already correctly answered as "by
+design, not a gap." This entry is about the part that WAS a real gap:
+the model training/eval compute, which is exactly the kind of workload
+GPU acceleration is for.)
+
+**Fix, four files**:
+- `fl/client.py::local_train_delta`: detect `model_device = next(model
+  .parameters()).device` once; move each mini-batch (`batch_images`,
+  `batch_labels`) onto it before the forward pass. Dataset tensors stay
+  on CPU by design (so holding 50 clients' shards doesn't require GPU
+  RAM for all of them at once) -- only the active mini-batch moves.
+- `fl/server.py::apply_update`: `torch.from_numpy(aggregated_delta)`
+  always lands on CPU (the crypto layer is numpy end to end); added
+  `.to(w_t.device)` so the add doesn't raise a device-mismatch
+  RuntimeError the instant `w_t` is ever on CUDA -- this would have
+  been the very next crash after fixing model placement alone.
+- `fl/round_loop.py::load_checkpoint`: added `map_location="cpu"` --
+  without it, loading a checkpoint saved from CUDA fails outright on a
+  machine with no GPU, or can target a CUDA device index that no
+  longer exists after a disconnect/reconnect gives a fresh instance.
+- `fl/round_loop.py::run_training_loop`'s resume block: moves the
+  now-CPU-loaded `w_t` onto the live model's actual device right after
+  restoring it, so a resumed run keeps training on GPU exactly like a
+  fresh run does.
+- All five run notebooks (`RUN_MVP_TINY_CNN_MNIST[_WITH_ATTACK]
+  .ipynb` hand-patched; `RUN_MVP_TINY_CNN_FEMNIST`/`RUN_MVP_
+  SMALL_RESNET_{MNIST,FEMNIST}.ipynb` regenerated from the updated
+  `notebooks/_build_mvp_run_notebooks.py`): model-build cell now picks
+  `device = torch.device('cuda' if torch.cuda.is_available() else
+  'cpu')` and does `model = model.to(device)`; eval cells move each
+  eval batch to `next(model.parameters()).device` the same way.
+
+**Verified**: 113 passed, 5 skipped locally, unchanged (this sandbox
+has no GPU, so the CUDA path itself can't be exercised here -- same
+limitation as every other torch-dependent change in this repo; needs
+Colab confirmation like the rest). All five notebooks' JSON validity
+and Python syntax (`ast.parse`, magics stripped) re-checked after the
+patch. Every other `model(...)`/`w_t`-touching call site in `fl/` was
+grepped for and checked by hand -- these were the only ones.
+
+**Consequence for the paper, and for tonight's runs**: this is a pure
+speed fix, NOT a correctness change -- every numeric result that
+leaves torch already crosses to numpy/CPU before touching the DP-noise,
+quantization, masking, sketching, or verification layers (confirmed:
+`local_train_delta`'s `delta = (new_flat - w_t).detach().cpu().numpy()
+...` is unconditional), so nothing about F14's fix, the crypto
+guarantees, or any already-reported security-check result changes.
+What changes is wall-clock time: real GPU compute for the forward/
+backward pass instead of CPU, which should meaningfully shorten all
+four queued MVP runs (especially `small_resnet`, ~13x more params
+than `tiny_cnn`). Worth having landed before tonight's runs, not after.

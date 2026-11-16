@@ -305,6 +305,11 @@ zero local training, not crypto participation), 20 rounds.
 before this notebook's first run** -- unlike the tiny_cnn+MNIST run,
 there is no stale/pre-fix checkpoint to worry about resuming from here.
 
+**GPU placement fix (2026-11-16) also already in place**: model and
+every mini-batch now move onto CUDA when available (cell 8 prints
+which device it picked) -- training previously ran on CPU even on a
+GPU runtime, since nothing moved the model or data off of it.
+
 **Checkpoint durability: git, not Drive.** Checkpoints are committed
 and pushed, after every round, to the shared `colab-checkpoints`
 branch on the FL-ZKP repo itself (never `main`) -- see the git-
@@ -360,10 +365,25 @@ def model_cell(cfg):
     return f"""\
 # 7. Build the model.
 # {cfg['model_note']}
+import torch
 from fl.models import build_model, flatten_state_dict
 
 REAL_MODEL = '{cfg['model']}'
 model = build_model(REAL_MODEL, num_classes={cfg['num_classes']}, in_channels=1)
+
+# GPU fix (2026-11-16): build_model() returns a plain nn.Module on
+# CPU -- nothing downstream (fl/client.py, fl/round_loop.py) ever
+# moved it or the per-batch data onto CUDA before this fix, so training
+# ran entirely on CPU even on a GPU Colab runtime. Moving the model
+# here, once, before the run starts is now the ONLY place that needs
+# to pick the device -- fl/client.py's local_train_delta reads
+# `next(model.parameters()).device` and moves each mini-batch to match,
+# and fl/round_loop.py's checkpoint/resume path follows the same model
+# device automatically (see both files' own 2026-11-16 comments).
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = model.to(device)
+print("training device:", device)
+
 flat_w, model_shapes = flatten_state_dict(model)
 dim = flat_w.numel()
 print(REAL_MODEL, "param count:", dim)
@@ -428,20 +448,26 @@ import torch
 from fl.models import unflatten_to_state_dict
 
 def evaluate_accuracy(model, images, labels, batch_size=512):
+    # GPU fix (2026-11-16): dataset tensors stay on CPU by design (see
+    # fl/client.py's 2026-11-16 comment); move each eval batch to
+    # wherever `model` actually lives, same pattern as training.
+    device = next(model.parameters()).device
     model.eval()
     correct = 0
     with torch.no_grad():
         for i in range(0, len(images), batch_size):
-            logits = model(images[i:i + batch_size])
+            batch_images = images[i:i + batch_size].to(device)
+            batch_labels = labels[i:i + batch_size].to(device)
+            logits = model(batch_images)
             preds = logits.argmax(dim=1)
-            correct += (preds == labels[i:i + batch_size]).sum().item()
+            correct += (preds == batch_labels).sum().item()
     return correct / len(images)
 
 # Load the LATEST checkpointed weights explicitly -- see markdown above.
 ckpt = load_checkpoint(CKPT_PATH) if os.path.exists(CKPT_PATH) else None
 eval_w_t = ckpt['w_t'] if ckpt is not None else final_w_t
 eval_round = ckpt['round'] if ckpt is not None else 'final (in-memory, no checkpoint found)'
-model.load_state_dict(unflatten_to_state_dict(eval_w_t, model_shapes))
+model.load_state_dict(unflatten_to_state_dict(eval_w_t.to(next(model.parameters()).device), model_shapes))
 
 # Official MNIST test set (10,000 images) -- the headline number.
 test_images, test_labels = {case_data_var}['test']
@@ -462,20 +488,26 @@ import torch
 from fl.models import unflatten_to_state_dict
 
 def evaluate_accuracy(model, images, labels, batch_size=512):
+    # GPU fix (2026-11-16): dataset tensors stay on CPU by design (see
+    # fl/client.py's 2026-11-16 comment); move each eval batch to
+    # wherever `model` actually lives, same pattern as training.
+    device = next(model.parameters()).device
     model.eval()
     correct = 0
     with torch.no_grad():
         for i in range(0, len(images), batch_size):
-            logits = model(images[i:i + batch_size])
+            batch_images = images[i:i + batch_size].to(device)
+            batch_labels = labels[i:i + batch_size].to(device)
+            logits = model(batch_images)
             preds = logits.argmax(dim=1)
-            correct += (preds == labels[i:i + batch_size]).sum().item()
+            correct += (preds == batch_labels).sum().item()
     return correct / len(images)
 
 # Load the LATEST checkpointed weights explicitly -- see markdown above.
 ckpt = load_checkpoint(CKPT_PATH) if os.path.exists(CKPT_PATH) else None
 eval_w_t = ckpt['w_t'] if ckpt is not None else final_w_t
 eval_round = ckpt['round'] if ckpt is not None else 'final (in-memory, no checkpoint found)'
-model.load_state_dict(unflatten_to_state_dict(eval_w_t, model_shapes))
+model.load_state_dict(unflatten_to_state_dict(eval_w_t.to(next(model.parameters()).device), model_shapes))
 
 # unseen_test: writers held out entirely from every client/server_root/
 # global_val role (ROADMAP.md §3.4) -- THE headline number for FEMNIST,

@@ -575,7 +575,17 @@ def apply_update(w_t, aggregated_delta):
     """w_{t+1} = w_t + Dequantize(sum q_k)/|A_real| -- already mean-
     divided by run_round, so this is a plain add. TORCH-DEPENDENT: w_t
     is the flat tensor from fl.models.flatten_state_dict.
+
+    GPU fix (2026-11-16): `aggregated_delta` is always a plain numpy
+    array (it crosses back from the crypto layer's dequantize step,
+    which is numpy end to end), so `torch.from_numpy(...)` always
+    lands on CPU regardless of where `w_t` itself lives. Before this
+    fix, `w_t + <CPU tensor>` raised a device-mismatch RuntimeError
+    the moment `w_t` was ever on CUDA -- i.e. the instant model/data
+    placement was fixed elsewhere, this line would have been the next
+    thing to break. Moving the CPU-origin tensor onto `w_t`'s own
+    device (a no-op if `w_t` is already on CPU) fixes it either way.
     """
     import torch
 
-    return w_t + torch.from_numpy(aggregated_delta).float()
+    return w_t + torch.from_numpy(aggregated_delta).float().to(w_t.device)

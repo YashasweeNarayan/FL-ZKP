@@ -261,9 +261,18 @@ def load_checkpoint(path: str) -> dict:
     argument to continue an interrupted run at the round after
     `round`, with `w_t`/`threshold`/`history`/`suspect_tracker` all
     restored to exactly where the interrupted run left them.
+
+    GPU fix (2026-11-16): `map_location="cpu"` -- without it, a
+    checkpoint saved while `w_t` lived on CUDA fails to load at all on
+    a machine with no GPU (or crashes resuming onto a different CUDA
+    device index after a disconnect/reconnect gives a fresh Colab
+    instance). `run_training_loop`'s resume block below moves `w_t`
+    onto the live model's actual device right after this call, so
+    landing it on CPU here first is always safe and never loses the
+    GPU placement for the rest of the run.
     """
     import torch
-    return torch.load(path, weights_only=False)
+    return torch.load(path, weights_only=False, map_location="cpu")
 
 
 def run_training_loop(
@@ -397,7 +406,14 @@ def run_training_loop(
     # than re-running rounds whose cost (real GPU time + crypto) was
     # already paid for.
     if resume_from is not None:
-        w_t = resume_from["w_t"]
+        # GPU fix (2026-11-16): load_checkpoint() now always lands w_t
+        # on CPU (map_location="cpu") regardless of what device it was
+        # saved from -- move it onto wherever `model`'s parameters
+        # actually live NOW (set once by the notebook's model-build
+        # cell before this function is ever called), so a resumed run
+        # keeps training on GPU exactly like a fresh run does, instead
+        # of silently falling back to CPU for the rest of the session.
+        w_t = resume_from["w_t"].to(next(model.parameters()).device)
         threshold = resume_from["threshold"]
         history = resume_from["history"]
         suspect_tracker = resume_from["suspect_tracker"]

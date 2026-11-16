@@ -221,6 +221,18 @@ def local_train_delta(model, w_t, local_data, lr: float, epochs: int,
     if batch_size <= 0:
         raise ValueError(f"local_train_delta: batch_size must be positive, got {batch_size}")
 
+    # GPU fix (2026-11-16): dataset tensors are kept on CPU by design
+    # (so holding all 50 clients' shards doesn't require GPU RAM for
+    # every one of them at once) -- but that means each mini-batch has
+    # to be moved to whatever device `model`'s parameters actually live
+    # on (set once, outside this function, by the notebook's model-
+    # build cell: `model = model.to(device)`). Before this fix, nothing
+    # anywhere moved model OR data onto CUDA, so training ran entirely
+    # on CPU even on a GPU Colab runtime -- the tiny ~1.5GB GPU-memory
+    # footprint observed on real runs was CUDA context + crypto/
+    # sketch.py's JL projection only, never the model's own compute.
+    model_device = next(model.parameters()).device
+
     last_loss = None
     n_batches_total = 0
     for epoch_idx in range(epochs):
@@ -236,8 +248,8 @@ def local_train_delta(model, w_t, local_data, lr: float, epochs: int,
             perm = torch.randperm(n)
         for start in range(0, n, batch_size):
             batch_idx = perm[start:start + batch_size]
-            batch_images = images[batch_idx]
-            batch_labels = labels[batch_idx]
+            batch_images = images[batch_idx].to(model_device)
+            batch_labels = labels[batch_idx].to(model_device)
             optimizer.zero_grad()
             outputs = model(batch_images)
             loss = criterion(outputs, batch_labels)
