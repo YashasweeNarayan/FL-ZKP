@@ -403,9 +403,34 @@ def round_step_phase1(
     # scaled sigma (not conflating "how many shares to generate" with
     # "the sqrt(p*n) scaling factor" -- those are two different things
     # split_noise's own parameters happened to let collide here).
-    per_client_sigma = sigma_dp / np.sqrt(max(sampling_rate * n_clients, 1e-9))
-    noise_shares = split_noise(per_client_sigma, n_shares=1, dim=ctx.model_dim, rng=np.random.default_rng())
-    nu_k = noise_shares[0]
+    #
+    # FIX.md (2026-11-16, found from the real 20-round CASE1 run that
+    # just finished with test accuracy stuck at ~33%, every round
+    # otherwise clean -- accepted=50/50, V5=PASS, F7e=PASS, aggregate=
+    # EXACT, so again the bug is in what gets aggregated): the scaling
+    # above by itself is still wrong, because it was unconditional --
+    # EVERY client, sampled or not, drew and added its own
+    # per_client_sigma-std noise share. ARCHITECTURE.md's own protocol
+    # listing is explicit that this must NOT happen: "all 50 clients
+    # submit; ~38 are dummies with q_k = 0" (line 201) -- an unsampled
+    # client's final quantized value is supposed to be EXACTLY zero,
+    # noise included, not "zero delta plus a full noise draw". Since
+    # ALL n=50 accepted submissions get summed server-side (not just
+    # the ~p*n=12.5 sampled ones), unconditional noise inflated the
+    # aggregate std to sqrt(n/(p*n)) = sqrt(1/p) = 2x the intended
+    # sigma_dp (5.0 instead of 2.5 at this config's p=0.25) -- the
+    # sqrt(p*n) scaling above is only correct if noise sums over
+    # exactly ~p*n contributors, which requires dummies to contribute
+    # NONE. Fixed by gating noise on the SAME b_k Step 1 already
+    # computed -- a dummy client's nu_k is now the exact zero vector,
+    # so its q_k = Quantize(0 + 0) = 0 as the spec requires, and only
+    # genuinely-sampled clients' noise enters the aggregate sum.
+    if b_k:
+        per_client_sigma = sigma_dp / np.sqrt(max(sampling_rate * n_clients, 1e-9))
+        noise_shares = split_noise(per_client_sigma, n_shares=1, dim=ctx.model_dim, rng=np.random.default_rng())
+        nu_k = noise_shares[0]
+    else:
+        nu_k = np.zeros(ctx.model_dim, dtype=np.float64)
 
     # Step 3: quantize.
     try:

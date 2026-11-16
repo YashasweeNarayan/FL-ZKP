@@ -6,6 +6,28 @@ order, not in parallel, unless a step says otherwise.
 
 ## 1. [BLOCKING, START NOW] Real tiny_cnn/MNIST run with the F9 DP fix
 
+**STATUS UPDATE, 2026-11-16: this run completed (20/20 rounds, all
+accepted, git-checkpointed per F13, authored as Yashaswee Narayan) --
+but its result is now INVALIDATED, and item #1 is NOT actually done.**
+Final numbers were `test_acc=0.3334` / `val_acc=0.3361` -- far below
+the 90%+ expected. Investigated and root-caused (not guessed): F9's
+fix only partially closed the DP-noise bug -- it scaled each client's
+noise share correctly but still applied it to EVERY client
+unconditionally, including the ~38 dummy (unsampled) clients each
+round, which `ARCHITECTURE.md` line 201 explicitly requires to submit
+`q_k = 0`. This left a residual 2x aggregate-noise overshoot (full
+writeup: FIX.md F14, STATUS.md's F9 entry). **Fixed in `fl/client.py`
+just now** -- the noise draw is gated on the same `b_k` sampling flag
+Step 1 already computes, confirmed by a standalone numpy Monte Carlo
+check (old std=4.9967 ≈ predicted 2x overshoot, new std=2.4286 ≈
+predicted target) and the full local suite (113 passed/5 skipped,
+unchanged). **This run needs to be redone from round 0** with the
+fix in place (same notebook, git-checkpoint mechanism from #1 below
+still applies) before its accuracy number can go in the paper. The
+security/crypto results from the completed run (`accepted=50/50,
+V5=PASS, F7e=PASS, aggregate=EXACT` every round) are NOT affected by
+this bug and remain valid -- only the accuracy number needs a re-run.
+
 **Why first**: this is the one number the paper's utility claim
 currently rests on, and it's the longest-running thing on this list.
 The last real-Colab run of this exact setup, before F9's fix, hit

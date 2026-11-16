@@ -1513,3 +1513,61 @@ step failed even though the fetch itself reported success. Fixed with
 an explicit destination refspec (`<branch>:refs/remotes/origin/<branch>`).
 
 113 passed, 5 skipped, unchanged.
+
+## F14 — DP noise still added unconditionally to dummy clients, residual 2x aggregate overshoot (2026-11-16)
+
+**Context**: the first real 20-round CASE1 baseline run (git-based
+checkpointing from F13, author identity Yashaswee Narayan) completed
+cleanly on every security check -- accepted=50/50 every round, V5=PASS,
+F7e=PASS, aggregate=EXACT -- but came back with MNIST test accuracy of
+only 33.34% (round 19), vs. the 90%+ expected for `tiny_cnn` on MNIST at
+this FedAvg config. Since every crypto/consistency check passed, the bug
+had to be in what gets aggregated, not in the aggregation machinery --
+same category as F6 and F9.
+
+**Root cause**: `fl/client.py` Step 2's noise-share draw (the F9 fix
+site: `per_client_sigma = sigma_dp / sqrt(p*n)`, then
+`split_noise(per_client_sigma, n_shares=1, ...)`) ran *unconditionally*,
+for every one of the `n_clients=50` clients each round, regardless of
+`b_k` (the Step 0/Step 1 VRF-sampling flag that already gates whether a
+client trains or contributes an all-zero delta). `ARCHITECTURE.md` line
+201 is explicit that this is wrong: "all 50 clients submit; ~38 are
+dummies with q_k = 0" -- a dummy (unsampled) client's final quantized
+value must be *exactly* zero, noise included, not zero-delta-plus-a-
+full-noise-draw. `fl/server.py::aggregate_masked_vector` sums over every
+accepted submission (confirmed 50/50 accepted in the real run), so all
+~38 dummy clients' independent noise draws were entering the aggregate
+sum too.
+
+F9 (2026-11-15) had already fixed the *scale* of each individual
+client's noise share (sigma_dp/sqrt(p*n) instead of raw sigma_dp),
+correctly sized for summing over the ~p*n=12.5 *sampled* clients the
+spec intends -- but with noise added by all 50 instead, the realized
+aggregate variance is `n * (sigma_dp^2/(p*n)) = (n/(p*n)) * sigma_dp^2
+= (1/p) * sigma_dp^2`, i.e. aggregate std = `sigma_dp / sqrt(p)` =
+`sigma_dp * sqrt(1/0.25)` = `2 * sigma_dp` = 5.0 instead of the intended
+2.5 -- a residual 2x overshoot left over after F9 only partially closed
+the original ~7.07x bug.
+
+**Fix**: gated Step 2 on the same `b_k` Step 1 already computes --
+sampled clients (`b_k=True`) draw their scaled noise share exactly as
+before; dummy clients (`b_k=False`) get `nu_k = np.zeros(ctx.model_dim)`
+exactly, so `q_k = quantize(0 + 0) = 0` as the spec requires, and only
+the ~p*n genuinely-sampled clients' noise enters the aggregate sum.
+
+**Verified with a standalone numpy-only Monte Carlo sanity check**
+(p=0.25, n=50, sigma_dp=2.5, dim=10000, 200 trials, independent of the
+actual pipeline code) before treating this as resolved: old
+(unconditional) behavior measured aggregate noise std ~4.9967 (predicted
+5.0 = 2x target); new (gated) behavior measured ~2.4286 (predicted 2.5 =
+target). Confirms the fix, doesn't just assert it.
+
+**Consequence for the paper**: the completed 20-round baseline run's
+*accuracy* numbers (33.34% test / 33.61% held-out) are invalidated by
+this bug and must be re-run with the fix in place to get a valid number
+for the paper. The same run's *security/crypto* results (accepted=50/50,
+V5/F7e/aggregate all passing every round) are unaffected by this bug and
+remain valid -- this bug lives entirely in the ML-validity layer (same
+category as F6/F9), not the cryptographic-correctness layer.
+
+113 passed, 5 skipped, unchanged.
