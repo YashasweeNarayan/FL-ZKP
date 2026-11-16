@@ -292,6 +292,7 @@ def run_training_loop(
     f7f_share_threshold: int = 4,  # FIX.md F7f (2026-11-15): a SEPARATE, low Shamir threshold for F7f's subgroup reconstruction during bisection -- NEVER the main secagg_share_threshold. The main threshold (default (2n/3)+1, a super-majority chosen for the WHOLE round's dropout/collusion resistance) is almost always bigger than any bisection-floor-sized subgroup, so reusing it for F7f made every leaf group unverifiable and therefore automatically "suspect" regardless of guilt (Gate E caught this: an innocent client got banned, the real cheater never did). This threshold governs a SECOND, independent Shamir sharing of each client's secrets, used ONLY during F7f's subgroup checks -- the main round's security is untouched by this value.
     checkpoint_path: str = None,  # 2026-11-15, scaling to real multi-hour Colab free-tier runs: if given, save {w_t, threshold, history, suspect_tracker, round} to this path after EVERY round -- a run that spans hours on a free-tier runtime that can disconnect at any time otherwise loses everything on a disconnect. None -> no checkpointing (matches every prior call site's behavior exactly).
     resume_from: dict = None,  # output of load_checkpoint(checkpoint_path) from an earlier, interrupted call. Restores w_t/threshold/history/suspect_tracker and resumes at the round AFTER the checkpointed one, instead of starting over at round 0. None -> fresh start (default, matches every prior call site).
+    on_checkpoint_saved: "Callable[[str, int], None] | None" = None,  # 2026-11-16: fires right after save_checkpoint() writes checkpoint_path for a round, with (checkpoint_path, round_idx). Deliberately generic -- this library has no opinion on WHERE durability comes from (Drive, git, S3, nothing); a caller wires up its own persistence (e.g. a notebook's git-commit-and-push helper, for a Colab session where Drive isn't mounted) without this module importing subprocess/git at all. A no-op if checkpoint_path is None (nothing was saved to call back about). Exceptions raised here are NOT caught -- a persistence failure should be visible, not swallowed; the checkpoint itself is already safely on local disk by the time this fires, so a raised exception here costs you a retry next round, not the checkpoint.
 ):
     """Runs ARCHITECTURE.md §4's round protocol for `rounds` rounds over
     one model: VRF self-sampling -> local train -> DP noise -> quantize
@@ -754,6 +755,8 @@ def run_training_loop(
             # load_checkpoint()'s docstring for the resume path.
             if checkpoint_path:
                 save_checkpoint(checkpoint_path, t_round, w_t, threshold, history, suspect_tracker)
+                if on_checkpoint_saved is not None:
+                    on_checkpoint_saved(checkpoint_path, t_round)
 
     # IMPORTANT: every call to local_train_delta (inside round_step_phase1,
     # once per client per round) reloads `model` with THAT client's own
