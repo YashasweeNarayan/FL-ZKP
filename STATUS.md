@@ -170,6 +170,40 @@ Still open, flagged but not addressed: ROADMAP's "2 arms [baseline, JANUS-FL]" c
 
 **Second backbone swapped too, same day:** `mobilenet_v2` (~2-2.5M params, no precedent in this sub-field) replaced by `fl/models.py::build_small_resnet` (~263K params, hand-built residual network, anchored to WhiteCloak's own CIFAR-10-L ResNet at 273K -- see FIX.md for the full writeup). `MVP_MODEL_BUILDERS` and `configs/mvp_3day.yaml`'s `mvp_scope.models` both updated to `[tiny_cnn, small_resnet]`. The run notebook (`RUN_MVP_TINY_CNN_MNIST.ipynb`) doesn't need any code change to run `small_resnet` next -- every cell reads `REAL_MODEL` generically (including the checkpoint filename), so switching to the second backbone after the first finishes is just `REAL_MODEL = 'small_resnet'` in the model-build cell. Not yet run on real Colab.
 
+**Remaining 3 of the 2x2 matrix built as separate notebooks, not a
+manual `REAL_MODEL` edit in-place, 2026-11-16:** generated
+`notebooks/RUN_MVP_TINY_CNN_FEMNIST.ipynb`,
+`notebooks/RUN_MVP_SMALL_RESNET_MNIST.ipynb`,
+`notebooks/RUN_MVP_SMALL_RESNET_FEMNIST.ipynb` via a new
+`notebooks/_build_mvp_run_notebooks.py` script, rather than hand-
+editing `RUN_MVP_TINY_CNN_MNIST.ipynb`'s `REAL_MODEL`/dataset cells in
+place -- lets all four (including #1) be run in parallel/separate
+sessions without one overwriting another's in-progress state, and
+keeps the shared cells (clone/install/sanity-check/git-checkpoint-
+setup/evaluate) generated from one source instead of four
+hand-maintained copies that could drift apart (same discipline as
+F13/F14 -- a shared bug fix only needs applying once, here). Each
+pushes to the SAME `colab-checkpoints` branch under a
+case+model-keyed filename, so no collision. FEMNIST dataset loading
+overrides `datasets.femnist.cache_dir` to a local Colab path
+(`/content/femnist_cache/`), same no-Drive pattern `RUN_MVP_TINY_CNN_
+MNIST.ipynb` already uses for MNIST's `source="torchvision"` override;
+FEMNIST's headline metric is `unseen_test` (writer-disjoint held-out
+writers, per `fl/data_noniid.py`/ROADMAP.md §3.4), not `global_val` --
+deliberately different from MNIST's eval cell, which uses the official
+`test` split as its headline. Verified to the extent this sandbox
+allows (no torch/GPU/network here, same limitation as every other
+torch-dependent artifact in this repo): all three are valid JSON,
+cell-for-cell structurally identical to the already-run tiny_cnn+MNIST
+notebook except where dataset/model genuinely differ, every code
+cell's Python syntax parses cleanly (`ast.parse`, Jupyter magics
+stripped with indentation preserved), and the `build_model`/
+`prepare_case1`/`prepare_case2` call sites match their real function
+signatures by direct inspection. 113 passed, 5 skipped locally,
+unchanged (no `fl/` or `crypto/` code touched by this addition, only
+new notebooks + their generator script). **Not yet run on Colab --
+same as the rest of this matrix.**
+
 ## What is NOT cut, scope-wise (for context when reading the above)
 
 Per `ROADMAP.md` §0.1: all 13 crypto primitives, both circuit specifications, the full `R_cons` relation, the committee consent rule, double-masking, the mix cascade, and the V5 aggregation check are all present in this repo (as 🟡 or ✅ above) — none of the crypto/security surface was cut for the 3-day MVP, only the ML-scale parameters (2 backbones instead of 3, ~45 rounds instead of 120-150, 1 seed instead of 3, 5 attacks instead of 7).
