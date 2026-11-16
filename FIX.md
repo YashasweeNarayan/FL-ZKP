@@ -1648,3 +1648,39 @@ What changes is wall-clock time: real GPU compute for the forward/
 backward pass instead of CPU, which should meaningfully shorten all
 four queued MVP runs (especially `small_resnet`, ~13x more params
 than `tiny_cnn`). Worth having landed before tonight's runs, not after.
+
+## F16 — concurrent MVP run notebooks racing on the shared checkpoint branch (2026-11-16)
+
+**Context**: live on the real tiny_cnn+MNIST rerun (first GPU-confirmed
+run, device=cuda), round 0's checkpoint push failed with git's
+standard non-fast-forward rejection ("the remote contains work that
+you do not have locally").
+
+**Root cause**: all four MVP run notebooks (F13/F15/the matrix added
+2026-11-16) deliberately share ONE `colab-checkpoints` branch, keyed
+apart only by checkpoint filename (case+model). That's fine for
+non-overlapping file writes, but `push_checkpoint_to_git` never
+re-synced with the remote before pushing -- so if a second notebook
+(one of the other 3 in the matrix) pushes to the same branch between
+this notebook's last fetch and its own push, the push is rejected
+outright, with no retry logic beyond "try again next round" (which
+hits the exact same problem if the other notebook is still running).
+
+**Fix**: `push_checkpoint_to_git` (all 5 run notebooks, plus
+`notebooks/_build_mvp_run_notebooks.py`'s template) now retries once
+on a push rejection: `git fetch` + `git rebase origin/<branch>`, then
+push again. Since every notebook only ever commits its own filename,
+the rebase has nothing to conflict on and always auto-merges cleanly.
+If the rebase itself somehow fails, it's aborted cleanly and the
+original warning is printed -- no change in the no-retry-logic
+fallback behavior from F13.
+
+**Applied live, hot-patch first**: the exact new function body was
+handed to the user as a paste-into-a-new-cell snippet for the
+already-running session (Python functions are called by reference
+each round, so redefining it mid-run takes effect from the next round
+with no restart needed) before being committed to source for every
+future/restarted run.
+
+113 passed, 5 skipped, unchanged (notebook-only change, no fl/ or
+crypto/ code touched).

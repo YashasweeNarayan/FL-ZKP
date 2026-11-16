@@ -220,7 +220,16 @@ def push_checkpoint_to_git(ckpt_path, round_idx):
     \"\"\"on_checkpoint_saved callback for run_training_loop (fl/round_loop.py,
     2026-11-16). Never raises -- a push failure costs a retry next round,
     not the training run; the checkpoint is already safe on local disk
-    regardless of whether this push succeeds.\"\"\"
+    regardless of whether this push succeeds.
+
+    2026-11-16: all four MVP run notebooks share this SAME
+    'colab-checkpoints' branch (different checkpoint filenames, same
+    branch) -- if two are run concurrently, a plain push can lose a
+    race with the other notebook's push and get rejected as
+    non-fast-forward. Each notebook only ever commits its OWN
+    checkpoint filename, so a fetch+rebase onto the remote tip always
+    auto-merges cleanly; retried once below before giving up for this
+    round (next round's push tries again from scratch regardless).\"\"\"
     try:
         _git(["add", "-A"])
         commit = _git(["commit", "-m", f"checkpoint: round {round_idx}"], check=False)
@@ -229,7 +238,19 @@ def push_checkpoint_to_git(ckpt_path, round_idx):
             return
         push = _git(["push", "-u", "origin", CKPT_BRANCH], check=False)
         if push.returncode != 0:
-            print(f"  [checkpoint push WARNING] round {round_idx} saved locally but push FAILED "
+            # Lost a race with a concurrent writer (another MVP run
+            # notebook on this same shared branch) -- fetch + rebase
+            # onto the remote tip and retry once.
+            _git(["fetch", "origin", CKPT_BRANCH], check=False)
+            rebase = _git(["rebase", f"origin/{CKPT_BRANCH}"], check=False)
+            if rebase.returncode == 0:
+                push2 = _git(["push", "-u", "origin", CKPT_BRANCH], check=False)
+                if push2.returncode == 0:
+                    print(f"  [checkpoint] round {round_idx}: lost a race, rebased, retried -- now pushed.")
+                    return
+            else:
+                _git(["rebase", "--abort"], check=False)
+            print(f"  [checkpoint push WARNING] round {round_idx} saved locally but push FAILED even after rebase retry "
                   f"(will retry next round): {push.stderr.strip()[-300:]}")
         else:
             print(f"  [checkpoint] round {round_idx} pushed to '{CKPT_BRANCH}' -- safe against a disconnect now.")
