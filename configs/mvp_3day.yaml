@@ -62,7 +62,29 @@ evidence:
   n_permutations: 3000       # conformal calibration sample size
 
 dp:
-  sigma: 2.5                 # distributed Gaussian noise, aggregate sigma before per-client splitting
+  # 0.0 = DP layer DISABLED (FIX.md F19, 2026-11-17). fl/client.py treats
+  # sigma <= 0 as "no noise at all, for every client" -- an explicit,
+  # documented state, not a degenerate one.
+  #
+  # Why off: at this configuration there is no sigma that gives BOTH a
+  # reportable epsilon AND usable accuracy. sigma=2.5 (eps=2.81 @ 20
+  # rounds) injected a per-client noise vector of L2 norm ~101 for
+  # tiny_cnn and ~367 for small_resnet, which measured out at 42.4%
+  # MNIST / 1.3% FEMNIST accuracy -- below even the DP-degraded
+  # literature benchmark (~75% on MNIST). Getting the noise norm down to
+  # single digits needs sigma ~0.025-0.1, i.e. eps of 200-3000, which is
+  # not a privacy guarantee worth reporting.
+  #
+  # With DP off, the privacy claim rests on the cryptographic layer
+  # (anonymity via ring signatures, secure aggregation, ZK proofs,
+  # threshold traceability) and the threat model is stated accordingly:
+  # individual updates stay confidential in transit and unlinkable to
+  # their author; inference from the RELEASED AGGREGATE is explicitly
+  # out of scope. This matches the peer group (PQS-BFL, ZK-FL).
+  #
+  # To re-enable as an ablation, set a positive sigma -- the whole code
+  # path is intact and crypto/dp.py's RDPAccountant converts it to eps.
+  sigma: 0.0
   delta: 1.0e-5
 
 mixnet:

@@ -23,9 +23,10 @@ Each run is fully independent: its own checkpoint filename AND its
 own dedicated git branch (FIX.md F17, 2026-11-17 -- a shared branch
 across all four meant every push collided when they ran concurrently,
 even with F16's fetch+rebase retry). Uses the SAME `fl/client.py`
-DP-noise fix (FIX.md F14, 2026-11-16) as the tiny_cnn+MNIST run --
-there is no stale-checkpoint concern for these three, since they've
-never been run before this fix landed.
+DP-noise fix (FIX.md F14, 2026-11-16) as the tiny_cnn+MNIST run.
+As of FIX.md F19 (2026-11-17) the DP layer is disabled outright
+(`dp.sigma: 0.0`) and every emitted notebook checkpoints to a `_nodp`
+filename, so no DP-era checkpoint can be resumed by accident.
 
 Run this file (not the notebooks it emits) if the shared cells ever
 need to change.
@@ -370,9 +371,20 @@ see `notebooks/_build_mvp_run_notebooks.py`, which generated this file.
 the crypto pipeline every round -- `sampling_rate` only gates real-vs-
 zero local training, not crypto participation), 20 rounds.
 
-**DP-noise fix (FIX.md F14, 2026-11-16) already in `fl/client.py`
-before this notebook's first run** -- unlike the tiny_cnn+MNIST run,
-there is no stale/pre-fix checkpoint to worry about resuming from here.
+**The DP layer is OFF for this run (FIX.md F19, 2026-11-17).**
+`configs/mvp_3day.yaml` ships `dp.sigma: 0.0`, and `fl/client.py`
+treats that as "no noise at all, for every client" -- so the accuracy
+this run reports is the framework's utility WITHOUT any differential-
+privacy noise. The privacy claim rests on the cryptographic layer
+instead (ring-signature anonymity, double-masked secure aggregation,
+the ZK range/norm proofs, threshold traceability); inference from the
+released aggregate is explicitly out of the threat model. The whole DP
+code path is intact and re-enabling it is a one-line config change --
+see that config's `dp` block, and FIX.md F19 for the measurements that
+led here (42.4% MNIST / 1.3% FEMNIST with DP on).
+
+Checkpoints for this run carry a `_nodp` suffix, so nothing written
+during the DP era can be resumed by accident.
 
 **GPU placement fix (2026-11-16) also already in place**: model and
 every mini-batch now move onto CUDA when available (cell 8 prints
@@ -475,7 +487,14 @@ REAL_ROUNDS = 20  # down from CFG['mvp_scope']['rounds_per_run'] (45) -- see mar
 # Filename includes case prefix + model for readability, but collision
 # with the other MVP run notebooks is now impossible by construction:
 # each notebook pushes to its own dedicated branch (see FIX.md F17).
-CKPT_PATH = f'{{CKPT_DIR}}/{cfg["case_prefix"]}_{{REAL_MODEL}}_r{{REAL_ROUNDS}}.pt'
+#
+# '_nodp' suffix (FIX.md F19, 2026-11-17): the DP layer is now disabled
+# (configs/mvp_3day.yaml, dp.sigma: 0.0). Every checkpoint written
+# BEFORE that change was trained with DP noise that measured out at
+# 42.4% MNIST / 1.3% FEMNIST accuracy, and resuming from one would carry
+# those noise-corrupted weights into this run. New filename so this
+# starts clean from round 0 instead of silently continuing them.
+CKPT_PATH = f'{{CKPT_DIR}}/{cfg["case_prefix"]}_{{REAL_MODEL}}_r{{REAL_ROUNDS}}_nodp.pt'
 
 root_norms = bootstrap_norms_from_model_dim(
     model_dim=dim,
@@ -695,7 +714,10 @@ CHEATER_CLIENT_IDX = list(CHEATER_INDICES)  # single source of truth: fl/attacks
 
 # Own checkpoint filename -- distinct from the clean run's and from
 # every other attack variant's, so this run never cross-resumes.
-CKPT_PATH = f'{{CKPT_DIR}}/{cfg.case_prefix}_{{REAL_MODEL}}_r{{REAL_ROUNDS}}_withattack{N_CHEATERS}.pt'
+# '_nodp' suffix: FIX.md F19 (2026-11-17) disabled the DP layer; any
+# checkpoint written before that carries noise-corrupted weights, so a
+# new filename keeps this run from resuming one.
+CKPT_PATH = f'{{CKPT_DIR}}/{cfg.case_prefix}_{{REAL_MODEL}}_r{{REAL_ROUNDS}}_withattack{N_CHEATERS}_nodp.pt'
 
 root_norms = bootstrap_norms_from_model_dim(
     model_dim=dim,

@@ -1921,3 +1921,101 @@ notebooks' JSON + per-cell syntax re-validated; `CKPT_REPO_DIR`
 confirmed as `/kaggle/working/FL-ZKP-checkpoints` and `CKPT_BRANCH`
 confirmed unchanged (still the per-notebook dedicated branch from F17)
 in all 4. 120 passed, 5 skipped, unchanged (notebook-only change).
+
+## F19 — DP layer disabled; privacy claim moved onto the crypto layer (2026-11-17)
+
+**Evidence that forced this.** Two completed 20-round runs came back at
+chance-or-near-chance accuracy:
+
+| run | accuracy | chance level |
+|---|---|---|
+| `small_resnet` + FEMNIST (round 19) | 1.34% unseen-writer / 1.49% global_val | 1/62 ≈ 1.6% |
+| `tiny_cnn` + MNIST (round 19) | 42.35% official test / 40.42% global_val | 1/10 = 10% |
+
+Both ran entirely AFTER F14 and F15 landed (checkpoint push timestamps
+checked against commit times), so neither is explained by those bugs.
+
+**Diagnosis.** `fl/client.py` added `nu_k` with a per-coordinate std of
+`sigma_dp / sqrt(p*n) = 2.5/sqrt(12.5) ≈ 0.707`, fixed regardless of
+model size. The noise VECTOR norm therefore scales as `sqrt(model_dim)`:
+≈101 for `tiny_cnn` (20,586 params) and ≈367 for `small_resnet`
+(269,166 params) — a 3.6× penalty for the larger model purely from
+dimension, buying no extra privacy. That ordering matches the observed
+severity exactly (small model degraded, large model wiped out).
+
+**Secondary finding, recorded for any future re-enablement**: there is
+a unit mismatch between the accountant and the mechanism.
+`crypto/dp.py::RDPAccountant` documents `sigma` as
+`noise_std / clip_norm` — a RATIO, per the standard DP-SGD definition —
+but `fl/client.py` used it as an ABSOLUTE per-coordinate std, and
+nothing ever clipped a delta to a fixed sensitivity `C`.
+`ARCHITECTURE.md` line 411 claims "clipping already enforced by R_norm:
+‖q_k‖₂ ≤ B_t", but `B_t` is an adaptive median+MAD threshold that
+*rejects* rather than rescales, and it drifts with the data. So the ε
+one would report and the noise actually injected were not connected by
+the standard relationship — a referee checking one against the other
+would find it.
+
+**Why disabling rather than retuning.** Running the accountant across
+the σ range shows no setting that gives both a reportable ε and usable
+accuracy at this configuration:
+
+| sigma_dp | ‖nu‖ tiny_cnn | ‖nu‖ small_resnet | eps (20 rounds) |
+|---|---|---|---|
+| 2.500 | 101.5 | 366.9 | 2.81 |
+| 1.000 | 40.6 | 146.7 | 8.09 |
+| 0.500 | 20.3 | 73.4 | 19.80 |
+| 0.100 | 4.1 | 14.7 | 208.62 |
+| 0.025 | 1.0 | 3.7 | 3021.12 |
+
+Getting the noise into a range the signal can survive costs ε in the
+hundreds to thousands. Note this was NOT verified against a measured
+`‖Δ_k‖` — torch is unavailable in the sandbox, so the signal side of
+the ratio is inferred, not measured. Recorded as a known gap: a short
+instrumented run printing `‖Δ_k‖` next to `‖ν_k‖` would settle it, and
+should be done before any re-enablement.
+
+**Change.**
+- `crypto/dp.py`: new `dp_noise_share(sigma_dp, sampling_rate,
+  n_clients, model_dim, b_k, rng=None)`. Returns the exact zero vector
+  when `b_k` is False (the F14 dummy-client gate) OR when
+  `sigma_dp <= 0` (the new DP-disabled state), and otherwise the same
+  `N(0, (sigma_dp/sqrt(p*n))^2 I)` draw as before. Placed in
+  `crypto/dp.py` rather than `fl/client.py` deliberately: it is pure
+  numpy, and `fl.client` transitively imports `crypto.pedersen`, which
+  does a hash-to-point at module import time and needs a group backend —
+  so housing it here lets it be unit-tested in a network-less sandbox
+  without switching the whole pytest process onto the slow pure-Python
+  backend (an earlier attempt that set `JANUS_ALLOW_PURE_PYTHON_GROUP=1`
+  at test-module scope did exactly that and took the suite from 15s to
+  over 2 minutes).
+- `fl/client.py`: the inline noise block in `round_step_phase1` now
+  calls `dp_noise_share`; behaviour identical when DP is on.
+- `configs/mvp_3day.yaml`: `dp.sigma: 0.0`, with the reasoning and the
+  re-enable instructions in the config itself.
+- `ARCHITECTURE.md` §6.5: status banner stating the layer is disabled,
+  what the threat model now claims and explicitly does NOT claim
+  (inference from the released aggregate is out of scope), the
+  peer-group precedent, and the clipping/accountant mismatch to fix
+  first if it is ever turned back on.
+- All 8 run notebooks: checkpoint filenames gain a `_nodp` suffix
+  (`case1_tiny_cnn_r20_nodp.pt`,
+  `case2_small_resnet_r20_withattack7_nodp.pt`, …) so no DP-era
+  checkpoint can be resumed by accident — same mechanism F9 and F14
+  used. Checkpoint BRANCHES are unchanged (the F17 per-notebook
+  branches still apply).
+- `tests/test_dp_disabled.py` (6 new tests): exact zeros for a sampled
+  client with DP off; exact zeros for a dummy client; negative sigma
+  also treated as disabled (rather than reaching `np.random.normal`
+  with a negative scale, which raises); F14 regression — dummy still
+  gets zeros when DP is ON; the DP-enabled path still produces noise at
+  the correct `sigma_dp/sqrt(p*n)` scale; and the shipped config
+  actually has DP off, so re-enabling it can't happen silently.
+
+**Verification**: 126 passed, 5 skipped (120 + 6 new), suite still
+~15s. Separately ran the 24 normally-skipped crypto tests
+(`test_round_end_to_end.py`, `test_f7e_aggregate.py`) against the real
+pure-Python group backend — all 24 pass, confirming the
+`dp_noise_share` extraction did not disturb the round pipeline. All 9
+notebooks' JSON + per-cell Python syntax re-validated; all 8 checkpoint
+filenames confirmed unique and `_nodp`-suffixed.

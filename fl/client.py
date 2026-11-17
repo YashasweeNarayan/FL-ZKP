@@ -20,7 +20,7 @@ import numpy as np
 
 from crypto.ristretto import Scalar, Point, scalar_mul_base
 from crypto.vrf import evaluate as vrf_evaluate, is_sampled as vrf_is_sampled
-from crypto.dp import split_noise
+from crypto.dp import dp_noise_share
 from crypto.secagg import pairwise_mask_cached, self_mask, self_secret_bytes, shamir_share_self_secret, P_MASK
 from crypto.pedersen import commit as pedersen_commit
 from crypto.elgamal_threshold import encrypt as elgamal_encrypt
@@ -437,12 +437,34 @@ def round_step_phase1(
     # computed -- a dummy client's nu_k is now the exact zero vector,
     # so its q_k = Quantize(0 + 0) = 0 as the spec requires, and only
     # genuinely-sampled clients' noise enters the aggregate sum.
-    if b_k:
-        per_client_sigma = sigma_dp / np.sqrt(max(sampling_rate * n_clients, 1e-9))
-        noise_shares = split_noise(per_client_sigma, n_shares=1, dim=ctx.model_dim, rng=np.random.default_rng())
-        nu_k = noise_shares[0]
-    else:
-        nu_k = np.zeros(ctx.model_dim, dtype=np.float64)
+    # FIX.md F19 (2026-11-17): sigma_dp <= 0 means the DP layer is
+    # DISABLED, and nu_k is the exact zero vector for EVERY client,
+    # sampled or not. This is a deliberate, configured state (set
+    # `dp.sigma: 0.0`), not a degenerate one: the framework's privacy
+    # claim then rests entirely on the cryptographic layer (ring
+    # signatures for anonymity/unlinkability, double-masked secure
+    # aggregation so the server never sees an individual update, the
+    # Sigma/range proofs for correctness-without-disclosure, and
+    # threshold traceability for accountability) and NOT on any
+    # (eps, delta) statistical guarantee against inference from the
+    # released aggregate. See FIX.md F19 for why, and for the peer-group
+    # precedent (PQS-BFL, the ZK-FL family) for crypto-first FL
+    # frameworks that make exactly this threat-model split.
+    #
+    # Checked explicitly rather than leaning on np.random.normal's
+    # scale=0.0 behaviour, so that "DP is off" is visible at the call
+    # site and in the config instead of being an emergent property of
+    # a numpy edge case. Both the b_k gate (F14) and the sigma_dp <= 0
+    # gate (F19) live in dp_noise_share, which is unit-tested directly
+    # (tests/test_dp_disabled.py) -- round_step_phase1 itself needs too
+    # much setup (ring, keys, VRF, model) to assert this cheaply.
+    nu_k = dp_noise_share(
+        sigma_dp=sigma_dp,
+        sampling_rate=sampling_rate,
+        n_clients=n_clients,
+        model_dim=ctx.model_dim,
+        b_k=b_k,
+    )
 
     # Step 3: quantize.
     try:

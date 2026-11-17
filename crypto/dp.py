@@ -27,6 +27,52 @@ def split_noise(total_sigma: float, n_shares: int, dim: int, rng: np.random.Gene
     return [rng.normal(0.0, per_share_sigma, size=dim) for _ in range(n_shares)]
 
 
+def dp_noise_share(
+    sigma_dp: float,
+    sampling_rate: float,
+    n_clients: int,
+    model_dim: int,
+    b_k: bool,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """One client's share nu_k of the round's distributed Gaussian noise.
+
+    Lives here rather than in fl/client.py (its only caller) so it can be
+    unit-tested without dragging in the group backend: fl.client imports
+    crypto.pedersen, which does a hash-to-point at module import time and
+    needs rbcl. This function is ordinary numpy, like the rest of this
+    module.
+
+    Returns the EXACT zero vector in two distinct cases, which must not
+    be confused with each other:
+
+    1. `b_k` is False -- this client was not VRF-sampled this round, so
+       it is a dummy submitting q_k = 0 (FIX.md F14, ARCHITECTURE.md
+       line 201). Noise from dummies would inflate the aggregate past
+       the configured sigma_dp, because all n=50 submissions are summed
+       server-side while the sqrt(p*n) scaling assumes only the ~p*n
+       sampled clients contribute noise.
+
+    2. `sigma_dp <= 0` -- the DP layer is DISABLED by configuration
+       (FIX.md F19). Then NO client adds noise, sampled or not, and the
+       framework's privacy claim rests entirely on the cryptographic
+       layer rather than on any (eps, delta) guarantee. This is an
+       explicit configured state; see configs/mvp_3day.yaml's own `dp`
+       block for the reasoning and for how to re-enable it.
+
+    Otherwise draws N(0, per_client_sigma^2 I) with
+    per_client_sigma = sigma_dp / sqrt(p * n), so that the ~p*n sampled
+    clients' shares sum to one draw at the configured aggregate sigma_dp.
+    """
+    dp_enabled = sigma_dp > 0.0
+    if not (b_k and dp_enabled):
+        return np.zeros(model_dim, dtype=np.float64)
+    per_client_sigma = sigma_dp / np.sqrt(max(sampling_rate * n_clients, 1e-9))
+    if rng is None:
+        rng = np.random.default_rng()
+    return split_noise(per_client_sigma, n_shares=1, dim=model_dim, rng=rng)[0]
+
+
 @dataclass
 class RDPAccountant:
     """Renyi-DP accountant for the subsampled Gaussian mechanism.

@@ -405,6 +405,14 @@ Epoch e, roster C^(e), t=7, n_c=10, PK_trace fixed
 
 ### 6.5 Distributed differential privacy (limitation 2, fixed)
 
+> **STATUS (2026-11-17, FIX.md F19): this layer is DISABLED in the shipped configuration.** `configs/mvp_3day.yaml` sets `dp.sigma: 0.0`, and `crypto/dp.py::dp_noise_share` treats `σ ≤ 0` as "no noise at all, for any client". The design below is implemented, tested, and re-enabled by a one-line config change, but the reported experiments run **without** it.
+>
+> Why: at this configuration no σ gives both a reportable ε and usable accuracy. σ=2.5 (ε=2.81 over 20 rounds at p=0.25, δ=1e-5) injects a per-client noise vector of L2 norm ≈101 for `tiny_cnn` and ≈367 for `small_resnet`, which measured out at **42.4% MNIST / 1.3% FEMNIST** accuracy — below the ~75% MNIST figure typical of DP-FL in the literature. Bringing the noise norm into single digits needs σ≈0.025–0.1, i.e. ε of 200–3000, which is not a guarantee worth claiming.
+>
+> **Consequence for the threat model.** With DP off, the claim is that individual updates stay confidential and unlinkable to their author — via ring-signature anonymity (§5), double-masked secure aggregation (§6), the ZK norm/range proofs, and threshold traceability. Inference from the **released aggregate** (membership inference, gradient inversion on the sum) is explicitly **out of scope**, and §6.5's premise below is therefore an acknowledged open limitation rather than a solved one. This is the same threat-model split made by crypto-first FL frameworks such as PQS-BFL and the ZK-FL family, none of which include DP.
+>
+> Note also that the `clipping` line below is **aspirational as implemented**: `B_t` is an adaptive median+MAD threshold that *rejects* over-norm submissions rather than rescaling them to a fixed sensitivity `C`, so it does not function as the DP clipping step the accounting assumes. Any future re-enablement should fix that first — `crypto/dp.py::RDPAccountant` documents `sigma` as `noise_std / clip_norm`, a ratio, which the mechanism never divided by.
+
 Masking hides individual updates. It does not hide the **sum**, which is released every round for 120 rounds. Multi-round aggregate release is a real leakage channel, and gradient inversion on small-cohort aggregates is not safe by assumption.
 
 ```
