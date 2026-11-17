@@ -474,13 +474,19 @@ print(REAL_MODEL, "param count:", dim)
 
 def run_cell(cfg):
     case_data_var = f"{cfg['case_prefix']}_data"
+    if cfg["case_prefix"] == "case1":
+        headline_split, headline_desc = "test", "official MNIST test accuracy"
+    else:
+        headline_split, headline_desc = "unseen_test", "unseen-writer FEMNIST test accuracy"
     return f"""\
 # 8. The real run: 20 rounds, checkpointed every round and pushed to
 # this notebook's own dedicated '{cfg["ckpt_branch"]}' git branch (see
 # the git-checkpoint-setup cell above -- CKPT_DIR/push_checkpoint_to_git
 # come from there, not Drive).
 import numpy as np
+import torch
 from fl.round_loop import run_training_loop, bootstrap_norms_from_model_dim, release_gpu_memory, load_checkpoint
+from fl.models import unflatten_to_state_dict
 
 REAL_ROUNDS = 20  # down from CFG['mvp_scope']['rounds_per_run'] (45) -- see markdown cell 0
 
@@ -508,6 +514,29 @@ resume_from = load_checkpoint(CKPT_PATH) if os.path.exists(CKPT_PATH) else None
 if resume_from is not None:
     print(f"found checkpoint at round {{resume_from['round']}} -- resuming, not restarting from round 0")
 
+# FIX.md F21 (2026-11-17): per-round accuracy on the headline split --
+# {headline_desc} -- the accuracy-vs-round convergence curve expected
+# of an FL paper, which this pipeline never tracked before (only one
+# end-of-run number, computed once in the eval cell below, after ALL
+# rounds finished). Forward-only pass (no backward, no optimizer step),
+# called once per completed round by run_training_loop's new optional
+# eval_fn hook -- the real per-round cost is the sampled clients'
+# local SGD (E=5 epochs each), not one extra forward-only inference
+# pass over the test set.
+_eval_images, _eval_labels = {case_data_var}['{headline_split}']
+
+def _eval_fn(round_idx, w_t_now):
+    device = next(model.parameters()).device
+    model.load_state_dict(unflatten_to_state_dict(w_t_now.to(device), model_shapes))
+    model.eval()
+    correct = 0
+    with torch.no_grad():
+        for i in range(0, len(_eval_images), 512):
+            bi = _eval_images[i:i + 512].to(device)
+            bl = _eval_labels[i:i + 512].to(device)
+            correct += (model(bi).argmax(dim=1) == bl).sum().item()
+    return {{"acc": correct / len(_eval_images)}}
+
 final_w_t, real_history = run_training_loop(
     model=model,
     model_dim=dim,
@@ -522,10 +551,18 @@ final_w_t, real_history = run_training_loop(
     checkpoint_path=CKPT_PATH,
     resume_from=resume_from,
     on_checkpoint_saved=push_checkpoint_to_git,
+    eval_fn=_eval_fn,
 )
 release_gpu_memory()
 n_accepted = sum(1 for h in real_history if not h['aborted'])
 print(f"done: {{len(real_history)}} rounds in history, {{n_accepted}} accepted (not aborted)")
+
+print("\\nper-round {headline_desc} (convergence curve):")
+for h in real_history:
+    if h.get('aborted'):
+        print(f"  round {{h.get('round')}}: ABORTED")
+    elif 'eval' in h:
+        print(f"  round {{h.get('round')}}: acc={{h['eval']['acc']:.4f}}")
 """
 
 
@@ -683,6 +720,10 @@ after the last completed round, it does not restart from round 0.
 
 def attack_run_cell(cfg):
     case_data_var = f"{cfg.case_prefix}_data"
+    if cfg.case_prefix == "case1":
+        headline_split, headline_desc = "test", "official MNIST test accuracy"
+    else:
+        headline_split, headline_desc = "unseen_test", "unseen-writer FEMNIST test accuracy"
     return f"""\
 # 8. The real run: 20 rounds, checkpointed every round and pushed to
 # this notebook's own dedicated '{cfg.ckpt_branch}' git branch (see the
@@ -705,7 +746,9 @@ def attack_run_cell(cfg):
 # cheater_force_delta being None), so this is a clean, single-mechanism
 # attack across all {N_CHEATERS}, not the composed one F11 found and fixed.
 import numpy as np
+import torch
 from fl.round_loop import run_training_loop, bootstrap_norms_from_model_dim, release_gpu_memory, load_checkpoint
+from fl.models import unflatten_to_state_dict
 from attacks.a1_scaling import craft_scaled_update
 from fl.attacks.mvp_matrix import CHEATER_INDICES
 
@@ -748,6 +791,25 @@ resume_from = load_checkpoint(CKPT_PATH) if os.path.exists(CKPT_PATH) else None
 if resume_from is not None:
     print(f"found checkpoint at round {{resume_from['round']}} -- resuming, not restarting from round 0")
 
+# FIX.md F21 (2026-11-17): per-round accuracy on the headline split --
+# {headline_desc} -- same convergence-curve hook as the clean-run
+# notebook (see RUN_MVP_{cfg.model.upper()}_{cfg.dataset_label}.ipynb), so this attack
+# run's "honest majority keeps converging while attackers are rejected"
+# claim has an accuracy curve to point to, not just the acceptance log.
+_eval_images, _eval_labels = {case_data_var}['{headline_split}']
+
+def _eval_fn(round_idx, w_t_now):
+    device = next(model.parameters()).device
+    model.load_state_dict(unflatten_to_state_dict(w_t_now.to(device), model_shapes))
+    model.eval()
+    correct = 0
+    with torch.no_grad():
+        for i in range(0, len(_eval_images), 512):
+            bi = _eval_images[i:i + 512].to(device)
+            bl = _eval_labels[i:i + 512].to(device)
+            correct += (model(bi).argmax(dim=1) == bl).sum().item()
+    return {{"acc": correct / len(_eval_images)}}
+
 final_w_t, real_history = run_training_loop(
     model=model,
     model_dim=dim,
@@ -764,10 +826,18 @@ final_w_t, real_history = run_training_loop(
     cheater_client_idx=CHEATER_CLIENT_IDX,
     cheater_force_delta=malicious_delta,
     on_checkpoint_saved=push_checkpoint_to_git,
+    eval_fn=_eval_fn,
 )
 release_gpu_memory()
 n_accepted = sum(1 for h in real_history if not h['aborted'])
 print(f"done: {{len(real_history)}} rounds in history, {{n_accepted}} accepted (not aborted)")
+
+print("\\nper-round {headline_desc} (convergence curve, honest-majority signal):")
+for h in real_history:
+    if h.get('aborted'):
+        print(f"  round {{h.get('round')}}: ABORTED")
+    elif 'eval' in h:
+        print(f"  round {{h.get('round')}}: acc={{h['eval']['acc']:.4f}}")
 
 print("\\nper-round attacker verdict:")
 attacker_ever_accepted = {{}}

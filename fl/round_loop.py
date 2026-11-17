@@ -42,6 +42,7 @@ from .vector_store import (
 from .norm_rule import bootstrap_from_server_root, update_threshold_ema
 from .suspect_tracker import SuspectTracker
 from .models import flatten_state_dict, unflatten_to_state_dict
+from .eval_hook import EVAL_FAILED, run_eval_fn_safely
 
 
 def release_gpu_memory() -> None:
@@ -298,6 +299,7 @@ def run_training_loop(
     suspect_tracker: "SuspectTracker" = None,  # FIX.md F7f: what happens to a suspect group. None -> fresh tracker (no history from a previous call to this function). Pass the SAME instance across multiple run_training_loop calls to keep ban/quarantine state across them.
     cheater_client_idx: "int | list[int] | set[int] | None" = None,  # ATTACK SIMULATION ONLY (FIX.md F7e/F7f Colab gate) -- see round_step_phase2's _cheat_zero_sketch docstring. Never set this for a real round. None -> no cheater, the honest default. FIX.md 2026-11-16: generalized from a single int to also accept a list/set of indices, for a malicious-FRACTION run (e.g. 7 of 50 clients) rather than one lone cheater -- a bare int still works exactly as before (every existing call site, F11's gate included, is unaffected), it's just normalized to a one-element set internally. Every named index gets the SAME cheater_force_delta (see below) and the SAME _cheat_zero_sketch treatment; there is currently no way to give different indices different attacks in one call -- for that, call this function with disjoint index sets across SEPARATE attack-type notebooks/cells, not by composing it here.
     cheater_force_delta: "np.ndarray | None" = None,  # ATTACK SIMULATION ONLY (FIX.md F10's follow-up, attacks/a1_scaling.py run through a real round). Only takes effect when cheater_client_idx is also set -- EVERY index named by cheater_client_idx gets round_step_phase1's _force_delta=cheater_force_delta instead of its real (trained-or-zero) delta, so a crafted model-replacement-scale update goes through the REAL masking/sketching/range-proof pipeline alongside genuinely honest clients in the same round, rather than a hand-built submission tested in isolation. None -> no override (default; also a no-op if cheater_client_idx is None).
+    eval_fn: "callable | None" = None,  # FIX.md F21 (2026-11-17): optional (round_idx, w_t) -> dict|float callback, called once per successfully-completed round, right after this round's w_t is applied -- result stored under history[-1]["eval"]. Lets a caller get an accuracy-vs-round curve (the standard convergence-curve benchmark expected of an FL paper) without this module importing torch/eval logic itself: the caller's notebook already has evaluate_accuracy + model_shapes + the test set, so it closes over those and passes a thin wrapper. None -> no eval, no extra cost, existing callers (tests, attack notebooks that don't pass this) are unaffected. An exception from eval_fn is caught and logged, never allowed to abort training -- an eval bug must not cost a round of already-paid-for GPU + crypto work.
     f7f_share_threshold: int = 4,  # FIX.md F7f (2026-11-15): a SEPARATE, low Shamir threshold for F7f's subgroup reconstruction during bisection -- NEVER the main secagg_share_threshold. The main threshold (default (2n/3)+1, a super-majority chosen for the WHOLE round's dropout/collusion resistance) is almost always bigger than any bisection-floor-sized subgroup, so reusing it for F7f made every leaf group unverifiable and therefore automatically "suspect" regardless of guilt (Gate E caught this: an innocent client got banned, the real cheater never did). This threshold governs a SECOND, independent Shamir sharing of each client's secrets, used ONLY during F7f's subgroup checks -- the main round's security is untouched by this value.
     checkpoint_path: str = None,  # 2026-11-15, scaling to real multi-hour Colab free-tier runs: if given, save {w_t, threshold, history, suspect_tracker, round} to this path after EVERY round -- a run that spans hours on a free-tier runtime that can disconnect at any time otherwise loses everything on a disconnect. None -> no checkpointing (matches every prior call site's behavior exactly).
     resume_from: dict = None,  # output of load_checkpoint(checkpoint_path) from an earlier, interrupted call. Restores w_t/threshold/history/suspect_tracker and resumes at the round AFTER the checkpointed one, instead of starting over at round 0. None -> fresh start (default, matches every prior call site).
@@ -754,6 +756,21 @@ def run_training_loop(
                 "aggregate_exact": aggregate_exact,
                 "B_t": threshold.B_t,
             })
+
+            # FIX.md F21: per-round accuracy, if the caller asked for it.
+            # w_t is already this round's real aggregated global update
+            # (apply_update ran above) -- eval_fn gets the actual
+            # federated result for this round, not a stray last-client
+            # overfit (see this function's own docstring note below for
+            # why `model` itself can't be trusted mid-loop). Routed
+            # through fl.eval_hook.run_eval_fn_safely (its own module --
+            # see that module's docstring for why) so a real eval
+            # failure vs. "no eval_fn given" are distinguishable, and so
+            # this one line is unit-testable without torch -- this loop
+            # itself cannot run in a sandbox with no torch installed.
+            _eval_result = run_eval_fn_safely(eval_fn, t_round, w_t, verbose)
+            if _eval_result is not None and _eval_result is not EVAL_FAILED:
+                history[-1]["eval"] = _eval_result
         finally:
             # Releases this round's resident arrays and deletes any
             # spill files -- on the normal path and on every `continue`
