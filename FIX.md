@@ -1886,3 +1886,38 @@ any training round, so there was no state to resume).
 byte-identical again (only the attack template changed). All 4
 WITH_ATTACK notebooks' JSON + per-cell Python syntax re-validated.
 120 passed, 5 skipped, unchanged (notebook-only change).
+
+## F18 follow-up — WITH_ATTACK notebooks moved to Kaggle, checkpoint dir updated (2026-11-17)
+
+**Context**: all 4 attack-variant notebooks are now run on Kaggle
+instead of Colab (clean-run notebooks stay on Colab). The user had
+already validated this manually on their Kaggle copy of
+`RUN_MVP_TINY_CNN_FEMNIST_WITH_ATTACK.ipynb`: `/content/FL-ZKP-checkpoints`
+still works on Kaggle (clone/install/sanity/dataset cells never needed
+changing -- Kaggle accepts writes there too), but only
+`/kaggle/working/` is actually surfaced as notebook output when a
+Kaggle session ends, so the checkpoint clone needs to live there
+specifically to be retrievable.
+
+**Fix**: `notebooks/_build_mvp_run_notebooks.py`'s
+`_GIT_CHECKPOINT_CELL_TEMPLATE` parametrized on a second placeholder
+(`__CKPT_REPO_DIR_PLACEHOLDER__`, same pattern F17 used for the branch
+name); `git_checkpoint_cell()` takes a new `ckpt_repo_dir` parameter
+defaulting to `/content/FL-ZKP-checkpoints` (so every CLEAN run
+notebook, still on Colab, is unaffected), and `build_attack_notebook()`
+passes `/kaggle/working/FL-ZKP-checkpoints` explicitly. The 3
+generator-built attack notebooks were regenerated; the hand-built
+`RUN_MVP_TINY_CNN_MNIST_WITH_ATTACK.ipynb` was hand-patched the same
+way. **The GitHub PAT entry was NOT changed to a hardcoded token** --
+despite the user's own already-edited Kaggle cell hardcoding one as an
+example of the directory fix, every committed notebook keeps prompting
+for the PAT via `getpass()` (hidden input, never written to disk or
+committed); a real token committed to a GitHub-hosted notebook is a
+credential leak regardless of repo visibility.
+
+**Verification**: confirmed the 3 clean-run notebooks are byte-identical
+again (only the attack-notebook code path changed). All 4 WITH_ATTACK
+notebooks' JSON + per-cell syntax re-validated; `CKPT_REPO_DIR`
+confirmed as `/kaggle/working/FL-ZKP-checkpoints` and `CKPT_BRANCH`
+confirmed unchanged (still the per-notebook dedicated branch from F17)
+in all 4. 120 passed, 5 skipped, unchanged (notebook-only change).

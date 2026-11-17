@@ -200,7 +200,7 @@ _GIT_CHECKPOINT_CELL_TEMPLATE = """\
 import subprocess
 from getpass import getpass
 
-CKPT_REPO_DIR = "/content/FL-ZKP-checkpoints"
+CKPT_REPO_DIR = "__CKPT_REPO_DIR_PLACEHOLDER__"
 # 2026-11-17: each of the 4 MVP run notebooks gets its OWN branch, not
 # one shared branch -- see FIX.md F17. Running all four at once on one
 # shared branch caused every single push to collide and fail (12/12
@@ -287,8 +287,20 @@ def push_checkpoint_to_git(ckpt_path, round_idx):
 """
 
 
-def git_checkpoint_cell(ckpt_branch):
-    return _GIT_CHECKPOINT_CELL_TEMPLATE.replace("__CKPT_BRANCH_PLACEHOLDER__", ckpt_branch)
+def git_checkpoint_cell(ckpt_branch, ckpt_repo_dir="/content/FL-ZKP-checkpoints"):
+    # ckpt_repo_dir default matches every CLEAN run notebook (Colab's
+    # writable /content/). 2026-11-17: the attack-variant notebooks are
+    # now run on Kaggle instead (see FIX.md), whose writable, output-
+    # preserved directory is /kaggle/working/, not /content/ -- Kaggle
+    # does accept writes under /content/ too, which is why the earlier
+    # clone/install/sanity/dataset cells never failed there, but only
+    # /kaggle/working/ is actually surfaced as notebook output when the
+    # session ends, which is the reason to use it here specifically.
+    return (
+        _GIT_CHECKPOINT_CELL_TEMPLATE
+        .replace("__CKPT_BRANCH_PLACEHOLDER__", ckpt_branch)
+        .replace("__CKPT_REPO_DIR_PLACEHOLDER__", ckpt_repo_dir)
+    )
 
 
 EVAL_MD = """\
@@ -789,7 +801,7 @@ def build_attack_notebook(cfg):
         ("code", RING_CELL),
         ("code", model_cell(cfg_dict)),
         ("md", CHECKPOINT_MD),
-        ("code", git_checkpoint_cell(cfg.ckpt_branch)),
+        ("code", git_checkpoint_cell(cfg.ckpt_branch, ckpt_repo_dir="/kaggle/working/FL-ZKP-checkpoints")),
         ("code", attack_run_cell(cfg)),
         ("md", EVAL_MD),
         ("code", eval_cell(cfg_dict)),
