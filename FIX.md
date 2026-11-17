@@ -1851,3 +1851,38 @@ attack notebooks' JSON validated, every code cell's Python re-checked
 with `ast.parse` (shell magics stripped, indentation preserved), each
 notebook's `CKPT_BRANCH` literal confirmed against the table in
 `fl/attacks/mvp_matrix.py`. 120 passed (113 + 7 new), 5 skipped.
+
+## F18 follow-up — attack-crafting line never updated for F15's GPU fix, crashed on real GPU (2026-11-17)
+
+**Context**: user connected their Kaggle-imported copy of
+`RUN_MVP_TINY_CNN_MNIST_WITH_ATTACK.ipynb` to a GPU runtime and hit
+`TypeError: can't convert cuda:0 device type tensor to numpy` on the
+line that crafts the malicious delta, before any training round ran.
+
+**Root cause**: F15 (2026-11-16) moved the model onto CUDA
+(`model = model.to(device)`) in every run notebook's model-build cell,
+but the attack run cell's `flat_w.numpy().astype(np.float64)` call
+(present since before F15 -- it crafts the A1 scaled-update attack
+once, from the model's own initial weights) was never updated to
+match. `flat_w` comes from `fl/models.py::flatten_state_dict`, which
+detaches but does NOT move tensors off their current device --
+correct on CPU (F15's audit of the training/eval paths), wrong the one
+place a `.numpy()` call survived outside those paths. Confirmed via
+grep this line is the ONLY unguarded `.numpy()` call across all 5
+WITH_ATTACK-adjacent notebooks (the other hit, in `RUN_ATTACKS.ipynb`'s
+F11 gate, is NOT a bug -- that notebook's gate model is never moved to
+a device at all, so it stays CPU-only by construction and the identical
+pattern there is safe).
+
+**Fix**: `flat_w.numpy()` -> `flat_w.cpu().numpy()` in
+`notebooks/_build_mvp_run_notebooks.py`'s `attack_run_cell()` template
+(regenerating the 3 generator-built attack notebooks) and hand-patched
+into `RUN_MVP_TINY_CNN_MNIST_WITH_ATTACK.ipynb` the same way. User was
+also given the one-line live fix to paste into their already-crashed
+Kaggle cell and re-run (nothing was lost -- the crash happens before
+any training round, so there was no state to resume).
+
+**Verification**: confirmed the 3 clean-run notebooks came out
+byte-identical again (only the attack template changed). All 4
+WITH_ATTACK notebooks' JSON + per-cell Python syntax re-validated.
+120 passed, 5 skipped, unchanged (notebook-only change).

@@ -699,7 +699,11 @@ root_norms = bootstrap_norms_from_model_dim(
 # it's submitted in. All {N_CHEATERS} attackers submit this SAME delta --
 # see markdown above for why that's a noted simplification.
 w_target = np.random.default_rng(CFG['seed'] + 99).normal(0, 1.0, size=dim)
-malicious_delta = craft_scaled_update(flat_w.numpy().astype(np.float64), w_target)
+# F18 follow-up (2026-11-17): flat_w lives on whatever device model_cell
+# moved the model to (F15, 2026-11-16) -- .cpu() first or this raises
+# "can't convert cuda:0 device type tensor to numpy" on any real GPU
+# runtime. craft_scaled_update itself is pure numpy, CPU-only by design.
+malicious_delta = craft_scaled_update(flat_w.cpu().numpy().astype(np.float64), w_target)
 print(f"crafted malicious delta (clients {{CHEATER_CLIENT_IDX}}), raw norm:", np.linalg.norm(malicious_delta))
 
 print("="*70)
