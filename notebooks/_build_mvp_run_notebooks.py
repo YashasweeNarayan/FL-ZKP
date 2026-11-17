@@ -29,11 +29,26 @@ never been run before this fix landed.
 
 Run this file (not the notebooks it emits) if the shared cells ever
 need to change.
+
+Also generates the three missing WITH_ATTACK variants (tiny_cnn+FEMNIST,
+small_resnet+MNIST, small_resnet+FEMNIST), completing the attack matrix
+started by `RUN_MVP_TINY_CNN_MNIST_WITH_ATTACK.ipynb` (hand-built,
+F11, NOT regenerated here for the same reason the clean tiny_cnn+MNIST
+notebook isn't). All 4 attack variants' parameters (which clients
+cheat, which dedicated checkpoint branch) come from the single source
+of truth in `fl/attacks/mvp_matrix.py` -- see that module's docstring.
+Every cell except the title markdown and the run cell is shared
+VERBATIM with the clean-run notebooks (same clone/install/sanity/ring/
+checkpoint-setup/eval cells) via the exact same functions above.
 """
 import json
 import os
+import sys
 
 NB_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(NB_DIR))  # repo root, for `import fl`
+
+from fl.attacks.mvp_matrix import ATTACK_CASES, CHEATER_INDICES, N_CHEATERS
 
 
 def nb(cells):
@@ -571,6 +586,213 @@ print(f"{{REAL_MODEL}} @ round {{eval_round}}: held-out global_val accuracy = {{
 """
 
 
+def attack_title_cell(cfg):
+    return f"""\
+# Run: {cfg.model} + {cfg.dataset_label}, 20 rounds, WITH {N_CHEATERS} active attackers ({100*N_CHEATERS//50}%), checkpointed
+
+Companion to `{cfg.clean_run_filename}` (the clean baseline run for
+this same (model, dataset) case) -- same model, same data, same 50
+clients, same 20 rounds, SAME checkpoint-resume machinery. The one
+difference: {N_CHEATERS} clients ({100*N_CHEATERS//50}% -- matching
+`ARCHITECTURE.md`'s own stated experimental target, contributions
+table N7: "n=50 ... {N_CHEATERS} adversaries") have their delta forced
+every round to a model-replacement-scale malicious update (same
+construction `RUN_ATTACKS.ipynb`'s F11 gate used to confirm V3 catches
+this inside a real round), via `cheater_client_idx`/`cheater_force_delta`.
+Everything else about each attacker's submission -- ring signature,
+VRF, masking, sketching, the real range proof -- runs exactly as it
+would for an honest client; see `fl/client.py`'s `_force_delta`
+docstring. All {N_CHEATERS} attackers reuse the SAME crafted delta (a
+simplifying choice, noted as such -- not independently-drawn attacks
+per client). Which clients cheat, and this notebook's own checkpoint
+branch, both come from `fl/attacks/mvp_matrix.py` -- the single source
+of truth across all 4 attack-variant notebooks (see that module's
+docstring for why).
+
+**Why {N_CHEATERS}, not some other number**: `ARCHITECTURE.md` SS2.2 (A2)
+states the system's theoretical tolerance as `f < n/2 = 25` -- that's a
+ceiling for a stress-test, not the number to validate against here.
+N7's own stated target ({N_CHEATERS} of 50) is what makes this run
+consistent with what the paper already commits to validating.
+
+**Point of this run**: produce a SECOND accuracy-vs-round curve to put
+next to the clean {cfg.model}+{cfg.dataset_label} run -- "the other
+43 clients converge normally for all 20 rounds while {N_CHEATERS}
+attackers ({100*N_CHEATERS//50}%) are rejected by V3 every single
+round" is the strongest combined utility+security claim this paper can
+make for this case, and it needs this run (not just F11's 3-round/
+9-client gate) to back it at the real training scale.
+
+**Expect more aborted rounds than the clean run.** Rejected clients
+don't count toward `k_min` eligibility, so round-availability degrades
+as the malicious fraction grows -- see `{cfg.clean_run_filename}`'s own
+markdown for the exact abort-probability numbers at this config. More
+ABORTED-round lines in this run's log than the clean run's is the
+model working as predicted, not a new bug.
+
+**Checkpoint durability: git, not Drive.** Checkpoints are committed
+and pushed, after every round, to this notebook's own dedicated
+`{cfg.ckpt_branch}` branch on the FL-ZKP repo itself -- distinct from
+BOTH the clean {cfg.model}+{cfg.dataset_label} run's branch AND every
+other attack variant's branch (FIX.md F17: every MVP run notebook,
+attack variants included, gets its own branch so concurrent pushes can
+never collide), never `main` -- see the git-checkpoint-setup cell's own
+markdown for the full reasoning. A push failing (transient network
+blip) only costs a retry next round -- it does not stop training, and
+the checkpoint is always safe on local disk regardless.
+
+**If Colab disconnects partway through:** re-run from cell 1 again.
+The git-checkpoint-setup cell re-clones the dedicated checkpoint
+checkout fresh and fetches whatever was last pushed to
+`{cfg.ckpt_branch}` -- the run cell then finds this notebook's own
+checkpoint (by filename, see the eval markdown below) and resumes
+after the last completed round, it does not restart from round 0.
+"""
+
+
+def attack_run_cell(cfg):
+    case_data_var = f"{cfg.case_prefix}_data"
+    return f"""\
+# 8. The real run: 20 rounds, checkpointed every round and pushed to
+# this notebook's own dedicated '{cfg.ckpt_branch}' git branch (see the
+# git-checkpoint-setup cell above -- CKPT_DIR/push_checkpoint_to_git
+# come from there, not Drive) -- WITH {N_CHEATERS} active attackers
+# ({100*N_CHEATERS//50}%, matching ARCHITECTURE.md's own N7 target) the
+# whole time.
+#
+# Same construction F11 used to confirm V3 catches A1 inside a real
+# round (FIX.md F11): each attacker's delta is forced every round to
+# attacks.a1_scaling.craft_scaled_update's gamma*(w_target - w_t) output,
+# built fresh from THIS model's actual initial weights (all {N_CHEATERS}
+# share the SAME crafted delta -- a simplifying choice, not
+# independently-drawn attacks per client). Everything else about each
+# attacker's submission (ring signature, VRF, masking, sketching, the
+# real range proof) runs exactly as it would for an honest client --
+# see fl/client.py's `_force_delta` docstring for why this is NOT the
+# same as a lying/forged submission. _cheat_zero_sketch does NOT also
+# fire here (fl/round_loop.py's F11 fix: it's conditional on
+# cheater_force_delta being None), so this is a clean, single-mechanism
+# attack across all {N_CHEATERS}, not the composed one F11 found and fixed.
+import numpy as np
+from fl.round_loop import run_training_loop, bootstrap_norms_from_model_dim, release_gpu_memory, load_checkpoint
+from attacks.a1_scaling import craft_scaled_update
+from fl.attacks.mvp_matrix import CHEATER_INDICES
+
+REAL_ROUNDS = 20
+CHEATER_CLIENT_IDX = list(CHEATER_INDICES)  # single source of truth: fl/attacks/mvp_matrix.py
+
+# Own checkpoint filename -- distinct from the clean run's and from
+# every other attack variant's, so this run never cross-resumes.
+CKPT_PATH = f'{{CKPT_DIR}}/{cfg.case_prefix}_{{REAL_MODEL}}_r{{REAL_ROUNDS}}_withattack{N_CHEATERS}.pt'
+
+root_norms = bootstrap_norms_from_model_dim(
+    model_dim=dim,
+    sketch_dim=CFG['sketch']['m'],
+    sketch_seed=f"bootstrap-{{REAL_MODEL}}-{cfg.case_prefix}-withattack{N_CHEATERS}".encode(),
+    quant_bits=16,
+    rng=np.random.default_rng(CFG['seed']),
+)
+
+# crafted ONCE, from this model's actual initial weights -- same
+# gamma*(w_target - w_t) construction as the F11 gate, far enough from a
+# random target that it should never pass V3 regardless of which round
+# it's submitted in. All {N_CHEATERS} attackers submit this SAME delta --
+# see markdown above for why that's a noted simplification.
+w_target = np.random.default_rng(CFG['seed'] + 99).normal(0, 1.0, size=dim)
+malicious_delta = craft_scaled_update(flat_w.numpy().astype(np.float64), w_target)
+print(f"crafted malicious delta (clients {{CHEATER_CLIENT_IDX}}), raw norm:", np.linalg.norm(malicious_delta))
+
+print("="*70)
+print(f"MALICIOUS CLIENTS IN THIS RUN: {{CHEATER_CLIENT_IDX}} ({{len(CHEATER_CLIENT_IDX)}} of {{n_clients}} = {{100*len(CHEATER_CLIENT_IDX)/n_clients:.0f}}%)")
+print("="*70)
+
+resume_from = load_checkpoint(CKPT_PATH) if os.path.exists(CKPT_PATH) else None
+if resume_from is not None:
+    print(f"found checkpoint at round {{resume_from['round']}} -- resuming, not restarting from round 0")
+
+final_w_t, real_history = run_training_loop(
+    model=model,
+    model_dim=dim,
+    client_datasets={case_data_var}['client_train'],
+    ring=ring,
+    client_sks=client_sks,
+    pairwise_secrets=pairwise_secrets,
+    pk_trace=PK_trace,
+    server_root_norms=root_norms,
+    CFG=CFG,
+    rounds=REAL_ROUNDS,
+    checkpoint_path=CKPT_PATH,
+    resume_from=resume_from,
+    cheater_client_idx=CHEATER_CLIENT_IDX,
+    cheater_force_delta=malicious_delta,
+    on_checkpoint_saved=push_checkpoint_to_git,
+)
+release_gpu_memory()
+n_accepted = sum(1 for h in real_history if not h['aborted'])
+print(f"done: {{len(real_history)}} rounds in history, {{n_accepted}} accepted (not aborted)")
+
+print("\\nper-round attacker verdict:")
+attacker_ever_accepted = {{}}
+attacker_ever_rejected = {{}}
+for h in real_history:
+    if h.get("aborted"):
+        print(f"  round {{h.get('round')}}: ABORTED -- {{h.get('reason')}}")
+        continue
+    reasons = h.get("rejected_reasons", {{}})
+    accepted_idxs = set(h.get("accepted_client_indices", []))
+    rejected_this_round = sorted(i for i in CHEATER_CLIENT_IDX if i in reasons)
+    accepted_this_round = sorted(i for i in CHEATER_CLIENT_IDX if i in accepted_idxs)
+    for i in rejected_this_round:
+        attacker_ever_rejected[i] = True
+    for i in accepted_this_round:
+        attacker_ever_accepted[i] = True
+    print(f"  round {{h.get('round')}}: accepted={{h.get('accepted')}}, "
+          f"attackers rejected={{rejected_this_round}}, attackers accepted={{accepted_this_round}}, "
+          f"aggregate_exact={{h.get('aggregate_exact')}}")
+
+if attacker_ever_accepted:
+    print(f"\\nFAIL: attacker(s) {{sorted(attacker_ever_accepted)}} had their scaled update accepted at least once -- a real defense failure, report this.")
+elif attacker_ever_rejected:
+    print(f"\\nPASS: every attacker that was ever eligible ({{sorted(attacker_ever_rejected)}}) was rejected by V3 every time, "
+          f"across all {{REAL_ROUNDS}} rounds, while the honest majority kept training normally.")
+else:
+    print("\\nINCONCLUSIVE: no attacker was ever sampled/eligible in any round -- check sampling_rate/eligibility.")
+"""
+
+
+def build_attack_notebook(cfg):
+    # cfg here is an fl.attacks.mvp_matrix.AttackCaseConfig (attribute
+    # access), NOT a RUN_CONFIGS dict (key access) -- dataset_cell,
+    # model_cell, eval_cell, and git_checkpoint_cell all only read
+    # dict-style keys, so adapt via a plain dict built from the config's
+    # fields plus whatever those shared functions expect.
+    cfg_dict = {
+        "case_prefix": cfg.case_prefix,
+        "model": cfg.model,
+        "dataset_label": cfg.dataset_label,
+        "num_classes": cfg.num_classes,
+        "model_note": cfg.model_note,
+        "ckpt_branch": cfg.ckpt_branch,
+    }
+    cells = [
+        ("md", attack_title_cell(cfg)),
+        ("code", CLONE_CELL),
+        ("code", INSTALL_CELL),
+        ("md", RESTART_MD),
+        ("code", SANITY_CELL),
+        ("code", CONFIG_CELL),
+        ("code", dataset_cell(cfg_dict)),
+        ("code", RING_CELL),
+        ("code", model_cell(cfg_dict)),
+        ("md", CHECKPOINT_MD),
+        ("code", git_checkpoint_cell(cfg.ckpt_branch)),
+        ("code", attack_run_cell(cfg)),
+        ("md", EVAL_MD),
+        ("code", eval_cell(cfg_dict)),
+    ]
+    return nb(cells)
+
+
 def build_notebook(cfg):
     cells = [
         ("md", title_cell(cfg)),
@@ -596,4 +818,16 @@ if __name__ == "__main__":
         out_path = os.path.join(NB_DIR, cfg["filename"])
         with open(out_path, "w") as f:
             json.dump(build_notebook(cfg), f, indent=1)
+        print(f"wrote {out_path}")
+
+    for acfg in ATTACK_CASES:
+        if acfg.filename == "RUN_MVP_TINY_CNN_MNIST_WITH_ATTACK.ipynb":
+            # hand-built, predates this generator -- never regenerated
+            # (same reason RUN_MVP_TINY_CNN_MNIST.ipynb isn't, see module
+            # docstring), and it may have an in-progress Colab session
+            # running against its current content.
+            continue
+        out_path = os.path.join(NB_DIR, acfg.filename)
+        with open(out_path, "w") as f:
+            json.dump(build_attack_notebook(acfg), f, indent=1)
         print(f"wrote {out_path}")

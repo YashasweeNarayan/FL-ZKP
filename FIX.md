@@ -1787,3 +1787,67 @@ pushing, to avoid colliding with that notebook's own pushes.
 113 passed, 5 skipped, unchanged (notebook-only change, no `fl/` or
 `crypto/` code touched). `RUN_MVP_TINY_CNN_MNIST.ipynb` needs a fresh
 20-round rerun under current code before its accuracy can be reported.
+
+## F18 — new fl/attacks/ config module + the 3 missing WITH_ATTACK notebook variants (2026-11-17)
+
+**Context**: only 1 of the 4 (model, dataset) cases in the MVP matrix
+had a WITH_ATTACK variant (`RUN_MVP_TINY_CNN_MNIST_WITH_ATTACK.ipynb`,
+hand-built for F11). The other 3 (tiny_cnn+FEMNIST, small_resnet+MNIST,
+small_resnet+FEMNIST) had no attack run at all, so the paper's
+utility+security claim ("honest clients converge while V3 rejects
+attackers every round") only had evidence for one case out of four.
+
+**Added**:
+- `fl/attacks/` (new package): `fl/attacks/mvp_matrix.py` is the single
+  source of truth for the attack-variant matrix — `N_CLIENTS=50`,
+  `N_CHEATERS=7` (`CHEATER_FRACTION=0.14`, matching `ARCHITECTURE.md`'s
+  own N7 contributions-table target, not A2's `f<n/2=25` theoretical
+  ceiling), `CHEATER_INDICES=(0..6)`, and an `ATTACK_CASES` list of 4
+  `AttackCaseConfig` entries (one per model×dataset combination) each
+  carrying its own dedicated checkpoint git branch
+  (`colab-checkpoints-<case>-<model>-attack7`, distinct from both its
+  companion clean-run branch and every other attack variant's — same
+  per-notebook-branch discipline as F17, extended to the attack
+  matrix). Attack *construction* (crafting the malicious delta) stays
+  in the pre-existing top-level `attacks/` package
+  (`attacks.a1_scaling.craft_scaled_update`) — not duplicated here;
+  this module only holds *which clients cheat, in which case, on which
+  branch*.
+- `tests/test_attack_mvp_matrix.py` (7 tests): cheater count/fraction
+  match ARCHITECTURE.md's N7 target; `CHEATER_INDICES` are distinct and
+  in range; all 4 (model, dataset) combinations present exactly once;
+  notebook filenames and checkpoint branches are all unique; FEMNIST
+  cases use `num_classes=62`/MNIST cases use `10`; `case_prefix`
+  matches the dataset (case1=MNIST, case2=FEMNIST); and — the actual
+  F16/F17 bug class, machine-checked — every attack branch is disjoint
+  from every clean-run branch (imports `RUN_CONFIGS` from
+  `notebooks/_build_mvp_run_notebooks.py` to check this directly rather
+  than trusting two hand-maintained lists to agree).
+- `notebooks/_build_mvp_run_notebooks.py` extended with
+  `attack_title_cell()`, `attack_run_cell()`, and
+  `build_attack_notebook()`, reusing every other cell
+  (clone/install/sanity/config/dataset/ring/model/checkpoint-setup/eval)
+  **verbatim** from the existing clean-run cell functions — only the
+  title markdown and the run cell actually differ for an attack
+  variant. Generates `RUN_MVP_TINY_CNN_FEMNIST_WITH_ATTACK.ipynb`,
+  `RUN_MVP_SMALL_RESNET_MNIST_WITH_ATTACK.ipynb`, and
+  `RUN_MVP_SMALL_RESNET_FEMNIST_WITH_ATTACK.ipynb`. The existing
+  hand-built `RUN_MVP_TINY_CNN_MNIST_WITH_ATTACK.ipynb` is deliberately
+  **not** regenerated (same reasoning as the clean tiny_cnn+MNIST
+  notebook: it may have an in-progress Colab session running against
+  its current content) — its `CHEATER_INDICES = list(range(7))` is
+  currently hand-written rather than imported from
+  `fl/attacks/mvp_matrix.py`, functionally identical but not yet
+  import-linked; noted in the module's own docstring as a known,
+  intentional gap.
+
+**Verification**: confirmed the 3 generator-built clean-run notebooks
+(`RUN_MVP_TINY_CNN_FEMNIST.ipynb`, `RUN_MVP_SMALL_RESNET_MNIST.ipynb`,
+`RUN_MVP_SMALL_RESNET_FEMNIST.ipynb` — all 3 have active Colab sessions
+running against them) came out **byte-identical** to before this change
+(`git diff --stat` empty) — the generator extension touches only new
+functions, nothing in the existing clean-run code path. All 3 new
+attack notebooks' JSON validated, every code cell's Python re-checked
+with `ast.parse` (shell magics stripped, indentation preserved), each
+notebook's `CKPT_BRANCH` literal confirmed against the table in
+`fl/attacks/mvp_matrix.py`. 120 passed (113 + 7 new), 5 skipped.
