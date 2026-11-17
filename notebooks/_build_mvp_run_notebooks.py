@@ -476,8 +476,19 @@ def run_cell(cfg):
     case_data_var = f"{cfg['case_prefix']}_data"
     if cfg["case_prefix"] == "case1":
         headline_split, headline_desc = "test", "official MNIST test accuracy"
+        # fl/data_iid.py: datasets["test"] = (test_images, test_labels) -- a plain tuple.
+        eval_unpack_line = f"_eval_images, _eval_labels = {case_data_var}['{headline_split}']"
     else:
         headline_split, headline_desc = "unseen_test", "unseen-writer FEMNIST test accuracy"
+        # fl/data_noniid.py: unseen_test is a FemnistClientDataset dataclass
+        # (.images/.labels attributes), NOT a tuple -- unpacking it directly
+        # raises "cannot unpack non-iterable FemnistClientDataset object"
+        # (caught live on a real Colab run, 2026-11-18). Same object the
+        # eval_cell below already reads via unseen_ds.images/.labels.
+        eval_unpack_line = (
+            f"_eval_ds = {case_data_var}['{headline_split}']\n"
+            f"_eval_images, _eval_labels = _eval_ds.images, _eval_ds.labels"
+        )
     return f"""\
 # 8. The real run: 20 rounds, checkpointed every round and pushed to
 # this notebook's own dedicated '{cfg["ckpt_branch"]}' git branch (see
@@ -523,7 +534,7 @@ if resume_from is not None:
 # eval_fn hook -- the real per-round cost is the sampled clients'
 # local SGD (E=5 epochs each), not one extra forward-only inference
 # pass over the test set.
-_eval_images, _eval_labels = {case_data_var}['{headline_split}']
+{eval_unpack_line}
 
 def _eval_fn(round_idx, w_t_now):
     device = next(model.parameters()).device
@@ -722,8 +733,15 @@ def attack_run_cell(cfg):
     case_data_var = f"{cfg.case_prefix}_data"
     if cfg.case_prefix == "case1":
         headline_split, headline_desc = "test", "official MNIST test accuracy"
+        eval_unpack_line = f"_eval_images, _eval_labels = {case_data_var}['{headline_split}']"
     else:
         headline_split, headline_desc = "unseen_test", "unseen-writer FEMNIST test accuracy"
+        # See run_cell's identical comment -- unseen_test is a
+        # FemnistClientDataset dataclass, not a tuple.
+        eval_unpack_line = (
+            f"_eval_ds = {case_data_var}['{headline_split}']\n"
+            f"_eval_images, _eval_labels = _eval_ds.images, _eval_ds.labels"
+        )
     return f"""\
 # 8. The real run: 20 rounds, checkpointed every round and pushed to
 # this notebook's own dedicated '{cfg.ckpt_branch}' git branch (see the
@@ -796,7 +814,7 @@ if resume_from is not None:
 # notebook (see RUN_MVP_{cfg.model.upper()}_{cfg.dataset_label}.ipynb), so this attack
 # run's "honest majority keeps converging while attackers are rejected"
 # claim has an accuracy curve to point to, not just the acceptance log.
-_eval_images, _eval_labels = {case_data_var}['{headline_split}']
+{eval_unpack_line}
 
 def _eval_fn(round_idx, w_t_now):
     device = next(model.parameters()).device

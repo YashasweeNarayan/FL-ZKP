@@ -2205,3 +2205,49 @@ run and a proof-by-formula, not the live run alone.
 **Not verified**: the ablation notebooks themselves have not been run
 on Colab/Kaggle yet (no torch/GPU in this sandbox) -- this entry
 describes what was built and why, not a confirmed pass/fail result.
+
+## F21 follow-up (2026-11-18): FEMNIST eval_fn crashed on round 0 -- unseen_test isn't a tuple
+
+**User-reported**, live Colab run of `RUN_MVP_TINY_CNN_FEMNIST.ipynb`:
+
+```
+TypeError: cannot unpack non-iterable FemnistClientDataset object
+---> 45 _eval_images, _eval_labels = case2_data['unseen_test']
+```
+
+**Cause.** F21's `eval_fn` wiring assumed every case's headline split was
+a plain `(images, labels)` tuple, copying the shape MNIST's `test` split
+actually has (`fl/data_iid.py`: `datasets["test"] = (test_images,
+test_labels)`). FEMNIST's `unseen_test` is NOT that shape -- it's a
+`FemnistClientDataset` dataclass (`fl/data_noniid.py`) with `.images`/
+`.labels` attributes. The existing `eval_cell` (F-pre-dating this
+session) already knew this and read `unseen_ds.images`/`unseen_ds.labels`
+correctly; the new per-round `eval_fn` code, written fresh instead of
+reusing that pattern, did not.
+
+Only hit the 2 of 4 (case_prefix == case2) notebooks and their attack
+variants: `RUN_MVP_TINY_CNN_FEMNIST(_WITH_ATTACK).ipynb`,
+`RUN_MVP_SMALL_RESNET_FEMNIST(_WITH_ATTACK).ipynb`. The MNIST (case1)
+notebooks and the hand-built `RUN_MVP_TINY_CNN_MNIST(_WITH_ATTACK).ipynb`
+were never affected -- `test` really is a tuple there.
+
+**Fix.** `run_cell`/`attack_run_cell` in
+`notebooks/_build_mvp_run_notebooks.py` now branch on `case_prefix`:
+case1 keeps the tuple-unpack line unchanged; case2 does
+`_eval_ds = case2_data['unseen_test']; _eval_images, _eval_labels =
+_eval_ds.images, _eval_ds.labels` -- the exact same attribute access
+`eval_cell` already uses successfully, not a new pattern. Regenerated
+all 6 generated notebooks; the 2 hand-built MNIST notebooks needed no
+change (case1 only).
+
+**Verification**: all 18 notebook files (12 main + 4 ablation + 2
+pre-existing setup/verify notebooks) re-validated as well-formed JSON;
+confirmed by direct read that `_eval_images, _eval_labels = _eval_ds.images,
+_eval_ds.labels` is now present in all 4 case2 notebooks and the
+tuple-unpack form is unchanged in the 4 case1 notebooks. 141 passed, 5
+skipped (unchanged -- this was a notebook-generator-only fix, no `fl/`
+code touched, so the real-crypto-backend e2e re-check was not needed).
+
+**Not verified**: not yet re-run on Colab/Kaggle (no torch/GPU here) --
+this fixes the exact crash reported, by reusing code already proven to
+work in `eval_cell`, but the next real run is what actually confirms it.
