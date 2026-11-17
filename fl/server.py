@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from fl.aggregation import real_contributor_count
+
 from crypto.clsag import verify_with_scopes, same_round_same_signer
 from crypto.rangeproof import verify_range, verify_recomposition, recompose_commitment
 from crypto.r_cons import verify_identity_binding
@@ -357,6 +359,7 @@ def run_round(
     quant_bits: int = 16,
     density: float = 1.0 / 3.0,
     n_tests: int = 8,             # FIX.md F7d: MUST match round_step_phase2's own n_tests, or the server derives a different number of public weight vectors than the client proved against and every honest client fails V3. Threaded explicitly rather than left as two independent hardcoded 8s.
+    sampling_rate: float = 1.0,   # FIX.md F20: p, the VRF self-sampling rate. Needed to scale the aggregate by the expected REAL cohort size rather than by len(accepted), which counts dummies. Defaults to 1.0 = "no dummies, every accepted client is a real contributor", which is both the pre-F20 behaviour and correct for callers that don't subsample (e.g. the unit tests).
     sketch_projector=None,        # FIX.md F7e: MUST be the same projector class the clients used (see _true_aggregate_sketch); None -> TorchSketchProjector, matching round_step_phase2
     blame_material_provider=None,  # FIX.md F7f: callable(group) -> (partial_q, straddling_pair_seeds, group_blinding_self_mask_shares, group_share_threshold) or None. Omit to abort without attribution on an F7e failure.
     f7f_share_threshold: int = 4,  # FIX.md F7f (2026-11-15): bisection's min_group_size floor -- MUST be <= whatever threshold blame_material_provider's own subgroup reconstruction actually uses, or every leaf group becomes unverifiable regardless of guilt (see fl/round_loop.py's f7f_share_threshold docstring). NOT the main secagg share_threshold.
@@ -553,7 +556,14 @@ def run_round(
             aggregate_sketch_suspect_groups=blame_groups,
         )
 
-    dequantized_mean_delta = dequantize(aggregate_quantized, bits=16) / max(len(accepted), 1)
+    # FIX.md F20: divide by the expected number of REAL contributors,
+    # not by len(accepted) -- the latter counts the ~(1-p)*n dummy
+    # submissions (q_k = 0, privacy padding for VRF self-sampling) that
+    # contribute nothing to the numerator, which silently shrank every
+    # update by ~1/p (≈3.4x at p=0.25). See fl/aggregation.py for the
+    # derivation, the attack-run case, and the privacy argument.
+    n_real = real_contributor_count(len(accepted), sampling_rate)
+    dequantized_mean_delta = dequantize(aggregate_quantized, bits=16) / n_real
 
     return RoundOutcome(
         aggregate_sketch_check_passed=sketch_ok,

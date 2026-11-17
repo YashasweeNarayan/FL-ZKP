@@ -658,7 +658,12 @@ def run_training_loop(
                                 sketch_dim=sketch_m, sigma_t=sigma_t,
                                 sketch_projector=TorchSketchProjector(seed=sigma_t, m=sketch_m, d=model_dim),
                                 blame_material_provider=blame_material_provider,
-                                f7f_share_threshold=f7f_share_threshold)
+                                f7f_share_threshold=f7f_share_threshold,
+                                # FIX.md F20: without this the aggregate is
+                                # divided by len(accepted), which counts the
+                                # ~(1-p)*n dummy (q_k=0) submissions and
+                                # shrinks every update by ~1/p.
+                                sampling_rate=sampling_rate)
             _t_verify = time.time() - _t_verify_start
 
             # FIX.md F7f: what happens to a suspect group. Record whatever

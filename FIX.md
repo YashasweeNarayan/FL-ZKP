@@ -2019,3 +2019,88 @@ pure-Python group backend — all 24 pass, confirming the
 `dp_noise_share` extraction did not disturb the round pipeline. All 9
 notebooks' JSON + per-cell Python syntax re-validated; all 8 checkpoint
 filenames confirmed unique and `_nodp`-suffixed.
+
+## F20 — FedAvg aggregate divided by len(accepted), which counts dummy submissions (2026-11-17)
+
+**Found while auditing the training path before committing to a long
+run** (the question asked was "are the models actually tuned, or will
+this waste 10 hours" — the hyperparameters turned out fine; this did
+not).
+
+**Bug.** `fl/server.py` ended each round with
+
+```python
+dequantized_mean_delta = dequantize(aggregate_quantized, bits=16) / max(len(accepted), 1)
+```
+
+`accepted` is every submission passing `verify_submission`
+(`server.py:387-396`). Under VRF self-sampling (`sampling_rate: 0.25`)
+only ~12.5 of 50 clients actually train; the other ~38 submit
+`q_k = 0` as privacy padding so the server cannot tell who trained, and
+a zero vector trivially satisfies the norm bound, so **every dummy is
+accepted**. Confirmed in the live logs: `accepted=43/50`, `35/50`,
+`40/50` — far above the ~12.5 real cohort.
+
+So the numerator summed ~12.5 real deltas while the denominator counted
+~43. **Every model update was ~1/p ≈ 4x smaller than FedAvg intends** —
+a silent, systematic shrink of the effective server learning rate for
+the entire history of the project. `apply_update`'s own docstring
+already stated the intended semantic as `w_t + Dequantize(sum q_k)/|A_real|`;
+the code and the documented intent disagreed.
+
+This compounds with F19: the 42.4% MNIST result was produced by a model
+being simultaneously noise-swamped AND stepped at a quarter speed.
+
+**Fix.** New `fl/aggregation.py::real_contributor_count(n_accepted, p)`
+returning `max(p * n_accepted, 1.0)`, threaded through
+`run_round(..., sampling_rate=...)` from `fl/round_loop.py`.
+
+Why `p * n_accepted` and not the obvious `p * n_clients - n_rejected`:
+
+| case | p·n_accepted | p·n_clients − n_rejected | correct |
+|---|---|---|---|
+| p=1.0, 43 accepted (7 rejected) | 43 | 43 | 43 — pre-F20 behaviour, preserved |
+| p=0.25, 50 accepted | 12.5 | 12.5 | 12.5 |
+| p=0.25, 43 accepted (7 attackers rejected) | 10.75 | 5.5 | 10.75 |
+| p=0.25, 35 accepted (15 rejected) | 8.75 | **−2.5** | — |
+
+The attack row is the one that matters: `_force_delta` is applied in
+`fl/client.py` AFTER the `b_k` branch (line 378), so attack submissions
+bypass the sampling gate entirely and only ~p of the rejected attackers
+displaced a genuinely-sampled honest contributor. Subtracting all 7
+over-corrects to 5.5 and would roughly double the applied step. The
+last row is not hypothetical — a 15-rejection round was observed live.
+
+`p=1.0` reduces exactly to the old denominator, which is why that is the
+default and why the three existing `run_round` test call sites are
+unaffected.
+
+**Privacy**: uses only the public `p` and the public accepted count, so
+no individual `b_k` is revealed and the anonymity the dummies exist to
+protect is intact.
+
+**Known limitation, recorded**: this is an expectation, not the realized
+count. `|S| ~ Binomial(50, 0.25)` has std ≈ 3.06, so the effective step
+inherits that jitter round to round. The principled upgrade is for each
+client to commit to `b_k` and open only the homomorphic SUM of those
+commitments — exact count, no individual bit revealed, and the Pedersen
+commitments already in the protocol are additively homomorphic, so it is
+an extension rather than new machinery. Deferred: protocol change, and
+the expectation is unbiased.
+
+**Checkpoint filenames** bumped `_nodp` -> `_nodp_f20`, since any
+checkpoint written in the ~20 minutes between F19 and this fix carries
+the 4x-too-small dynamics and must not be resumed into a corrected run.
+
+**Verification**: 134 passed (126 + 8 new in
+`tests/test_aggregate_scaling.py`), 5 skipped. Separately re-ran the 24
+normally-skipped crypto/e2e tests against the real pure-Python group
+backend after the `server.py` change — all 24 pass. All 9 notebooks'
+JSON + per-cell syntax re-validated. Confirmed `sampling_rate` is
+defined before the `run_round` call that consumes it.
+
+**Not verified**: the 4x larger step has never run against a real model
+here (no torch in the sandbox). If `lr=0.01` is now too hot, `quantize()`
+raises `FloatingPointError` with an explicit "lower lr" message rather
+than failing silently — so a divergence shows up in round 0-1, not after
+10 hours.

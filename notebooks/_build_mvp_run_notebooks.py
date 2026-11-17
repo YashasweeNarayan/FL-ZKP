@@ -494,7 +494,7 @@ REAL_ROUNDS = 20  # down from CFG['mvp_scope']['rounds_per_run'] (45) -- see mar
 # 42.4% MNIST / 1.3% FEMNIST accuracy, and resuming from one would carry
 # those noise-corrupted weights into this run. New filename so this
 # starts clean from round 0 instead of silently continuing them.
-CKPT_PATH = f'{{CKPT_DIR}}/{cfg["case_prefix"]}_{{REAL_MODEL}}_r{{REAL_ROUNDS}}_nodp.pt'
+CKPT_PATH = f'{{CKPT_DIR}}/{cfg["case_prefix"]}_{{REAL_MODEL}}_r{{REAL_ROUNDS}}_nodp_f20.pt'
 
 root_norms = bootstrap_norms_from_model_dim(
     model_dim=dim,
@@ -717,7 +717,7 @@ CHEATER_CLIENT_IDX = list(CHEATER_INDICES)  # single source of truth: fl/attacks
 # '_nodp' suffix: FIX.md F19 (2026-11-17) disabled the DP layer; any
 # checkpoint written before that carries noise-corrupted weights, so a
 # new filename keeps this run from resuming one.
-CKPT_PATH = f'{{CKPT_DIR}}/{cfg.case_prefix}_{{REAL_MODEL}}_r{{REAL_ROUNDS}}_withattack{N_CHEATERS}_nodp.pt'
+CKPT_PATH = f'{{CKPT_DIR}}/{cfg.case_prefix}_{{REAL_MODEL}}_r{{REAL_ROUNDS}}_withattack{N_CHEATERS}_nodp_f20.pt'
 
 root_norms = bootstrap_norms_from_model_dim(
     model_dim=dim,
