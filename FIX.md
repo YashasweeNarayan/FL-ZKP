@@ -1756,3 +1756,34 @@ code cell's Python re-checked with `ast.parse` (shell magics `!`/`%`
 stripped to `pass`, indentation preserved); each notebook's `CKPT_BRANCH`
 literal confirmed to match the table above. 113 passed, 5 skipped,
 unchanged (notebook-only change, no `fl/` or `crypto/` code touched).
+
+## F17 follow-up — completed tiny_cnn+MNIST baseline run was pre-F14, accuracy invalid (2026-11-17)
+
+**Discovery**: checked the branch's commit history to confirm whether
+`RUN_MVP_TINY_CNN_MNIST.ipynb` still needed to run. Its checkpoint
+(`case1_tiny_cnn_r20_f9fix.pt`) had in fact already reached round 19
+(all 20 rounds) — but the push timestamps (round 0 at 2026-11-16
+05:57 UTC, round 19 at 10:56 UTC) put the *entire run* before F14 was
+committed (15:51 UTC that same day). So this completed run has the
+exact same bug the earlier 33.34%/33.61% run had: DP noise added to
+every one of the ~50 clients instead of just the ~12 real (non-dummy)
+ones. A second, independent invalidation, same root cause as F14's
+original discovery — not a new bug.
+
+**Fix**: bumped the checkpoint filename in
+`notebooks/RUN_MVP_TINY_CNN_MNIST.ipynb` from `case1_tiny_cnn_r20_f9fix.pt`
+to `case1_tiny_cnn_r20_f14fix.pt` (same pattern F9's own fix used to
+force a fresh round-0 start rather than silently resuming invalid
+weights), with a comment explaining both invalidations (F9, F14) for
+future reference. Removed the stale `..._f9fix.pt` checkpoint file
+from both `colab-checkpoints-case1-tiny_cnn` (its own dedicated branch)
+and the old shared `colab-checkpoints` branch (where a copy also still
+lived from before the F17 migration), so there's nothing left for a
+rerun to accidentally resume from. The old shared branch is still live
+(the attack7 notebook hasn't migrated off it yet — see the open item in
+STATUS.md), so this was fetched/rebased against its current tip before
+pushing, to avoid colliding with that notebook's own pushes.
+
+113 passed, 5 skipped, unchanged (notebook-only change, no `fl/` or
+`crypto/` code touched). `RUN_MVP_TINY_CNN_MNIST.ipynb` needs a fresh
+20-round rerun under current code before its accuracy can be reported.
