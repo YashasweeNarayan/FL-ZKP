@@ -1684,3 +1684,75 @@ future/restarted run.
 
 113 passed, 5 skipped, unchanged (notebook-only change, no fl/ or
 crypto/ code touched).
+
+## F17 — F16's retry wasn't enough under real 4-way concurrent load; dedicated branch per notebook (2026-11-17)
+
+**Context**: user uploaded a live Colab log from `RUN_MVP_TINY_CNN_FEMNIST.ipynb`
+(identified from the log's `model_dim=102174`, which only matches
+`build_tiny_cnn(num_classes=62)` — confirmed by hand against the
+model's exact param-count formula, `1569*num_classes + 4832`) showing
+12 consecutive round pushes (rounds 0-11), every single one failing
+with git's non-fast-forward rejection. The warning text matched F16's
+*pre-fix* message format exactly — no "lost a race, rebased, retried"
+success message ever appeared, and no "even after rebase retry"
+phrasing either — proving this particular running session was started
+from a stale, un-hot-patched copy of the notebook (the F16 hot-patch
+only reached sessions that were paused to receive it; this one wasn't).
+Combined with the user confirming all 4 MVP run notebooks are
+genuinely running concurrently right now with the same GitHub PAT,
+this is real, sustained 4-way contention on the one shared
+`colab-checkpoints` branch F13/F16 used.
+
+**Root cause, restated**: F16 fixed the *symptom* (no retry logic) but
+not the underlying *design*: one mutable branch ref with N≥2
+concurrent writers will keep colliding under real load no matter how
+good the retry is, because a retry can itself lose the same race again
+(two notebooks can both rebase onto the same stale tip and both race
+to push the rebased result). F16 reduces how often this is visible; it
+doesn't eliminate it. The actual fix is to remove the shared resource,
+not to retry harder against it.
+
+**Fix**: every MVP run notebook — the clean baseline, the 7-attacker
+variant, and all 3 matrix notebooks — now pushes checkpoints to its
+OWN dedicated git branch instead of one shared `colab-checkpoints`
+branch:
+
+| notebook | branch |
+|---|---|
+| `RUN_MVP_TINY_CNN_MNIST.ipynb` | `colab-checkpoints-case1-tiny_cnn` |
+| `RUN_MVP_TINY_CNN_MNIST_WITH_ATTACK.ipynb` | `colab-checkpoints-case1-tiny_cnn-attack7` |
+| `RUN_MVP_TINY_CNN_FEMNIST.ipynb` | `colab-checkpoints-case2-tiny_cnn` |
+| `RUN_MVP_SMALL_RESNET_MNIST.ipynb` | `colab-checkpoints-case1-small_resnet` |
+| `RUN_MVP_SMALL_RESNET_FEMNIST.ipynb` | `colab-checkpoints-case2-small_resnet` |
+
+With no shared ref, a collision between two MVP run notebooks is no
+longer possible by construction — not "less likely," impossible,
+since each notebook's `git push` only ever contends with itself across
+re-runs/disconnects of that same notebook, which is exactly the single-
+writer case F13's original design already handled correctly. F16's
+fetch+rebase retry logic is kept in every notebook as defense-in-depth
+(e.g. a notebook accidentally run twice at once), not removed.
+
+**Applied**:
+- `notebooks/_build_mvp_run_notebooks.py`: `_GIT_CHECKPOINT_CELL_TEMPLATE`
+  parametrized on a `ckpt_branch` placeholder via a new
+  `git_checkpoint_cell(ckpt_branch)` wrapper; each `RUN_CONFIGS` entry
+  carries its own `"ckpt_branch"`; `title_cell`/`CHECKPOINT_MD`/`EVAL_MD`
+  updated to describe the per-notebook design instead of one shared
+  branch. The 3 generator-built notebooks (`*_FEMNIST.ipynb`,
+  `*_SMALL_RESNET_MNIST.ipynb`) were regenerated from this fixed script.
+- `RUN_MVP_TINY_CNN_MNIST.ipynb` and `RUN_MVP_TINY_CNN_MNIST_WITH_ATTACK.ipynb`
+  (hand-built, not generator-produced) hand-patched the same way: each
+  notebook's `CKPT_BRANCH` line, docstrings, and markdown updated to
+  its own assigned branch from the table above.
+- Live hot-patch snippets (one per currently-running notebook, each
+  creating and pushing its own new branch off the session's existing
+  local commits, then pointing `CKPT_BRANCH` at it) were handed to the
+  user so the 4 already-running sessions can migrate without losing
+  any in-progress rounds or restarting.
+
+**Verification**: all 5 notebooks' JSON validated (`json.load`); every
+code cell's Python re-checked with `ast.parse` (shell magics `!`/`%`
+stripped to `pass`, indentation preserved); each notebook's `CKPT_BRANCH`
+literal confirmed to match the table above. 113 passed, 5 skipped,
+unchanged (notebook-only change, no `fl/` or `crypto/` code touched).

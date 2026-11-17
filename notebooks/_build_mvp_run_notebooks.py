@@ -19,11 +19,13 @@ checkpoint filename, and the accuracy cell's headline metric source
 (MNIST's official `test` split vs FEMNIST's `unseen_test` -- the
 writer-disjoint held-out-writers split, per ROADMAP.md §3.4/data_noniid.py).
 
-Each run is independent (different checkpoint filename, same
-`colab-checkpoints` branch) and uses the SAME `fl/client.py` DP-noise
-fix (FIX.md F14, 2026-11-16) as the tiny_cnn+MNIST run -- there is no
-stale-checkpoint concern for these three, since they've never been run
-before this fix landed.
+Each run is fully independent: its own checkpoint filename AND its
+own dedicated git branch (FIX.md F17, 2026-11-17 -- a shared branch
+across all four meant every push collided when they ran concurrently,
+even with F16's fetch+rebase retry). Uses the SAME `fl/client.py`
+DP-noise fix (FIX.md F14, 2026-11-16) as the tiny_cnn+MNIST run --
+there is no stale-checkpoint concern for these three, since they've
+never been run before this fix landed.
 
 Run this file (not the notebooks it emits) if the shared cells ever
 need to change.
@@ -148,12 +150,16 @@ CHECKPOINT_MD = """\
   checkpoint can never touch the code checkout this notebook is actually
   importing from -- no risk of a `git checkout`/`reset` on the
   checkpoint side disturbing `sys.path`-imported modules mid-run.
-- A dedicated `colab-checkpoints` branch, never `main` -- small binary
-  commits (one per round, re-run disconnects add more) have no
-  business sitting in the same history a reviewer sees when they clone
-  this repo to read the paper's actual code. This branch is SHARED
-  across all four MVP run notebooks -- each run's checkpoint filename
-  (model+dataset+rounds) keeps them from colliding.
+- A dedicated branch (shown as `CKPT_BRANCH` in the cell below), never
+  `main` -- small binary commits (one per round, re-run disconnects
+  add more) have no business sitting in the same history a reviewer
+  sees when they clone this repo to read the paper's actual code.
+  **Each of the 4 MVP run notebooks gets its OWN branch** (FIX.md F17,
+  2026-11-17) -- an earlier version shared one branch across all four,
+  keyed apart only by checkpoint filename, and every single push
+  collided when they ran concurrently (observed live: 12/12 rounds
+  failed), even with a fetch+rebase retry (F16). A dedicated ref per
+  notebook removes the race at the git level instead of mitigating it.
 - `fl/round_loop.py`'s `on_checkpoint_saved` hook (2026-11-16) keeps
   the FL library itself git-agnostic -- it just calls back with
   `(checkpoint_path, round_idx)` after every local save; all the git
@@ -167,19 +173,27 @@ or committed) and deletes it from memory immediately after use.
 
 **On a disconnect and re-run**: this clone lives on local Colab disk,
 so it does NOT survive the disconnect (same as the code clone) -- but
-everything pushed to `colab-checkpoints` before the disconnect DID
-survive, on GitHub. Re-running this cell re-clones fresh and fetches
-that branch if it already exists, so the run cell's `resume_from` still
-finds the latest checkpoint and continues from there, not round 0.
+everything pushed to this notebook's own `CKPT_BRANCH` before the
+disconnect DID survive, on GitHub. Re-running this cell re-clones
+fresh and fetches that branch if it already exists, so the run cell's
+`resume_from` still finds the latest checkpoint and continues from
+there, not round 0.
 """
 
-GIT_CHECKPOINT_CELL = """\
+_GIT_CHECKPOINT_CELL_TEMPLATE = """\
 # 7.5. Git-backed checkpoint durability (replaces Drive -- see markdown above).
 import subprocess
 from getpass import getpass
 
 CKPT_REPO_DIR = "/content/FL-ZKP-checkpoints"
-CKPT_BRANCH = "colab-checkpoints"
+# 2026-11-17: each of the 4 MVP run notebooks gets its OWN branch, not
+# one shared branch -- see FIX.md F17. Running all four at once on one
+# shared branch caused every single push to collide and fail (12/12
+# rounds, observed live) even with F16's fetch+rebase retry, because
+# the retry itself can lose the SAME race under real concurrent load.
+# A dedicated ref per notebook removes the race at the git level
+# instead of mitigating it after the fact.
+CKPT_BRANCH = "__CKPT_BRANCH_PLACEHOLDER__"
 
 def _git(args, cwd=CKPT_REPO_DIR, check=True):
     r = subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True)
@@ -193,9 +207,9 @@ if not os.path.exists(CKPT_REPO_DIR):
     _git(["clone", "--depth", "1", _remote, CKPT_REPO_DIR], cwd=None)
     _git(["config", "user.email", "yashasweenarayan.yn@gmail.com"])
     _git(["config", "user.name", "Yashaswee Narayan"])
-    # does colab-checkpoints already exist on the remote (pushed in an
-    # earlier, since-disconnected session)? if so, use it -- that's where
-    # the actual latest checkpoint lives. If not, this is genuinely new.
+    # does this notebook's own CKPT_BRANCH already exist on the remote
+    # (pushed in an earlier, since-disconnected session)? if so, use it --
+    # that's where the actual latest checkpoint lives. If not, this is new.
     # explicit destination refspec -- a plain "fetch origin <branch>"
     # only updates FETCH_HEAD, not refs/remotes/origin/<branch>, so the
     # checkout below would fail even though the fetch itself succeeded.
@@ -222,14 +236,14 @@ def push_checkpoint_to_git(ckpt_path, round_idx):
     not the training run; the checkpoint is already safe on local disk
     regardless of whether this push succeeds.
 
-    2026-11-16: all four MVP run notebooks share this SAME
-    'colab-checkpoints' branch (different checkpoint filenames, same
-    branch) -- if two are run concurrently, a plain push can lose a
-    race with the other notebook's push and get rejected as
-    non-fast-forward. Each notebook only ever commits its OWN
-    checkpoint filename, so a fetch+rebase onto the remote tip always
-    auto-merges cleanly; retried once below before giving up for this
-    round (next round's push tries again from scratch regardless).\"\"\"
+    2026-11-17 (FIX.md F17): each MVP run notebook now has its OWN
+    dedicated CKPT_BRANCH, so this retry is defense-in-depth, not the
+    primary fix -- it used to be the ONLY mitigation for 4 notebooks
+    sharing one branch, which collided on every single push under real
+    concurrent load (observed live). Kept in case this exact branch is
+    ever reused by two sessions at once (e.g. the same notebook run
+    twice): fetch+rebase onto the remote tip and retry once before
+    giving up for this round (next round tries again regardless).\"\"\"
     try:
         _git(["add", "-A"])
         commit = _git(["commit", "-m", f"checkpoint: round {round_idx}"], check=False)
@@ -238,9 +252,8 @@ def push_checkpoint_to_git(ckpt_path, round_idx):
             return
         push = _git(["push", "-u", "origin", CKPT_BRANCH], check=False)
         if push.returncode != 0:
-            # Lost a race with a concurrent writer (another MVP run
-            # notebook on this same shared branch) -- fetch + rebase
-            # onto the remote tip and retry once.
+            # Lost a race with a concurrent writer on this branch --
+            # fetch + rebase onto the remote tip and retry once.
             _git(["fetch", "origin", CKPT_BRANCH], check=False)
             rebase = _git(["rebase", f"origin/{CKPT_BRANCH}"], check=False)
             if rebase.returncode == 0:
@@ -258,12 +271,17 @@ def push_checkpoint_to_git(ckpt_path, round_idx):
         print(f"  [checkpoint push WARNING] round {round_idx}: {e!r} -- local checkpoint is still fine, will retry next round.")
 """
 
+
+def git_checkpoint_cell(ckpt_branch):
+    return _GIT_CHECKPOINT_CELL_TEMPLATE.replace("__CKPT_BRANCH_PLACEHOLDER__", ckpt_branch)
+
+
 EVAL_MD = """\
 ## Evaluate accuracy
 
 Works whether you let training finish, stopped it early (Ctrl-C /
 interrupt), or are coming back in a fresh runtime with nothing but the
-checkpoint pushed to the `colab-checkpoints` git branch: it loads the LATEST checkpointed weights directly
+checkpoint pushed to this notebook's own `CKPT_BRANCH`: it loads the LATEST checkpointed weights directly
 from `CKPT_PATH` (falling back to the in-memory `final_w_t` only if no
 checkpoint file exists yet), so it always reports accuracy for
 whatever round you actually reached, not a partially-updated `model`
@@ -283,6 +301,7 @@ RUN_CONFIGS = [
         "model": "tiny_cnn",
         "model_note": "~20.6K params, matches WhiteCloak/PQS-BFL's model scale (see fl/models.py build_tiny_cnn docstring) -- same backbone as the MNIST run, different (non-IID, writer-split) dataset.",
         "num_classes": 62,
+        "ckpt_branch": "colab-checkpoints-case2-tiny_cnn",
     },
     {
         "filename": "RUN_MVP_SMALL_RESNET_MNIST.ipynb",
@@ -291,6 +310,7 @@ RUN_CONFIGS = [
         "model": "small_resnet",
         "model_note": "~263K params, anchored to WhiteCloak's own second reported model (CIFAR-10-L ResNet, 273K params -- see fl/models.py build_small_resnet docstring) -- demonstrates the protocol across a real residual architecture, not just a plain CNN.",
         "num_classes": 10,
+        "ckpt_branch": "colab-checkpoints-case1-small_resnet",
     },
     {
         "filename": "RUN_MVP_SMALL_RESNET_FEMNIST.ipynb",
@@ -299,6 +319,7 @@ RUN_CONFIGS = [
         "model": "small_resnet",
         "model_note": "~263K params (see fl/models.py build_small_resnet docstring) on the non-IID, writer-split FEMNIST dataset -- completes the 2-model x 2-dataset MVP matrix.",
         "num_classes": 62,
+        "ckpt_branch": "colab-checkpoints-case2-small_resnet",
     },
 ]
 
@@ -332,17 +353,18 @@ which device it picked) -- training previously ran on CPU even on a
 GPU runtime, since nothing moved the model or data off of it.
 
 **Checkpoint durability: git, not Drive.** Checkpoints are committed
-and pushed, after every round, to the shared `colab-checkpoints`
-branch on the FL-ZKP repo itself (never `main`) -- see the git-
-checkpoint-setup cell's own markdown for the full reasoning. A push
-failing (transient network blip) only costs a retry next round -- it
-does not stop training, and the checkpoint is always safe on local
-disk regardless.
+and pushed, after every round, to this notebook's own dedicated
+`{cfg['ckpt_branch']}` branch on the FL-ZKP repo itself (never `main`, and
+never shared with the other 3 MVP run notebooks -- each has its own
+branch, see FIX.md F17) -- see the git-checkpoint-setup cell's own
+markdown for the full reasoning. A push failing (transient network
+blip) only costs a retry next round -- it does not stop training, and
+the checkpoint is always safe on local disk regardless.
 
 **If Colab disconnects partway through:** re-run from cell 1 again.
 The git-checkpoint-setup cell re-clones the dedicated checkpoint
 checkout fresh and fetches whatever was last pushed to
-`colab-checkpoints` -- the run cell then finds this notebook's own
+`{cfg['ckpt_branch']}` -- the run cell then finds this notebook's own
 checkpoint (by filename, see cell 8.5) and resumes after the last
 completed round, it does not restart from round 0.
 """
@@ -415,17 +437,17 @@ def run_cell(cfg):
     case_data_var = f"{cfg['case_prefix']}_data"
     return f"""\
 # 8. The real run: 20 rounds, checkpointed every round and pushed to
-# the shared 'colab-checkpoints' git branch (see the git-checkpoint-
-# setup cell above -- CKPT_DIR/push_checkpoint_to_git come from there,
-# not Drive).
+# this notebook's own dedicated '{cfg["ckpt_branch"]}' git branch (see
+# the git-checkpoint-setup cell above -- CKPT_DIR/push_checkpoint_to_git
+# come from there, not Drive).
 import numpy as np
 from fl.round_loop import run_training_loop, bootstrap_norms_from_model_dim, release_gpu_memory, load_checkpoint
 
 REAL_ROUNDS = 20  # down from CFG['mvp_scope']['rounds_per_run'] (45) -- see markdown cell 0
 
-# Filename includes case prefix + model so this run's checkpoint can
-# never collide with any of the other three MVP run notebooks sharing
-# the same 'colab-checkpoints' branch.
+# Filename includes case prefix + model for readability, but collision
+# with the other MVP run notebooks is now impossible by construction:
+# each notebook pushes to its own dedicated branch (see FIX.md F17).
 CKPT_PATH = f'{{CKPT_DIR}}/{cfg["case_prefix"]}_{{REAL_MODEL}}_r{{REAL_ROUNDS}}.pt'
 
 root_norms = bootstrap_norms_from_model_dim(
@@ -561,7 +583,7 @@ def build_notebook(cfg):
         ("code", RING_CELL),
         ("code", model_cell(cfg)),
         ("md", CHECKPOINT_MD),
-        ("code", GIT_CHECKPOINT_CELL),
+        ("code", git_checkpoint_cell(cfg["ckpt_branch"])),
         ("code", run_cell(cfg)),
         ("md", EVAL_MD),
         ("code", eval_cell(cfg)),
