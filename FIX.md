@@ -2344,3 +2344,27 @@ touched, generator-only change).
 unchanged (not deleted) -- `Ablation_model.ipynb` is an additional,
 merged alternative, not a replacement, in case the per-combo notebooks
 are easier to run independently.
+
+**Traceability demo (2026-11-18): §6.2 opening protocol tested standalone against real crypto, before pipeline integration -- two gaps found and one partially closed.**
+
+User asked to review the traceability/audit subsystem (§6 of ARCHITECTURE.md) while the attack/ablation runs were in progress on Colab. Audit findings (no code run yet at this point, pure investigation):
+
+- **Wired into the real pipeline and tested (not gaps)**: F7f suspect tracking (`fl/suspect_tracker.py`, quarantine/ban bookkeeping) is called every round from `fl/round_loop.py` and has 15 passing tests. `verifier/audit.py::independent_v5_check` is also called every round from `round_loop.py`.
+- **Gap 1 -- §6.1 evidence accumulation (`fl/evidence.py`)**: solid, well-tested in isolation (`tests/test_evidence.py`: cosine/norm/loss-delta scoring, calibration bound, honest-vs-malicious separation) but never imported by `fl/server.py`/`fl/round_loop.py`/`fl/client.py` -- only referenced in `RUN_ATTACKS.ipynb`, whose own comment calls that usage "illustrative stand-ins."
+- **Gap 2 -- §6.2 opening protocol (`fl/trace.py`) and §6.4 committee reconfiguration (`crypto/reshare.py`)**: both ★ NOVEL in ARCHITECTURE.md, both correct-looking orchestration over already-tested primitives (own docstrings say "EC-DEPENDENT -- not run in this sandbox"), both had **zero test files anywhere** and **zero pipeline callers** -- only referenced from setup/demo notebooks.
+- **Gap 3 (new, found while reading `verifier/audit.py` in full)**: `independent_opening_reverification` -- itself a starred novelty point ("any third party can re-verify the entire accusation") -- has **zero callers anywhere in the repo**: not the pipeline, not a notebook, not a test. Completely orphaned.
+- **Gap 4**: §6.3's residual-anonymity formula `H(T) = log2(n - o(T))` has no implementation anywhere. `fl/trace.py::revoke()`'s own docstring defers it "to wherever the paper's figures are generated" -- no such file exists in the repo.
+
+Per the user's explicit plan ("test the opening protocol standalone first, then integrate into the full pipeline"), built `notebooks/traceability_demo/TRACEABILITY_DEMO.ipynb` (generator: `_build_traceability_demo.py`) closing part of Gap 2 and Gap 4 at the standalone level:
+
+- Runs the REAL Pedersen DKG (`crypto/dkg.py`) + threshold ElGamal (`crypto/elgamal_threshold.py`) + `fl/trace.py::run_opening_protocol`, with the project's real committee params read from `configs/mvp_3day.yaml` (`n_key_holders=10`, `threshold=7`), not re-typed by hand.
+- **Case A**: all 10 key holders cooperate -> opens, recovers the exact escrowed identity (`verdict.opened_pk == accused_client_pk`, asserted).
+- **Case B**: holders 1, 2, 3, and 4 missing (6 of 10 present, below t=7) -> fails with `reason="only 6 valid partials, need t=7"`. Note: the original ask was "1,2,3 missing" -- with the real t=7-of-10 committee that leaves exactly 7, which still succeeds. Confirmed with the user to add holder 4 to the missing set so Case B actually demonstrates a failed opening.
+- Bonus sweep cell: holders-present from 10 down to 0, confirms the opened/failed flip happens exactly at 7, not gradually -- same plot shape (success vs. count) the full pipeline's eventual per-round traceability figure will want.
+- Added a demo-only `residual_anonymity_bits()` helper (NOT promoted into `fl/trace.py` yet) to report Gap 4's `H(T)` for Case A's `revoke()` result: a 50-member ring drops from `log2(50)=5.644` to `log2(49)=5.615` bits after the one opening.
+
+Deliberately NOT exercised yet (scoped out, left for the pipeline-integration step): `fl/evidence.py`'s real evidence accumulation (Case A/B use a stubbed, already-above-threshold `CalibrationCertificate` instead, since no training rounds ran to accrue real evidence), and §6.2 step 5's R_cons identity-binding re-check (needs a genuine round's `rho_t`/`rho_e`/`vrf_alpha` and proof, which only exist once this is wired into `fl/round_loop.py`).
+
+**Verification**: executed every code cell for real (not just syntax-checked) against the test-only pure-Python ristretto255 backend (`JANUS_ALLOW_PURE_PYTHON_GROUP=1`, same gate `tests/test_round_end_to_end.py` uses) -- Case A opens and recovers the exact identity, Case B fails with the expected reason, the sweep confirms the 7/6 boundary, revocation shrinks the ring by exactly 1. Notebook JSON validated well-formed, 14 cells (one expected false positive on the reused `CLONE_CELL`'s `!git clone` line, same known non-bug as every other notebook). No `fl/`/`crypto/` library files touched -- generator + notebook only. 141 passed, 5 skipped, unchanged.
+
+**Not yet done**: not run on Colab with `rbcl` (should be identical -- same algebra, only the group-operation bindings differ, per the sanity cell's fallback design). Gap 1 (`fl/evidence.py` unwired), Gap 3 (`independent_opening_reverification` orphaned), and the full pipeline-integration step (wiring §6 into `fl/round_loop.py` for all 4 model/dataset combinations, with the per-round "traceability happened at round N" result and H(T) curve for the paper) are still open, per the user's own stated next step.
