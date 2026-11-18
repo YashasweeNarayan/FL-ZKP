@@ -2251,3 +2251,49 @@ code touched, so the real-crypto-backend e2e re-check was not needed).
 **Not verified**: not yet re-run on Colab/Kaggle (no torch/GPU here) --
 this fixes the exact crash reported, by reusing code already proven to
 work in `eval_cell`, but the next real run is what actually confirms it.
+
+## Milestone (2026-11-18): first complete, trustworthy 20-round result matrix
+
+All 4 (model, dataset) combinations finished round 19 on the final
+`_nodp_f20` pipeline (F19 DP-disable + F20 aggregate-scaling fix), with
+checkpoints confirmed pushed to all 4 dedicated branches
+(`colab-checkpoints-case{1,2}-{tiny_cnn,small_resnet}`,
+`case{1,2}_{model}_r20_nodp_f20.pt`, verified via `git ls-tree`/`git log`
+on each branch -- all last-committed 2026-11-18 02:42-03:27 UTC).
+
+| Model | Dataset | Test acc | Held-out global_val acc | Gap |
+|---|---|---|---|---|
+| tiny_cnn | MNIST | 0.9852 (10000 images) | 0.9788 (2499 images) | 0.0064 |
+| small_resnet | MNIST | 0.9891 (10000 images) | 0.9852 (2499 images) | 0.0039 |
+| tiny_cnn | FEMNIST | 0.7818 (69425 images) | 0.7743 (9327 images) | 0.0075 |
+| small_resnet | FEMNIST | 0.7013 (69425 images) | 0.6986 (9327 images) | 0.0027 |
+
+**Compare to the pre-fix (DP-enabled, aggregate-bugged) tiny_cnn+MNIST
+run**: 0.4235 test / 0.4042 global_val -- the jump to 0.9852/0.9788 is
+the direct, now-measured confirmation that F19+F20 were the real bugs,
+not a hypothesis. No DP-noise-scaling argument or units-mismatch
+analysis was ever run against a real model before this (no torch in
+this sandbox); this is the first number that actually tests it.
+
+**Pattern worth flagging for the paper, not smoothing over**: tiny_cnn
+(20.6K params) BEATS small_resnet (263K params) on FEMNIST (0.7818 vs
+0.7013) but loses narrowly on MNIST (0.9852 vs 0.9891). A ~13x larger
+model does not automatically win under this protocol's non-IID,
+writer-split, ~12-real-clients-per-round regime -- plausibly
+undertrained at 20 rounds relative to its parameter count, or more
+sensitive to per-client data skew than the smaller model. Worth a
+sentence of discussion in the results section rather than treating
+small_resnet's MNIST win as the whole story.
+
+**test vs. global_val agree within ~1pt in all 4 cells** -- no
+overfitting to the held-out global validation set, consistent
+generalization signal across both datasets.
+
+**Not yet checked**: these numbers have not been compared against any
+specific benchmark figure from the peer-group papers anchored in
+ARCHITECTURE.md (PQS-BFL, WhiteCloak, ZK-FL) -- ARCHITECTURE.md names
+those papers for threat-model/architecture precedent only and does not
+itself report their accuracy numbers, so there is nothing numeric in
+this repo to check against yet. If the paper wants a head-to-head
+accuracy comparison, that requires pulling each paper's own reported
+numbers separately.
