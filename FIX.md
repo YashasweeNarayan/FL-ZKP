@@ -2297,3 +2297,50 @@ itself report their accuracy numbers, so there is nothing numeric in
 this repo to check against yet. If the paper wants a head-to-head
 accuracy comparison, that requires pulling each paper's own reported
 numbers separately.
+
+## Merged ablation notebook (2026-11-18): Ablation_model.ipynb, pushed to its own `ablation` branch
+
+**User request**: merge the 4 standalone ablation notebooks
+(`ABLATION_TINY_CNN_MNIST`, `ABLATION_TINY_CNN_FEMNIST`,
+`ABLATION_SMALL_RESNET_MNIST`, `ABLATION_SMALL_RESNET_FEMNIST`) into
+one notebook, `Ablation_model.ipynb`, and push it to a branch named
+`ablation`.
+
+**Not a naive concatenation.** The 4 standalone notebooks each
+clone/install/sanity-check/load-config/build-the-crypto-ring from
+scratch -- identical across all 4 (same repo, same `CFG`, `RING_CELL`
+only reads `CFG['protocol']`, never model/dataset). Concatenating all
+4 notebooks verbatim would re-clone, re-pip-install (~minutes each),
+and rebuild an identical 50-client ring three times over for nothing.
+`notebooks/ablation_study/_build_ablation_merged_notebook.py` dedupes
+all of that to run once, and loads each dataset (MNIST, FEMNIST) once,
+reused by both models that use it, instead of once per combo.
+
+**The one real bug this merge would otherwise have shipped**: the
+per-notebook checkpoint-setup cell only clones + picks a branch ONCE
+per session (`if not os.path.exists(CKPT_REPO_DIR): <clone + pick
+branch> else: print("reusing it")`), because every other notebook in
+this repo is one-notebook-one-branch. Reused verbatim in a merged
+notebook, combo 2's checkpoint cell would see the directory already
+exists (from combo 1) and silently skip picking combo 2's branch --
+quietly pushing combos 2-4's checkpoints into combo 1's branch.
+Caught before running, not after: new `merged_checkpoint_cell` in the
+build script runs the fetch-or-create-branch step on EVERY call, and
+when a combo's branch doesn't exist yet, branches explicitly from
+`origin/main` rather than "current HEAD" (which on combo 2+ would be
+the previous combo's branch tip, carrying its checkpoint history into
+a branch that should start clean).
+
+**Verification**: `Ablation_model.ipynb` (31 cells) validated as
+well-formed JSON; every code cell's source compiled for syntax errors
+(one false positive on the reused `CLONE_CELL`'s `!git clone` magic
+line, a Jupyter-only construct `compile()` can't parse -- not a bug,
+identical to the cell already proven working in all 8 other run
+notebooks). Full suite re-run: 141 passed, 5 skipped (no `fl/` code
+touched, generator-only change).
+
+**Not verified**: not run on Colab yet. The 4 individually-generated
+`ABLATION_*.ipynb` notebooks remain in `notebooks/ablation_study/`
+unchanged (not deleted) -- `Ablation_model.ipynb` is an additional,
+merged alternative, not a replacement, in case the per-combo notebooks
+are easier to run independently.
