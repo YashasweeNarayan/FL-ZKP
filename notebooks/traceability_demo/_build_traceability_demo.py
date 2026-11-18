@@ -39,14 +39,15 @@ integration step that comes after this is validated):
     re-check) -- that needs a genuine round's rho_t/rho_e/vrf_alpha
     and identity-binding proof, which only exist once this is wired
     into fl/round_loop.py.
-  - §6.3's residual-anonymity accounting (H(T) = log2(n - o(T))) has
-    NO implementation anywhere in the repo yet (fl/trace.py's own
-    `revoke()` docstring explicitly defers it "to wherever the paper's
-    figures are generated"). This notebook adds a minimal, real,
-    demo-only `residual_anonymity_bits()` helper INLINE (not in
-    fl/trace.py) so Case A's result can be reported the way the paper
-    will want it -- flagged in its own cell as a draft to promote into
-    a real module once the full pipeline needs it.
+  - §6.3's residual-anonymity accounting (H(T) = log2(n - o(T))) had
+    NO implementation anywhere in the repo when this notebook was
+    first built; `fl/trace.py::residual_anonymity_bits` (real,
+    tested in tests/test_trace.py -- pure math, no EC needed) now
+    provides it, and this notebook imports that function rather than
+    redefining it inline. See that function's own docstring for the
+    exact semantics (`n_opened_so_far` accumulates across repeated
+    `revoke()` calls within a run; it is not re-derived from
+    `len(current_ring)`).
 """
 import json
 import os
@@ -91,11 +92,11 @@ full 4-combination run.
 **Not yet exercised here** (comes after this is validated, when §6
 is wired into the real pipeline): `fl/evidence.py`'s real evidence
 accumulation (Case A/B use a stubbed, already-above-threshold
-evidence certificate instead), the §6.2 step 5 R_cons identity-binding
-re-check (needs a genuine round's proof), and §6.3's residual-anonymity
-accounting (no implementation exists anywhere in the repo yet -- this
-notebook adds a minimal demo-only version in its own cell, clearly
-marked as a draft).
+evidence certificate instead) and the §6.2 step 5 R_cons
+identity-binding re-check (needs a genuine round's proof). §6.3's
+residual-anonymity accounting (`fl/trace.py::residual_anonymity_bits`)
+IS real and unit-tested (`tests/test_trace.py`) -- this notebook
+calls that function directly, nothing here is a draft.
 
 **No GPU/torch/dataset needed.** Runs identically on Colab (real
 `rbcl`-backed ristretto255) or on a plain CPU machine with no network
@@ -186,7 +187,7 @@ from dataclasses import dataclass
 
 from crypto.elgamal_threshold import encrypt, compute_partial, verify_partial, combine_partials
 from crypto.ristretto import Scalar, scalar_mul_base
-from fl.trace import OpeningRequest, run_opening_protocol, RevocationRecord, revoke
+from fl.trace import OpeningRequest, run_opening_protocol, RevocationRecord, revoke, residual_anonymity_bits
 
 accused_client_sk = Scalar.from_int(424242)          # stand-in for a real client's long-term sk_k
 accused_client_pk = scalar_mul_base(accused_client_sk)  # the escrowed plaintext -- what opening should recover
@@ -311,30 +312,16 @@ REVOKE_MD = """\
 
 `fl/trace.py::revoke()` removes the opened identity from the ring and
 reports the new ring size. §6.3's accountability-anonymity budget,
-`H(T) = log2(n - o(T))` (bits of residual anonymity after `o(T)`
-openings out of `n` ring members), has **no implementation anywhere
-in the repo yet** -- `revoke()`'s own docstring defers it "to wherever
-the paper's figures are generated". The helper below is a minimal,
-real, demo-only version so this notebook can report the number the
-paper will actually want; it is NOT yet promoted into `fl/trace.py`
-(flagging that as a candidate for the full-pipeline integration step).
+`fl/trace.py::residual_anonymity_bits` (`H(T) = log2(n - o(T))`, bits
+of residual anonymity after `o(T)` openings out of `n` ring members),
+is a real function with its own unit tests
+(`tests/test_trace.py` -- pure math, no EC backend needed, run
+unconditionally). This cell imports and calls it directly; nothing
+here is redefined or demo-only.
 """
 
 REVOKE_CELL = """\
 # 10. Revoke the opened identity (Case A) and report residual anonymity.
-import math
-
-def residual_anonymity_bits(ring_size_before: int, n_opened_so_far: int) -> float:
-    \"\"\"DEMO-ONLY draft of ARCHITECTURE.md SS6.3's H(T) = log2(n - o(T)).
-    Not yet a real module -- promote into fl/trace.py (with a test)
-    once SS6 is wired into the actual per-round pipeline, where o(T)
-    will be tracked across real rounds rather than computed once here.
-    \"\"\"
-    remaining = ring_size_before - n_opened_so_far
-    if remaining <= 0:
-        return float("-inf")
-    return math.log2(remaining)
-
 original_ring = [accused_client_pk] + [
     scalar_mul_base(Scalar.random()) for _ in range(49)
 ]  # a 50-member ring, same size as the real pipeline's n_clients, with the accused client in it
@@ -362,18 +349,17 @@ CLOSING_MD = """\
   (the sweep above), not gradually.
 - Revocation shrinks the ring by exactly one member; residual
   anonymity dropped from `log2(50)=5.64` to `log2(49)=5.61` bits for
-  this single opening (the demo-only `residual_anonymity_bits` helper
-  above).
+  this single opening, via `fl/trace.py::residual_anonymity_bits`
+  (real, unit-tested in `tests/test_trace.py`).
 
 **Left for the full-pipeline integration step** (next, per plan):
 wiring this into `fl/round_loop.py` so `fl/evidence.py` triggers real
 openings from real per-round evidence instead of a stubbed
 certificate, exercising the step-5 R_cons identity-binding re-check
-against a genuine round's proof, running all 4 (model, dataset)
-combinations end to end, and promoting `residual_anonymity_bits` into
-a real, tested module (likely alongside `fl/trace.py`) so the paper's
-traceability section can report, per round, both WHEN an opening
-happened and the resulting H(T) curve.
+against a genuine round's proof, and running all 4 (model, dataset)
+combinations end to end so the paper's traceability section can
+report, per round, both WHEN an opening happened and the resulting
+H(T) curve from `residual_anonymity_bits`.
 """
 
 

@@ -10,6 +10,7 @@ ARCHITECTURE.md §6.2 specifies, in the same six numbered steps.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from crypto.elgamal_threshold import compute_partial, verify_partial, combine_partials
@@ -105,10 +106,9 @@ class RevocationRecord:
 def revoke(verdict: OpeningVerdict, current_ring: list, epoch: int) -> tuple[list, RevocationRecord]:
     """§6.2 step 6: 'the named client's pk is revoked and the ring
     shrinks'. Returns the new ring and a record for §6.3's residual-
-    anonymity accounting (H(T) = log2(n - o(T))) -- that accounting
-    itself lives wherever the paper's figures are generated, not here;
-    this function only performs the mechanical removal and reports
-    what changed.
+    anonymity accounting (`residual_anonymity_bits`, below) -- this
+    function only performs the mechanical removal and reports what
+    changed.
     """
     if not verdict.opened:
         raise ValueError("cannot revoke: opening did not succeed")
@@ -116,3 +116,32 @@ def revoke(verdict: OpeningVerdict, current_ring: list, epoch: int) -> tuple[lis
     if len(new_ring) != len(current_ring) - 1:
         raise AssertionError("revoked pk was not found exactly once in the current ring")
     return new_ring, RevocationRecord(epoch=epoch, revoked_pk=verdict.opened_pk, new_ring_size=len(new_ring))
+
+
+def residual_anonymity_bits(ring_size_before: int, n_opened_so_far: int) -> float:
+    """§6.3's accountability-anonymity budget: H(T) = log2(n - o(T)).
+
+    `ring_size_before` is the ring's ORIGINAL size (n, before any
+    openings this epoch/run), not its current size after some have
+    already been revoked -- `n_opened_so_far` (o(T)) is what tracks
+    how many have been removed so far, so callers accumulate
+    `n_opened_so_far` across repeated `revoke()` calls rather than
+    re-deriving it from `len(current_ring)` (which this function
+    never sees, deliberately: it only needs the two counts the
+    formula names, not the ring's actual contents).
+
+    Returns -inf once every member has been opened (n - o <= 0) --
+    there's no ring left to hide in, which IS the right value for a
+    monotonically-decreasing residual-anonymity curve to bottom out
+    at, not an error: a committee that has opened every client has
+    produced a well-defined (if degenerate) answer, not an
+    exceptional one.
+    """
+    if ring_size_before <= 0:
+        raise ValueError("ring_size_before must be positive")
+    if n_opened_so_far < 0:
+        raise ValueError("n_opened_so_far cannot be negative")
+    remaining = ring_size_before - n_opened_so_far
+    if remaining <= 0:
+        return float("-inf")
+    return math.log2(remaining)
