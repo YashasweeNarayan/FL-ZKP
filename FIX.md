@@ -2702,3 +2702,27 @@ carry a distinct `CKPT_REPO_DIR`/`CKPT_BRANCH` (`trace-0`/`trace-1`/
 `...-small_resnet-attack7-traceability` x2). 159 passed, 6 skipped
 (unchanged -- no library code touched this entry, generator-only).
 **Not yet run on Colab.**
+
+## Combo notebook widened to all 4 attack7 combos (2026-11-20)
+
+User clarified: the "cnn mnist old one with attack" they're running
+right now is the standalone `RUN_MVP_TINY_CNN_MNIST_WITH_ATTACK.ipynb`
+(already traceability-wired, per the earlier same-day entry) -- but
+they want tiny_cnn+MNIST included in the combo notebook too, not left
+out of it.
+
+`notebooks/_build_attack_traceability_combo_notebook.py`:
+`COMBO_CASES` widened from 3 to all 4 `fl/attacks/mvp_matrix.ATTACK_CASES`
+entries. tiny_cnn+MNIST's copy here checkpoints to its OWN branch
+(`colab-checkpoints-case1-tiny_cnn-attack7-traceability`) -- distinct
+from both its existing final branch AND the standalone notebook's own
+branch (which the user's separate, concurrent run is currently
+writing to) -- so running both at once cannot collide; it's redundant
+compute, not a correctness risk. Regenerated
+`RUN_MVP_ATTACK7_TRACEABILITY_COMBO.ipynb`: now 51 cells, 4 combo
+blocks (`tiny_cnn+MNIST`, `tiny_cnn+FEMNIST`, `small_resnet+MNIST`,
+`small_resnet+FEMNIST`), one combined summary at the end. Verified all
+4 `CKPT_BRANCH`/`CKPT_REPO_DIR` pairs distinct from each other (confirmed
+by printing every generated cell's values, not just asserted) and from
+the standalone notebook's branch. 159 passed, 6 skipped (generator-only
+change). **Not yet run on Colab.**

@@ -1,22 +1,32 @@
 """Generates RUN_MVP_ATTACK7_TRACEABILITY_COMBO.ipynb: ONE notebook that
-runs the three attack7 combos which still need a traceability result
--- small_resnet+MNIST, tiny_cnn+FEMNIST, small_resnet+FEMNIST --
-sequentially, in a single Colab session, each with §6.2 opening
-wired for real (notebooks/_build_mvp_run_notebooks.py's
-OPENING_HANDLER_CELL, added 2026-11-19).
+runs all 4 attack7 combos sequentially, in a single Colab session,
+each with §6.2 opening wired for real
+(notebooks/_build_mvp_run_notebooks.py's OPENING_HANDLER_CELL, added
+2026-11-19).
 
-Why this exists (2026-11-19, user's explicit ask): tiny_cnn+MNIST's
-attack7 checkpoint had already been removed for an unrelated reason
-(the round-10 history-gap re-run) and is being run separately by the
-user. The other 3 attack7 combos already have FINAL, GOOD accuracy/
-security checkpoints from before traceability wiring existed --
-resuming any of them would load the finished checkpoint and exit
-immediately (no rounds left in `range(20, 20)`), producing ZERO new
-traceability output. Getting a real traceability result for these 3
-means running each fresh from round 0. Rather than 3 separate Colab
-tabs (awkward for one person to babysit, and free-tier Colab often
-won't run multiple GPU sessions on one account at once), this
-notebook runs all 3 back-to-back in one session, unattended.
+Why this exists (2026-11-19, user's explicit ask): 3 of the 4 attack7
+combos (small_resnet+MNIST, tiny_cnn+FEMNIST, small_resnet+FEMNIST)
+already had FINAL, GOOD accuracy/security checkpoints from before
+traceability wiring existed -- resuming any of them would load the
+finished checkpoint and exit immediately (no rounds left in
+`range(20, 20)`), producing ZERO new traceability output. Getting a
+real traceability result for them means running each fresh from round
+0. Rather than 3 (now 4) separate Colab tabs (awkward for one person
+to babysit, and free-tier Colab often won't run multiple GPU sessions
+on one account at once), this notebook runs them all back-to-back in
+one session, unattended.
+
+tiny_cnn+MNIST is ALSO included here (2026-11-20, same user ask,
+widened): its own standalone notebook
+(`RUN_MVP_TINY_CNN_MNIST_WITH_ATTACK.ipynb`) already has the identical
+traceability wiring and may be running separately at the same time --
+that's fine, this combo's copy checkpoints to its OWN
+`...-traceability` branch, distinct from both that notebook's branch
+AND the other 3 combos' branches here, so the two can never collide
+even if run concurrently. Running it twice is redundant but harmless;
+not including it here just because it might already be running
+elsewhere would leave this notebook's "run every combo, in one place"
+promise broken if that other run is interrupted.
 
 **Deliberately on NEW, separate checkpoint branches** (user: "has to
 be different") -- `<original-attack7-branch>-traceability` for each
@@ -52,15 +62,9 @@ from fl.attacks.mvp_matrix import ATTACK_CASES, N_CHEATERS  # noqa: E402
 
 nb = gen.nb
 
-# The 3 combos that still need a fresh, traceability-wired run.
-# tiny_cnn+MNIST (case1/tiny_cnn) is excluded -- the user is running
-# that one separately (its checkpoint was already removed for the
-# round-10-gap re-run, unrelated to this notebook's purpose).
-COMBO_CASES = [
-    c for c in ATTACK_CASES
-    if not (c.case_prefix == "case1" and c.model == "tiny_cnn")
-]
-assert len(COMBO_CASES) == 3, f"expected 3 remaining combos, got {len(COMBO_CASES)}"
+# All 4 attack7 combos, each run fresh under real traceability wiring.
+COMBO_CASES = list(ATTACK_CASES)
+assert len(COMBO_CASES) == 4, f"expected all 4 combos, got {len(COMBO_CASES)}"
 
 
 def _cfg_dict(cfg):
@@ -75,10 +79,10 @@ def _cfg_dict(cfg):
 
 
 TITLE_MD = f"""\
-# Attack7 traceability combo run: the 3 remaining combos, back-to-back
+# Attack7 traceability combo run: all 4 combos, back-to-back
 
-Runs {len(COMBO_CASES)} of the 4 attack7 combos in ONE Colab session,
-each from round 0, each with \u00a76.2's opening protocol wired for real
+Runs all {len(COMBO_CASES)} attack7 combos in ONE Colab session, each
+from round 0, each with \u00a76.2's opening protocol wired for real
 (`on_pseudonym_flagged` -> `fl/trace.py::run_opening_protocol` against
 the real DKG committee this notebook builds for each combo -- see
 `notebooks/_build_mvp_run_notebooks.py`'s `OPENING_HANDLER_CELL`
@@ -87,19 +91,23 @@ docstring for exactly what that does).
 **Combos in this notebook, in run order:**
 {chr(10).join(f"{i+1}. `{c.model}` + `{c.dataset_label}`" for i, c in enumerate(COMBO_CASES))}
 
-**Why these 3, and why fresh:** each already has a FINAL, good
-accuracy/security checkpoint from before traceability wiring existed
-(see FIX.md's attack-matrix milestone, 2026-11-19) -- resuming one of
-those would load the already-complete checkpoint and exit immediately
-(no rounds left to run), producing no traceability output at all. The
-4th attack7 combo, `tiny_cnn`+`MNIST`, is being re-run separately (its
-checkpoint was already removed for an unrelated reason -- a round-10
-history gap flagged earlier the same day) and is NOT in this notebook.
+**Why fresh, for every combo:** `small_resnet+MNIST`, `tiny_cnn+FEMNIST`,
+and `small_resnet+FEMNIST` already had a FINAL, good accuracy/security
+checkpoint from before traceability wiring existed (see FIX.md's
+attack-matrix milestone, 2026-11-19) -- resuming one of those would
+load the already-complete checkpoint and exit immediately (no rounds
+left to run), producing no traceability output at all. `tiny_cnn+MNIST`
+is included here too even though its own standalone notebook
+(`RUN_MVP_TINY_CNN_MNIST_WITH_ATTACK.ipynb`, same traceability wiring)
+may be running separately at the same time -- this combo's copy uses
+its OWN distinct checkpoint branch, so the two can never collide even
+run concurrently; running it twice is redundant, not harmful.
 
 **Checkpoints go to NEW, separate branches** --
 `<combo>-attack7-traceability`, distinct from each combo's existing
-`<combo>-attack7` branch, which keeps its current final result
-completely untouched. Each combo also gets its own checkpoint-repo
+`<combo>-attack7` branch (and, for tiny_cnn+MNIST, distinct from the
+standalone notebook's own branch too), so nothing here ever touches
+an existing final result. Each combo also gets its own checkpoint-repo
 clone directory (`CKPT_REPO_DIR`), not a shared one -- see the
 checkpoint markdown cell before each combo for why one clone can't
 safely serve two different branches in this notebook's design.
