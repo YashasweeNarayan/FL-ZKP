@@ -2571,3 +2571,72 @@ flagged pseudonym, giving the paper's per-round "traceability happened
 at round N" result and the H(T) curve. Not yet run on Colab (no
 torch/EC in this sandbox for the full `round_loop.py` path -- same
 limitation as every torch-dependent module here).
+
+## §6.2 opening protocol wired into all 8 run notebooks, real committee (2026-11-19, same day)
+
+Completes the traceability integration started above: `on_pseudonym_flagged`
+(fl/round_loop.py) is now wired, for real, in every MVP run notebook --
+the main training matrix (4 clean + 4 attack7), not just the standalone
+demo. User authorized proceeding through the full pipeline
+autonomously ("do what needs to be done... while updating the .md
+files... giving the perfect systematic way of working").
+
+**What changed, concretely**:
+- `notebooks/_build_mvp_run_notebooks.py`'s shared `RING_CELL` now also
+  Feldman-verifies every DKG sub-share (same check
+  `notebooks/traceability_demo` already ran standalone -- held this
+  notebook's committee to the same standard now that opening runs for
+  real from it) and computes `pk_shares` (each holder's PUBLIC Feldman
+  commitment, via the already-tested `pk_share_for`) -- needed by
+  `run_opening_protocol`'s `verify_partial` step, which the ring cell
+  never computed before since nothing used it.
+- New shared `OPENING_HANDLER_CELL`: defines `on_pseudonym_flagged`,
+  wired straight to `fl/trace.py`'s already-validated
+  `run_opening_protocol` + `revoke` + `residual_anonymity_bits` --
+  the SAME functions the standalone demo proved correct against both
+  the pure-Python backend and real `rbcl` on Colab, nothing new
+  introduced. Collects a real Chaum-Pedersen partial from every key
+  holder (none of the 10 holders is ever one of the 50 clients in this
+  simulation, so nobody ever recuses as the accused) and appends one
+  entry per flagged pseudonym to `traceability_log` (round, opened,
+  theta, evidence total, and -- when opened -- the new ring size and
+  H(T)). Tracks a REPORTING-ONLY shrinking ring (`_opening_ring`) for
+  the H(T) curve -- deliberately does NOT feed back into this run's
+  own ring-signature verification ring, since actually reconfiguring
+  the live ring mid-run is §6.4 (`crypto/reshare.py`), still untested
+  and out of scope.
+- `run_cell`/`attack_run_cell`: `on_pseudonym_flagged=on_pseudonym_flagged`
+  added to the `run_training_loop(...)` call; both print a "§6
+  traceability summary" after the run, built from `traceability_log`
+  -- this IS the paper's "traceability happened at round N" result,
+  for real per-round evidence, not a synthetic demo case.
+- Regenerated the 6 auto-generated notebooks (3 clean + 3 attack7).
+  The 2 hand-built/frozen notebooks this generator never overwrites
+  (`RUN_MVP_TINY_CNN_MNIST.ipynb`, `..._WITH_ATTACK.ipynb` -- the
+  baseline and the attack7 variant about to be re-run from scratch)
+  were hand-patched with the byte-identical cell content instead of
+  regenerated, so neither loses its hand-built history; verified the
+  patch produced the exact same ring-cell/handler-cell/run-cell text
+  the generator itself emits for the other 6.
+
+**Verification possible without Colab (no torch/GPU here, same
+limitation as every training-path change this whole project)**: all 8
+notebooks re-checked as valid JSON; every non-magic code cell
+(`!pip`/`!git` cells excluded, as always) parses as valid Python via
+`ast.parse` -- including the 2 newly-inserted opening-handler cells
+and both patched run cells. 159 passed, 6 skipped locally (one more
+than the last entry -- a new `EpochEvidenceState.certificate` property
+test). **Not yet run on Colab.**
+
+**Expected result once run** (not yet observed -- a prediction worth
+recording before it's confirmed, so a surprising outcome is visible as
+surprising): a clean (all-honest) run should show ZERO traceability
+events across all 20 rounds (every pseudonym's evidence stays under
+the calibrated theta). An attack7 run should show the 7 attackers'
+pseudonyms crossing theta and getting opened very early (their forced
+delta is a model-replacement-scale outlier every single round they're
+eligible -- evidence accumulation is independent of, and in addition
+to, V3's existing hard per-round rejection), giving the paper a real
+"traceability happened at round N" number for all 4 (model, dataset)
+combinations once their attack7 variants are (re-)run under this
+wiring.

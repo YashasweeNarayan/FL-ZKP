@@ -308,7 +308,7 @@ def run_training_loop(
     evidence_alpha: float = 0.05,  # 2026-11-19: §6.1 evidence accumulation (fl/trace_wiring.py::EpochEvidenceState), wired into the real per-round loop below. This is the certified Pr[open | honest] bound theta is calibrated to -- see fl/evidence.py::calibrate_theta_from_norms. The real pipeline only ever computes evidence from the ONE cryptographically-verified term (norm_q/B_t, via fl/evidence.py::norm_only_evidence) -- cos_dist and loss_delta both need the raw q_k vector, which the server never sees under the norm-bound ZK proof (see norm_only_evidence's docstring for the full reasoning); this is a deliberate, honest reduction of the full §6.1 formula, not a missing feature.
     evidence_n_permutations: int = 2000,  # passed straight through to calibrate_theta_from_norms; see its docstring.
     evidence_rng: "np.random.Generator | None" = None,  # passed straight through to calibrate_theta_from_norms (None -> a fresh default_rng each call, matching every other calibration call site in this project).
-    on_pseudonym_flagged: "Callable[[bytes, int, float], None] | None" = None,  # fires once, the FIRST round a pseudonym's accumulated evidence crosses theta this epoch, with (pseudonym_bytes, t_round, evidence_total). pseudonym_bytes is clsag.py's real P_k^e epoch pseudonym (phase1_by_client[i].key_image_epoch.b) -- this function deliberately does NOT call fl/trace.py's run_opening_protocol itself (the committee's secret key-holder shares live only in notebook scope, never passed in here; see fl/trace_wiring.py's module docstring for why). A caller that has the real committee (e.g. the notebook that built it via crypto/dkg.py's finalize()) wires this callback to actually open the identity and call revoke(); None -> evidence is still accumulated and recorded in `history`, just nothing acts on a crossing. Exceptions raised here are NOT caught, same convention as on_checkpoint_saved.
+    on_pseudonym_flagged: "Callable[[bytes, int, float, object, int, object], None] | None" = None,  # fires once, the FIRST round a pseudonym's accumulated evidence crosses theta this epoch, with (pseudonym_bytes, t_round, evidence_total, escrow_ciphertext, epoch, calibration_certificate). pseudonym_bytes is clsag.py's real P_k^e epoch pseudonym (phase1_by_client[i].key_image_epoch.b); escrow_ciphertext is THAT round's phase1_by_client[i].escrow_ciphertext (tau_k) for the flagged client -- any round within the epoch decrypts to the same real pk_k, since the epoch pseudonym (and therefore the accusation) is the same client across the whole epoch, so the round the flag fires on is as good as any other; calibration_certificate is fl/trace_wiring.py's EpochEvidenceState.certificate (an fl.evidence.CalibrationCertificate), needed to build fl/trace.py's OpeningRequest. This function deliberately does NOT call fl/trace.py's run_opening_protocol itself (the committee's secret key-holder shares live only in notebook scope, never passed in here; see fl/trace_wiring.py's module docstring for why). A caller that has the real committee (e.g. the notebook that built it via crypto/dkg.py's finalize()) wires this callback to actually open the identity and call revoke(); None -> evidence is still accumulated and recorded in `history`, just nothing acts on a crossing. Exceptions raised here are NOT caught, same convention as on_checkpoint_saved.
 ):
     """Runs ARCHITECTURE.md §4's round protocol for `rounds` rounds over
     one model: VRF self-sampling -> local train -> DP noise -> quantize
@@ -781,13 +781,21 @@ def run_training_loop(
             # every eligible client's norm was actually measured against
             # this round.
             _evidence_B_t_this_round = threshold.B_t
-            pseudonym_norm_pairs = [
-                (
-                    phase1_by_client[i].key_image_epoch.b,
+            pseudonym_norm_pairs = []
+            pseudonym_to_escrow = {}
+            for i in eligible_this_round:
+                _pseudonym = phase1_by_client[i].key_image_epoch.b
+                pseudonym_norm_pairs.append((
+                    _pseudonym,
                     int_sketch_norm(phase2_by_client[i].sketch_commitment.v, sketch_m, _sketch_density),
-                )
-                for i in eligible_this_round
-            ]
+                ))
+                # Last-writer-wins is fine here: every eligible client
+                # keeps the SAME key_image_epoch (and therefore the
+                # same escrowed pk_k) for the whole epoch, so any
+                # round's escrow_ciphertext for this pseudonym decrypts
+                # to the same identity -- see on_pseudonym_flagged's
+                # docstring above.
+                pseudonym_to_escrow[_pseudonym] = phase1_by_client[i].escrow_ciphertext
             newly_flagged = evidence_state.record_round(t_round, pseudonym_norm_pairs, _evidence_B_t_this_round)
             if newly_flagged:
                 if verbose:
@@ -795,7 +803,10 @@ def run_training_loop(
                           f"crossed theta={evidence_state.theta:.3f} this epoch (epoch {evidence_state.epoch})")
                 if on_pseudonym_flagged is not None:
                     for pseudonym in newly_flagged:
-                        on_pseudonym_flagged(pseudonym, t_round, evidence_state.total_for(pseudonym))
+                        on_pseudonym_flagged(
+                            pseudonym, t_round, evidence_state.total_for(pseudonym),
+                            pseudonym_to_escrow[pseudonym], evidence_state.epoch, evidence_state.certificate,
+                        )
 
             threshold = update_threshold_ema(threshold, next_round_norms, k=k, alpha=ema_alpha)
 

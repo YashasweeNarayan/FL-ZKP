@@ -98,6 +98,14 @@ class EpochEvidenceState:
         return self._certificate.theta if self._certificate is not None else float("inf")
 
     @property
+    def certificate(self) -> "CalibrationCertificate | None":
+        """The current epoch's CalibrationCertificate -- a caller
+        acting on a flagged pseudonym (e.g. building fl/trace.py's
+        OpeningRequest) needs this object itself, not just its theta.
+        """
+        return self._certificate
+
+    @property
     def epoch(self) -> "int | None":
         return self._current_epoch if self._current_epoch >= 0 else None
 

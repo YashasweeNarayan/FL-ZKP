@@ -94,6 +94,14 @@ def test_persistently_scaled_pseudonym_gets_flagged_and_only_once():
     assert "malicious" not in more_flags
 
 
+def test_certificate_matches_theta_and_is_none_before_first_round():
+    state = make_state()
+    assert state.certificate is None
+    state.record_round(t_round=0, pseudonym_norm_pairs=[("p1", 5.0)], B_t=10.0)
+    assert state.certificate is not None
+    assert state.certificate.theta == state.theta
+
+
 def test_rejected_clients_still_contribute_evidence():
     """A client this round's protocol rejected (e.g. V3) must still be
     passed into record_round -- evidence tracks behavior independent of
@@ -119,6 +127,8 @@ if __name__ == "__main__":
     print("test_honest_pseudonym_stays_unflagged_across_a_full_epoch PASSED")
     test_persistently_scaled_pseudonym_gets_flagged_and_only_once()
     print("test_persistently_scaled_pseudonym_gets_flagged_and_only_once PASSED")
+    test_certificate_matches_theta_and_is_none_before_first_round()
+    print("test_certificate_matches_theta_and_is_none_before_first_round PASSED")
     test_rejected_clients_still_contribute_evidence()
     print("test_rejected_clients_still_contribute_evidence PASSED")
     print("\nALL trace_wiring TESTS PASSED")

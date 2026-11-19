@@ -137,7 +137,7 @@ print(CFG)
 RING_CELL = """\
 # 6. Build the ring (one keypair per client) and the trace committee.
 from crypto.ristretto import Scalar, scalar_mul_base
-from crypto.dkg import generate_contribution, finalize, pk_share_for
+from crypto.dkg import generate_contribution, verify_sub_share, finalize, pk_share_for
 from fl.round_loop import build_x25519_keys, precompute_pairwise_secrets
 
 n_clients = CFG['protocol']['n_clients']
@@ -152,9 +152,92 @@ pairwise_secrets = precompute_pairwise_secrets(x25519_sks, x25519_pks)
 
 key_holder_ids = list(range(1, n_c + 1))
 dkg_contributions = [generate_contribution(h, t, key_holder_ids) for h in key_holder_ids]
+
+# Feldman-verify every sub-share before finalizing -- a real committee
+# would discard a contribution that fails this and re-run DKG without
+# the cheating holder; all contributions here are honest, so every
+# check is expected to pass. Same check notebooks/traceability_demo
+# already runs standalone; added here (2026-11-19) alongside pk_shares
+# below so this notebook's committee is held to the same standard, now
+# that §6.2 opening runs for real from this notebook's own evidence
+# (not just the standalone demo).
+for c in dkg_contributions:
+    for j in key_holder_ids:
+        assert verify_sub_share(c.sub_shares[j], c.feldman_commitments), (
+            f"holder {c.holder_id}'s sub-share to {j} failed Feldman verification"
+        )
+
 PK_trace, key_holder_shares = finalize(dkg_contributions, key_holder_ids)
+# pk_shares (2026-11-19): each holder's PUBLIC Feldman commitment --
+# needed by crypto.elgamal_threshold.verify_partial inside
+# fl/trace.py::run_opening_protocol to check a partial decryption
+# before combining it. key_holder_shares (above) are the holders' own
+# SECRET shares, needed to CREATE a partial in the first place
+# (crypto.elgamal_threshold.compute_partial) -- both come out of the
+# SAME DKG run, never recomputed independently.
+pk_shares = {i: pk_share_for(i, dkg_contributions) for i in key_holder_ids}
 print(f"ring of {len(ring)} published, PK_trace established among {n_c} key holders (t={t})")
 print(f"{n_clients} X25519 keypairs + {n_clients*(n_clients-1)} pairwise secrets precomputed")
+"""
+
+OPENING_HANDLER_CELL = """\
+# 6.5. §6.2 real opening-protocol handler, wired to
+# run_training_loop's on_pseudonym_flagged callback (fl/round_loop.py,
+# 2026-11-19). This is the SAME run_opening_protocol +
+# revoke + residual_anonymity_bits machinery already validated
+# standalone in notebooks/traceability_demo/TRACEABILITY_DEMO.ipynb
+# (both against the local pure-Python backend and, per FIX.md, the
+# real rbcl backend on Colab) -- nothing new is introduced here, this
+# cell just triggers it from REAL per-round evidence instead of a
+# hand-built test case, using the SAME committee (key_holder_shares,
+# pk_shares) the ring cell above just built for escrow.
+#
+# None of these key holders is ever one of this run's clients (two
+# disjoint simulated roles), so no holder ever recuses as
+# the accused party (fl/trace.py::collect_partial_from_holder's
+# recusal rule) -- every holder contributes a partial to every opening
+# attempt, same as the demo notebook's partials_from() helper.
+from crypto.elgamal_threshold import compute_partial
+from fl.trace import OpeningRequest, run_opening_protocol, revoke, residual_anonymity_bits
+
+traceability_log = []       # one dict per flagged pseudonym: round, opened, H(T), etc.
+_opening_ring = list(ring)  # REPORTING-ONLY shrinking ring, for the H(T) curve -- does NOT
+                             # feed back into this run's own ring-signature verification (that
+                             # would need §6.4 committee/ring reconfiguration, out of scope here;
+                             # see FIX.md's traceability-wiring entries for why).
+_n_opened_so_far = 0
+
+
+def on_pseudonym_flagged(pseudonym_bytes, t_round, evidence_total, escrow_ciphertext, epoch, certificate):
+    global _opening_ring, _n_opened_so_far
+    request = OpeningRequest(
+        epoch=epoch, accused_pseudonym=pseudonym_bytes, evidence_total=evidence_total,
+        calibration_certificate=certificate, escrow_ciphertext=escrow_ciphertext,
+    )
+    transcript = f"opening:{epoch}:{pseudonym_bytes.hex()}".encode()
+    partials = {
+        i: compute_partial(escrow_ciphertext, key_holder_shares[i], pk_shares[i], transcript)
+        for i in key_holder_ids
+    }
+    verdict = run_opening_protocol(request, partials, pk_shares, t, admin_authorized=True)
+
+    entry = {
+        "round": t_round, "epoch": epoch, "pseudonym": pseudonym_bytes.hex(),
+        "evidence_total": evidence_total, "theta": certificate.theta, "opened": verdict.opened,
+    }
+    if verdict.opened:
+        _opening_ring, record = revoke(verdict, _opening_ring, epoch)
+        _n_opened_so_far += 1
+        entry["new_ring_size"] = record.new_ring_size
+        entry["residual_anonymity_bits"] = residual_anonymity_bits(len(ring), _n_opened_so_far)
+        print(f"  round {t_round}: TRACEABILITY -- pseudonym {pseudonym_bytes.hex()[:12]}... OPENED "
+              f"(evidence={evidence_total:.3f} > theta={certificate.theta:.3f}), "
+              f"ring {len(ring)}->{record.new_ring_size}, H(T)={entry['residual_anonymity_bits']:.3f} bits")
+    else:
+        entry["reason"] = verdict.reason
+        print(f"  round {t_round}: TRACEABILITY -- pseudonym {pseudonym_bytes.hex()[:12]}... flagged but "
+              f"NOT opened ({verdict.reason})")
+    traceability_log.append(entry)
 """
 
 CHECKPOINT_MD = """\
@@ -563,6 +646,7 @@ final_w_t, real_history = run_training_loop(
     resume_from=resume_from,
     on_checkpoint_saved=push_checkpoint_to_git,
     eval_fn=_eval_fn,
+    on_pseudonym_flagged=on_pseudonym_flagged,
 )
 release_gpu_memory()
 n_accepted = sum(1 for h in real_history if not h['aborted'])
@@ -574,6 +658,23 @@ for h in real_history:
         print(f"  round {{h.get('round')}}: ABORTED")
     elif 'eval' in h:
         print(f"  round {{h.get('round')}}: acc={{h['eval']['acc']:.4f}}")
+
+# §6.2 traceability summary (2026-11-19) -- built from traceability_log,
+# populated by on_pseudonym_flagged (opening-handler cell above) every
+# time real per-round evidence crossed theta during this run.
+print("\\n\\u00a76 traceability summary:")
+if traceability_log:
+    for e in traceability_log:
+        if e["opened"]:
+            print(f"  round {{e['round']}}: pseudonym {{e['pseudonym'][:12]}}... OPENED "
+                  f"(evidence={{e['evidence_total']:.3f}} > theta={{e['theta']:.3f}}), "
+                  f"H(T)={{e['residual_anonymity_bits']:.3f}} bits")
+        else:
+            print(f"  round {{e['round']}}: pseudonym {{e['pseudonym'][:12]}}... flagged, NOT opened "
+                  f"({{e['reason']}})")
+    print(f"  {{_n_opened_so_far}} identity(ies) opened across {{len(traceability_log)}} flagged pseudonym(s) this run.")
+else:
+    print("  no pseudonym ever crossed theta this run -- no traceability events (expected for an all-honest run).")
 """
 
 
@@ -845,6 +946,7 @@ final_w_t, real_history = run_training_loop(
     cheater_force_delta=malicious_delta,
     on_checkpoint_saved=push_checkpoint_to_git,
     eval_fn=_eval_fn,
+    on_pseudonym_flagged=on_pseudonym_flagged,
 )
 release_gpu_memory()
 n_accepted = sum(1 for h in real_history if not h['aborted'])
@@ -883,6 +985,27 @@ elif attacker_ever_rejected:
           f"across all {{REAL_ROUNDS}} rounds, while the honest majority kept training normally.")
 else:
     print("\\nINCONCLUSIVE: no attacker was ever sampled/eligible in any round -- check sampling_rate/eligibility.")
+
+# §6.2 traceability summary (2026-11-19) -- a norm-scaling attacker
+# like this one is expected to cross evidence theta almost immediately
+# (its forced delta is a model-replacement-scale outlier every round it
+# submits), independent of and in addition to V3's hard per-round
+# rejection above -- this is the "traceability happened at round N"
+# result for the paper, built from traceability_log (opening-handler
+# cell above).
+print("\\n\\u00a76 traceability summary:")
+if traceability_log:
+    for e in traceability_log:
+        if e["opened"]:
+            print(f"  round {{e['round']}}: pseudonym {{e['pseudonym'][:12]}}... OPENED "
+                  f"(evidence={{e['evidence_total']:.3f}} > theta={{e['theta']:.3f}}), "
+                  f"H(T)={{e['residual_anonymity_bits']:.3f}} bits")
+        else:
+            print(f"  round {{e['round']}}: pseudonym {{e['pseudonym'][:12]}}... flagged, NOT opened "
+                  f"({{e['reason']}})")
+    print(f"  {{_n_opened_so_far}} identity(ies) opened across {{len(traceability_log)}} flagged pseudonym(s) this run.")
+else:
+    print("  no pseudonym ever crossed theta this run.")
 """
 
 
@@ -909,6 +1032,7 @@ def build_attack_notebook(cfg):
         ("code", CONFIG_CELL),
         ("code", dataset_cell(cfg_dict)),
         ("code", RING_CELL),
+        ("code", OPENING_HANDLER_CELL),
         ("code", model_cell(cfg_dict)),
         ("md", CHECKPOINT_MD),
         ("code", git_checkpoint_cell(cfg.ckpt_branch, ckpt_repo_dir="/kaggle/working/FL-ZKP-checkpoints")),
@@ -929,6 +1053,7 @@ def build_notebook(cfg):
         ("code", CONFIG_CELL),
         ("code", dataset_cell(cfg)),
         ("code", RING_CELL),
+        ("code", OPENING_HANDLER_CELL),
         ("code", model_cell(cfg)),
         ("md", CHECKPOINT_MD),
         ("code", git_checkpoint_cell(cfg["ckpt_branch"])),
