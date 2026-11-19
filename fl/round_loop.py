@@ -43,6 +43,7 @@ from .norm_rule import bootstrap_from_server_root, update_threshold_ema
 from .suspect_tracker import SuspectTracker
 from .models import flatten_state_dict, unflatten_to_state_dict
 from .eval_hook import EVAL_FAILED, run_eval_fn_safely
+from .trace_wiring import EpochEvidenceState
 
 
 def release_gpu_memory() -> None:
@@ -304,6 +305,10 @@ def run_training_loop(
     checkpoint_path: str = None,  # 2026-11-15, scaling to real multi-hour Colab free-tier runs: if given, save {w_t, threshold, history, suspect_tracker, round} to this path after EVERY round -- a run that spans hours on a free-tier runtime that can disconnect at any time otherwise loses everything on a disconnect. None -> no checkpointing (matches every prior call site's behavior exactly).
     resume_from: dict = None,  # output of load_checkpoint(checkpoint_path) from an earlier, interrupted call. Restores w_t/threshold/history/suspect_tracker and resumes at the round AFTER the checkpointed one, instead of starting over at round 0. None -> fresh start (default, matches every prior call site).
     on_checkpoint_saved: "Callable[[str, int], None] | None" = None,  # 2026-11-16: fires right after save_checkpoint() writes checkpoint_path for a round, with (checkpoint_path, round_idx). Deliberately generic -- this library has no opinion on WHERE durability comes from (Drive, git, S3, nothing); a caller wires up its own persistence (e.g. a notebook's git-commit-and-push helper, for a Colab session where Drive isn't mounted) without this module importing subprocess/git at all. A no-op if checkpoint_path is None (nothing was saved to call back about). Exceptions raised here are NOT caught -- a persistence failure should be visible, not swallowed; the checkpoint itself is already safely on local disk by the time this fires, so a raised exception here costs you a retry next round, not the checkpoint.
+    evidence_alpha: float = 0.05,  # 2026-11-19: §6.1 evidence accumulation (fl/trace_wiring.py::EpochEvidenceState), wired into the real per-round loop below. This is the certified Pr[open | honest] bound theta is calibrated to -- see fl/evidence.py::calibrate_theta_from_norms. The real pipeline only ever computes evidence from the ONE cryptographically-verified term (norm_q/B_t, via fl/evidence.py::norm_only_evidence) -- cos_dist and loss_delta both need the raw q_k vector, which the server never sees under the norm-bound ZK proof (see norm_only_evidence's docstring for the full reasoning); this is a deliberate, honest reduction of the full §6.1 formula, not a missing feature.
+    evidence_n_permutations: int = 2000,  # passed straight through to calibrate_theta_from_norms; see its docstring.
+    evidence_rng: "np.random.Generator | None" = None,  # passed straight through to calibrate_theta_from_norms (None -> a fresh default_rng each call, matching every other calibration call site in this project).
+    on_pseudonym_flagged: "Callable[[bytes, int, float], None] | None" = None,  # fires once, the FIRST round a pseudonym's accumulated evidence crosses theta this epoch, with (pseudonym_bytes, t_round, evidence_total). pseudonym_bytes is clsag.py's real P_k^e epoch pseudonym (phase1_by_client[i].key_image_epoch.b) -- this function deliberately does NOT call fl/trace.py's run_opening_protocol itself (the committee's secret key-holder shares live only in notebook scope, never passed in here; see fl/trace_wiring.py's module docstring for why). A caller that has the real committee (e.g. the notebook that built it via crypto/dkg.py's finalize()) wires this callback to actually open the identity and call revoke(); None -> evidence is still accumulated and recorded in `history`, just nothing acts on a crossing. Exceptions raised here are NOT caught, same convention as on_checkpoint_saved.
 ):
     """Runs ARCHITECTURE.md §4's round protocol for `rounds` rounds over
     one model: VRF self-sampling -> local train -> DP noise -> quantize
@@ -319,7 +324,14 @@ def run_training_loop(
     Returns (final_w_t, history), history a list of one dict per round
     (round index, aborted/accepted counts, V5 pass/fail, the resulting
     B_t) -- enough to plot convergence and audit-pass-rate afterward
-    without re-deriving it from scratch.
+    without re-deriving it from scratch. Also accumulates §6.1 evidence
+    per epoch pseudonym (fl/trace_wiring.py::EpochEvidenceState) and
+    records which pseudonyms newly crossed the calibrated theta each
+    round (history[-1]["evidence_newly_flagged"], etc.) -- see
+    on_pseudonym_flagged below for how a caller with the real
+    committee (built via crypto/dkg.py, as every run notebook already
+    does for escrow) turns a crossing into an actual §6.2 identity
+    opening.
 
     *** PERFORMANCE NOTE -- READ BEFORE LAUNCHING A FULL RUN ***
     This function now calls `crypto/sketch.py`'s `TorchSketchProjector`
@@ -395,6 +407,18 @@ def run_training_loop(
 
     w_t, model_shapes = flatten_state_dict(model)
     threshold = bootstrap_from_server_root(server_root_norms, k=k)
+    # 2026-11-19: reuses server_root_norms (the SAME array B_t's own
+    # bootstrap above just consumed) to calibrate theta -- see
+    # fl/evidence.py::calibrate_theta_from_norms's docstring for why
+    # the same root-set norms are the right honest-population stand-in
+    # here too, and this function's own evidence_alpha/evidence_n_permutations
+    # docstring above for what's deliberately NOT computed (cos_dist,
+    # loss_delta) and why.
+    evidence_state = EpochEvidenceState(
+        epoch_rounds=epoch_rounds, sampling_rate=sampling_rate,
+        server_root_norms=server_root_norms, alpha=evidence_alpha,
+        n_permutations=evidence_n_permutations, rng=evidence_rng,
+    )
     history = []
     start_round = 0
 
@@ -420,6 +444,16 @@ def run_training_loop(
         history = resume_from["history"]
         suspect_tracker = resume_from["suspect_tracker"]
         start_round = resume_from["round"] + 1
+        # KNOWN GAP (2026-11-19): evidence_state is NOT part of the
+        # checkpoint -- a resumed run starts a fresh epoch's
+        # accumulator/theta rather than restoring evidence totaled
+        # so far this epoch. Harmless for every run so far (all are
+        # <= epoch_rounds long, so "this epoch" and "this whole run"
+        # coincide, and a resume only loses evidence from the handful
+        # of rounds between the last checkpoint and the resume point,
+        # not an intra-epoch span worth re-deriving from history
+        # retroactively). Would need fixing before a run spans
+        # multiple epochs AND gets interrupted mid-epoch.
         if verbose:
             print(f"resuming from checkpoint: round {resume_from['round']} done, "
                   f"continuing at round {start_round} (of {rounds} total)")
@@ -734,6 +768,35 @@ def run_training_loop(
                 int_sketch_norm(phase2_by_client[i].sketch_commitment.v, sketch_m, _sketch_density)
                 for i in outcome.accepted_client_indices
             ])
+
+            # 2026-11-19: §6.1 evidence accumulation, over EVERY eligible
+            # client this round (accepted AND rejected alike -- see
+            # fl/trace_wiring.py::EpochEvidenceState.record_round's
+            # docstring for why excluding rejected clients would be
+            # wrong), keyed by the real epoch pseudonym clsag.py already
+            # attaches to every submission (phase1_by_client[i] IS the
+            # submission -- see fl/client.py's key_image_epoch field).
+            # Uses threshold.B_t as it stood for THIS round (before the
+            # EMA update two lines below reassigns it), matching the B_t
+            # every eligible client's norm was actually measured against
+            # this round.
+            _evidence_B_t_this_round = threshold.B_t
+            pseudonym_norm_pairs = [
+                (
+                    phase1_by_client[i].key_image_epoch.b,
+                    int_sketch_norm(phase2_by_client[i].sketch_commitment.v, sketch_m, _sketch_density),
+                )
+                for i in eligible_this_round
+            ]
+            newly_flagged = evidence_state.record_round(t_round, pseudonym_norm_pairs, _evidence_B_t_this_round)
+            if newly_flagged:
+                if verbose:
+                    print(f"  round {t_round}: §6.2 TRACEABILITY -- {len(newly_flagged)} pseudonym(s) "
+                          f"crossed theta={evidence_state.theta:.3f} this epoch (epoch {evidence_state.epoch})")
+                if on_pseudonym_flagged is not None:
+                    for pseudonym in newly_flagged:
+                        on_pseudonym_flagged(pseudonym, t_round, evidence_state.total_for(pseudonym))
+
             threshold = update_threshold_ema(threshold, next_round_norms, k=k, alpha=ema_alpha)
 
             if verbose:
@@ -755,6 +818,15 @@ def run_training_loop(
                 "f7e_passed": outcome.aggregate_sketch_check_passed,   # True / None (not run); False never reaches here, it aborts above
                 "aggregate_exact": aggregate_exact,
                 "B_t": threshold.B_t,
+                # 2026-11-19: §6.1/§6.2 traceability -- which pseudonyms
+                # (if any) newly crossed theta THIS round, as hex strings
+                # (bytes aren't JSON/checkpoint-friendly), plus theta and
+                # the epoch index they were calibrated against, so a
+                # post-hoc notebook cell can plot "traceability happened
+                # at round N" without re-deriving it from raw history.
+                "evidence_newly_flagged": [p.hex() for p in newly_flagged],
+                "evidence_theta": evidence_state.theta,
+                "evidence_epoch": evidence_state.epoch,
             })
 
             # FIX.md F21: per-round accuracy, if the caller asked for it.

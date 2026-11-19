@@ -148,3 +148,74 @@ def calibrate_theta(
     theta = float(np.quantile(simulated_totals, 1.0 - alpha))
     empirical_fp = float(np.mean(simulated_totals > theta))
     return CalibrationCertificate(theta=theta, alpha=alpha, n_permutations=n_permutations, empirical_fp_rate_at_theta=empirical_fp)
+
+
+def norm_only_evidence(norm_q: float, B_t: float) -> float:
+    """ev^(t) reduced to its ONE cryptographically-verified term.
+
+    The real pipeline cannot compute w1*cos_dist(q, median) or
+    w3*loss_delta_on_root_set against actual protocol state: both need
+    the raw update vector q_k in the clear, and the server never has
+    it -- that is the entire point of the norm-bound ZK proof
+    (crypto/norm_proof.py, crypto/sketch.py): the server only ever
+    learns a committed norm estimate (``phase2.sketch_commitment.v``,
+    via ``crypto.sketch.int_sketch_norm``), never q_k itself. A
+    "self-reported loss_delta" would restore w3, but only by trusting
+    an unverified client claim (nothing proves it corresponds to the
+    client's actual committed update) -- a real adversary could lie
+    about it undetected, unlike norm_q which IS enforced by the
+    existing sketch+rangeproof.
+
+    So for the real wired pipeline, w1=w3=0 and this collapses to
+    w2*(norm_q/B_t) -- equivalently ``per_round_evidence(q=<unused>,
+    median_ref=<unused>, norm_q, B_t, loss_delta=0.0, w1=0.0, w2=1.0,
+    w3=0.0)`` with the unused/always-zero terms spelled out directly,
+    so the real call site (fl/trace_wiring.py) never needs a dummy q
+    or median_ref just to multiply them away. The full three-term
+    formula remains exactly as specified for the standalone/demo
+    context (tests/test_evidence.py, notebooks/traceability_demo),
+    where synthetic vectors make cos_dist and loss_delta meaningful to
+    exercise; this function is the real-pipeline-faithful instance of
+    the same §6.1 formula, not a different one.
+    """
+    return norm_q / B_t if B_t > 0 else float("inf")
+
+
+def calibrate_theta_from_norms(
+    root_set_norms: np.ndarray,
+    B_t: float,
+    rounds_per_epoch: int,
+    sampling_rate: float,
+    alpha: float = 0.05,
+    n_permutations: int = 2000,
+    rng: np.random.Generator | None = None,
+) -> CalibrationCertificate:
+    """calibrate_theta's norm-only counterpart, paired with
+    norm_only_evidence the same way calibrate_theta is paired with
+    per_round_evidence: resamples (with replacement) from the server's
+    OWN root-set norms -- the same array fl/norm_rule.py's
+    bootstrap_from_server_root already uses to set B_t -- as stand-ins
+    for an honest client's per-round ||q|| contribution, divides by
+    B_t, draws each simulated pseudo-client's round-count this epoch
+    from Binomial(rounds_per_epoch, sampling_rate) (matching the VRF
+    self-sampling rate, exactly as calibrate_theta does), and sets
+    theta to the empirical (1-alpha) quantile across simulated epoch
+    totals -- same certified Pr[open | honest] <= alpha guarantee,
+    restricted to the one term norm_only_evidence actually computes.
+    """
+    rng = rng if rng is not None else np.random.default_rng()
+    n_root = len(root_set_norms)
+    if n_root == 0:
+        raise ValueError("root_set_norms must be non-empty to calibrate theta")
+    root_set_norms = np.asarray(root_set_norms)
+
+    simulated_totals = np.empty(n_permutations)
+    for p in range(n_permutations):
+        n_rounds_this_epoch = rng.binomial(rounds_per_epoch, sampling_rate)
+        n_rounds_this_epoch = max(n_rounds_this_epoch, 1)  # avoid a degenerate zero-round epoch
+        idxs = rng.integers(0, n_root, size=n_rounds_this_epoch)
+        simulated_totals[p] = float(np.sum([norm_only_evidence(root_set_norms[i], B_t) for i in idxs]))
+
+    theta = float(np.quantile(simulated_totals, 1.0 - alpha))
+    empirical_fp = float(np.mean(simulated_totals > theta))
+    return CalibrationCertificate(theta=theta, alpha=alpha, n_permutations=n_permutations, empirical_fp_rate_at_theta=empirical_fp)

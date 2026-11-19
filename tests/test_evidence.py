@@ -9,7 +9,7 @@ import numpy as np
 
 from fl.evidence import (
     cosine_distance, per_round_evidence, EvidenceAccumulator,
-    calibrate_theta,
+    calibrate_theta, norm_only_evidence, calibrate_theta_from_norms,
 )
 
 DIM = 64
@@ -137,6 +137,93 @@ def test_malicious_client_with_persistently_higher_norm_gets_flagged():
     assert malicious_acc.total_for("malicious") > cert.theta
 
 
+def test_norm_only_evidence_matches_full_formula_with_w1_w3_zeroed():
+    """norm_only_evidence(norm_q, B_t) must equal per_round_evidence's
+    w2-only term exactly -- it's the same formula with the two
+    real-pipeline-uncomputable terms' weights set to zero, spelled out
+    directly rather than requiring a dummy q/median_ref/loss_delta.
+    """
+    rng = np.random.default_rng(2)
+    q = rng.normal(0, 1.0, size=DIM)
+    median_ref = rng.normal(0, 1.0, size=DIM)
+    norm_q = float(np.linalg.norm(q))
+    B_t = 7.5
+    full = per_round_evidence(q, median_ref, norm_q, B_t, loss_delta=123.0, w1=0.0, w2=1.0, w3=0.0)
+    reduced = norm_only_evidence(norm_q, B_t)
+    assert abs(full - reduced) < 1e-12
+
+
+def test_norm_only_evidence_inf_when_B_t_not_positive():
+    assert norm_only_evidence(5.0, 0.0) == float("inf")
+    assert norm_only_evidence(5.0, -1.0) == float("inf")
+
+
+def test_calibrate_theta_from_norms_bounds_honest_false_accusation_rate():
+    """Same guardrail as test_calibration_bounds_honest_false_accusation_rate,
+    for the norm-only calibration path."""
+    rng = np.random.default_rng(3)
+    root_norms = np.abs(rng.normal(5.0, 1.0, size=300))
+    B_t = 10.0
+    alpha = 0.05
+    rounds_per_epoch = 25
+    sampling_rate = 0.25
+
+    cert = calibrate_theta_from_norms(
+        root_norms, B_t, rounds_per_epoch, sampling_rate, alpha=alpha,
+        n_permutations=3000, rng=rng,
+    )
+    assert abs(cert.empirical_fp_rate_at_theta - alpha) < 0.02
+
+    n_eval_epochs = 2000
+    opens = 0
+    for _ in range(n_eval_epochs):
+        n_rounds = max(rng.binomial(rounds_per_epoch, sampling_rate), 1)
+        acc = EvidenceAccumulator(epoch=1)
+        idxs = rng.integers(0, len(root_norms), size=n_rounds)
+        for i in idxs:
+            acc.record("honest_client", norm_only_evidence(root_norms[i], B_t))
+        if acc.total_for("honest_client") > cert.theta:
+            opens += 1
+    empirical_rate = opens / n_eval_epochs
+    assert empirical_rate < alpha + 0.03, (
+        f"false-accusation rate {empirical_rate} exceeds alpha={alpha} budget by too much"
+    )
+
+
+def test_calibrate_theta_from_norms_flags_persistently_scaled_attacker():
+    rng = np.random.default_rng(4)
+    root_norms = np.abs(rng.normal(5.0, 1.0, size=300))
+    B_t = 10.0
+    rounds_per_epoch = 25
+    sampling_rate = 0.25
+
+    cert = calibrate_theta_from_norms(
+        root_norms, B_t, rounds_per_epoch, sampling_rate, alpha=0.05,
+        n_permutations=2000, rng=rng,
+    )
+
+    n_rounds = 10
+    honest_acc = EvidenceAccumulator(epoch=2)
+    malicious_acc = EvidenceAccumulator(epoch=2)
+    for t in range(n_rounds):
+        honest_norm = float(np.abs(rng.normal(5.0, 1.0)))
+        honest_acc.record("honest", norm_only_evidence(honest_norm, B_t))
+
+        scaled_norm = B_t * 5.0  # a1_scaling: norm blown up 5x the bound
+        malicious_acc.record("malicious", norm_only_evidence(scaled_norm, B_t))
+
+    assert honest_acc.total_for("honest") < cert.theta
+    assert malicious_acc.total_for("malicious") > cert.theta
+
+
+def test_calibrate_theta_from_norms_rejects_empty_root_set():
+    try:
+        calibrate_theta_from_norms(np.array([]), 10.0, 25, 0.25)
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+
 if __name__ == "__main__":
     test_cosine_distance_identical_vectors_is_zero()
     print("test_cosine_distance_identical_vectors_is_zero PASSED")
@@ -152,4 +239,14 @@ if __name__ == "__main__":
     print("test_calibration_bounds_honest_false_accusation_rate PASSED")
     test_malicious_client_with_persistently_higher_norm_gets_flagged()
     print("test_malicious_client_with_persistently_higher_norm_gets_flagged PASSED")
+    test_norm_only_evidence_matches_full_formula_with_w1_w3_zeroed()
+    print("test_norm_only_evidence_matches_full_formula_with_w1_w3_zeroed PASSED")
+    test_norm_only_evidence_inf_when_B_t_not_positive()
+    print("test_norm_only_evidence_inf_when_B_t_not_positive PASSED")
+    test_calibrate_theta_from_norms_bounds_honest_false_accusation_rate()
+    print("test_calibrate_theta_from_norms_bounds_honest_false_accusation_rate PASSED")
+    test_calibrate_theta_from_norms_flags_persistently_scaled_attacker()
+    print("test_calibrate_theta_from_norms_flags_persistently_scaled_attacker PASSED")
+    test_calibrate_theta_from_norms_rejects_empty_root_set()
+    print("test_calibrate_theta_from_norms_rejects_empty_root_set PASSED")
     print("\nALL evidence TESTS PASSED")

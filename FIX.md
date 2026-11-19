@@ -2451,3 +2451,123 @@ yet done: not run on Colab with rbcl"). Same algebra, same outcome,
 real backend -- the opening protocol, the DKG, and the H(T) helper
 are now validated against both the test-only pure-Python group and
 the real libsodium-backed one.
+
+## §6 traceability wired into the real per-round pipeline (2026-11-19)
+
+Continuation of the "next phase" the user asked for after the attack-
+matrix + traceability-demo results landed. Investigated what's
+actually available inside `fl/round_loop.py` before writing any code
+(same discipline as the original §6 review): the real epoch pseudonym
+(`key_image_epoch`, `P_k^e`) and escrow ciphertext are already attached
+to every submission (`fl/client.py`), ready to use as-is -- but the
+sketch commitment only ever exposes a committed SCALAR (`v = ||Sq||^2`,
+via `crypto.sketch.int_sketch_norm`), never the raw vector `q`, by
+design (the whole point of the norm-bound ZK proof is that the server
+verifies without learning the update). The one place a plaintext `q`
+exists is a documented "simulation-only" self-check copy, explicitly
+destroyed before round end and explicitly noted as something no real
+party could access.
+
+That kills §6.1's `w1*cos_dist(q, median)` term outright for the real
+pipeline -- not a bug, a direct structural consequence. Checked whether
+`loss_delta_on_root_set` (the formula's third term) could stand in:
+it can't either, for the identical reason -- computing it needs
+`w_t + q_k` evaluated on the root set, i.e. the same raw vector. The
+only way to get a loss-delta signal at all would be the CLIENT
+self-reporting it, unverified (nothing ZK-proves it matches the
+client's actual committed update) -- a real adversary could lie about
+it freely, unlike `norm_q` which the sketch+rangeproof already
+enforces cryptographically.
+
+Put both findings to the user before writing any code (two
+AskUserQuestion checkpoints, since this affects what the paper can
+honestly claim about the wired pipeline): **evidence_t for the real
+pipeline is `norm_q/B_t` only** (w1=w3=0) -- fully ZK-verified, zero
+added trust assumptions, at the cost of not catching a "small,
+persistently off-distribution but under-the-norm-bound" attacker (a
+different attack shape than anything in the current attack matrix,
+all of which scale the norm up, not stay under it).
+
+**Built, tests-first, library layer only (notebook wiring is next)**:
+- `fl/evidence.py`: added `norm_only_evidence(norm_q, B_t)` (the
+  formula reduced to its one live term) and
+  `calibrate_theta_from_norms(root_set_norms, B_t, rounds_per_epoch,
+  sampling_rate, ...)` (calibrate_theta's norm-only counterpart,
+  reusing the SAME root-set-norms array `fl/norm_rule.py`'s
+  `bootstrap_from_server_root` already consumes for B_t -- no new data
+  plumbing). The original 3-term `per_round_evidence`/`calibrate_theta`
+  are untouched, still exactly as specified, for the standalone demo
+  and the paper's theoretical description of the full formula.
+- `fl/trace_wiring.py` (new): `EpochEvidenceState` -- owns one
+  `EvidenceAccumulator` + its calibrated theta for the current epoch,
+  rolls over automatically when `t_round // epoch_rounds` changes
+  (the same expression `round_loop.py` already uses for `rho_e`),
+  and reports newly-flagged pseudonyms per round. Deliberately does
+  NOT call `fl/trace.py`'s `run_opening_protocol` itself -- the
+  committee's secret key-holder shares live only in notebook scope
+  (`crypto/dkg.py`'s `finalize()` output), never passed into
+  `round_loop.py`; this module's job is server-side detection only
+  (who crossed theta, and when), cheap enough to run every round for
+  every client, leaving the slower EC-heavy actual decryption to a
+  post-hoc notebook step for just the handful of flagged pseudonyms.
+- `fl/round_loop.py`: wired in. Every ELIGIBLE client each round
+  (accepted AND rejected -- a client V3 rejects this round still
+  submitted a real committed norm, and theta is calibrated against
+  the full honest-population distribution, so excluding rejected
+  clients would stop tracking exactly who evidence accumulation
+  exists to catch) feeds `evidence_state.record_round(...)`, using
+  `threshold.B_t` as it stood for THIS round (captured before the EMA
+  update reassigns it). New optional params: `evidence_alpha` (default
+  0.05), `evidence_n_permutations`, `evidence_rng`, and
+  `on_pseudonym_flagged(pseudonym_bytes, t_round, evidence_total)` --
+  all default to not breaking any existing call site. Non-aborted
+  rounds' `history` entries gained `evidence_newly_flagged` (hex
+  strings), `evidence_theta`, `evidence_epoch` for post-hoc plotting.
+  **Known, documented gap**: `evidence_state` is NOT checkpointed --
+  a resumed run starts a fresh epoch's accumulator. Harmless for every
+  run so far (all <= epoch_rounds=25 long, so "this epoch" and "this
+  whole run" coincide); would need fixing before a run spans multiple
+  epochs AND gets interrupted mid-epoch.
+
+Confirmed real dummy-padding behavior directly from the code (not
+assumed) before relying on it for calibration: `eligible_this_round`
+is EVERY non-quarantined client every round (VRF self-sampling happens
+INSIDE `round_step_phase1`, deciding real-delta vs. honest-zero-delta
+internally), matching `calibrate_theta_from_norms`'s
+Binomial(rounds_per_epoch, sampling_rate) participation model exactly
+-- a non-sampled client's dummy zero delta naturally yields `norm_q~0`
+that round, so it contributes ~nothing to its own evidence total
+without needing a separate "is this a dummy round" flag anywhere.
+
+**Tests**: `tests/test_trace_wiring.py` (new, 6 pure-math tests --
+epoch rollover resets totals, theta doesn't recalibrate mid-epoch, a
+realistically-dummy-padded honest pseudonym clears theta, a
+persistently-scaled pseudonym gets flagged exactly once, rejected
+clients still accumulate evidence) + 5 new tests in
+`tests/test_evidence.py` (norm_only_evidence matches the full
+formula's w2-only term exactly, B_t<=0 edge case, the same
+false-accusation-rate and scaled-attacker guardrail tests
+`calibrate_theta` already had, now for the norm-only path). One test
+bug caught and fixed before it was a code bug: an early draft of
+`test_honest_pseudonym_stays_unflagged_across_a_full_epoch` had
+"honest" submit a real (nonzero) norm EVERY round -- 100% participation,
+not the ~sampling_rate=0.25 the calibration assumes -- which of course
+exceeded theta; fixed by modeling honest participation the same
+dummy-padded way the real pipeline actually works (mostly zero-norm
+rounds, a real norm only on the VRF-sampled ones), which is also
+exactly how the current wiring will behave for real.
+
+**Verification**: 158 passed, 6 skipped locally (unchanged EC-gated
+skips); separately re-ran the full suite against the real pure-Python
+EC backend (`JANUS_ALLOW_PURE_PYTHON_GROUP=1`) after touching
+`fl/round_loop.py` -- 232 passed, 0 failed, in ~4m12s.
+
+**Not yet done** (next step, notebook layer): wire
+`on_pseudonym_flagged` in the actual run notebooks, which already
+build a real DKG committee (`PK_trace, key_holder_shares`) for escrow
+-- the callback can call the already-validated (both locally and on
+real Colab rbcl) `run_opening_protocol`/`revoke()` for real, for each
+flagged pseudonym, giving the paper's per-round "traceability happened
+at round N" result and the H(T) curve. Not yet run on Colab (no
+torch/EC in this sandbox for the full `round_loop.py` path -- same
+limitation as every torch-dependent module here).
