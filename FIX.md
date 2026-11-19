@@ -2642,3 +2642,63 @@ to, V3's existing hard per-round rejection), giving the paper a real
 "traceability happened at round N" number for all 4 (model, dataset)
 combinations once their attack7 variants are (re-)run under this
 wiring.
+
+## Combined attack7-traceability notebook for the 3 remaining combos (2026-11-19, same day)
+
+User is re-running `tiny_cnn+MNIST+attack7` themselves (already needed
+a fresh run, per the round-10-gap item above). Asked whether the other
+3 attack7 combos (`small_resnet+MNIST`, `tiny_cnn+FEMNIST`,
+`small_resnet+FEMNIST`) should also get a fresh traceability run, and
+if so how to run them efficiently rather than needing 3 separate Colab
+tabs. Flagged first: each of those 3 already has a FINAL, good
+accuracy/security checkpoint from before traceability wiring existed
+-- **resuming any of them produces zero traceability output**, since
+`run_training_loop`'s round loop (`range(start_round, rounds)`) is
+empty when `start_round` already equals `rounds`. Getting a real
+result needs a fresh run from round 0.
+
+User chose: run `tiny_cnn+MNIST+attack7` themselves now, and asked for
+ONE combined notebook covering the other 3 combos sequentially, with
+checkpoints saved "has to be different" (distinct from each combo's
+existing final branch).
+
+Built `notebooks/_build_attack_traceability_combo_notebook.py` ->
+`RUN_MVP_ATTACK7_TRACEABILITY_COMBO.ipynb`: one notebook, 40 cells,
+running `tiny_cnn+FEMNIST`, `small_resnet+MNIST`, `small_resnet+FEMNIST`
+back-to-back in a single Colab session (~15 hours total, unattended).
+Reuses every cell-generating function from
+`notebooks/_build_mvp_run_notebooks.py` directly (dataset_cell,
+RING_CELL, OPENING_HANDLER_CELL, model_cell, git_checkpoint_cell,
+attack_run_cell, eval_cell) and `fl/attacks/mvp_matrix.py`'s
+`ATTACK_CASES` for the attack parameters -- nothing here reimplements
+a cell that generator already owns, so this notebook can't silently
+drift from the other 4 attack7 notebooks' own content.
+
+**Each combo gets its own checkpoint branch AND its own clone
+directory**: `<combo>-attack7-traceability` (distinct from
+`<combo>-attack7`, which keeps its existing final result completely
+untouched) and `/content/FL-ZKP-checkpoints-trace-{0,1,2}`. The
+dedicated-clone-dir part matters mechanically, not just for
+tidiness: `git_checkpoint_cell`'s generated code only clones + checks
+out a branch inside an `if not os.path.exists(CKPT_REPO_DIR):` guard
+-- reusing ONE clone dir across 3 combos in the same notebook would
+mean combo 2 and 3's cells see the dir already exists and skip
+straight to "reuse it", never checking out their OWN different
+branch. Caught this by reading the existing template closely before
+writing the generator, not by trial and error.
+
+Between combos, a small cell copies `traceability_log`/
+`_n_opened_so_far` into combo-specific names
+(`traceability_log_case2_tiny_cnn`, etc.) before the next combo's
+`OPENING_HANDLER_CELL` cell resets both to empty for its own run; a
+final combined cell prints all 3 combos' results together.
+
+**Verification possible without Colab**: notebook valid JSON, 40
+cells in the expected order (title/setup once, then 3 full combo
+blocks, then one combined summary); every non-magic code cell parses
+(`ast.parse`); each combo's `git_checkpoint_cell` call confirmed to
+carry a distinct `CKPT_REPO_DIR`/`CKPT_BRANCH` (`trace-0`/`trace-1`/
+`trace-2`, `...-tiny_cnn-attack7-traceability` /
+`...-small_resnet-attack7-traceability` x2). 159 passed, 6 skipped
+(unchanged -- no library code touched this entry, generator-only).
+**Not yet run on Colab.**
