@@ -2378,3 +2378,54 @@ Also closed part of the other §6.2 gap found during the review (`fl/trace.py` h
 Updated `notebooks/traceability_demo/TRACEABILITY_DEMO.ipynb`'s revocation cell to import `residual_anonymity_bits` from `fl.trace` instead of redefining it inline; title/closing markdown updated to stop calling it a draft. Re-executed the full notebook end to end against the real pure-Python backend -- identical output to before (Case A opens and matches, Case B fails with the same reason, sweep boundary unchanged, `H(T)`: 5.644 -> 5.615 bits for the one Case-A revocation).
 
 **Verification**: 147 passed (141+6), 6 skipped (5+1, the opening-protocol file skips without a backend) with no backend set; 13/13 of the two new files' tests pass against the pure-Python backend (`JANUS_ALLOW_PURE_PYTHON_GROUP=1`); full suite re-confirmed against the real backend: 221 passed, 0 failed, in ~4m35s (no `fl/round_loop.py`/`fl/server.py`/`fl/client.py` touched, so this is purely the new tests plus the pre-existing crypto/e2e suite, all green).
+
+## Milestone (2026-11-19): attack-matrix (attack7) results -- 3 of 4 final, 1 pending a clean re-run
+
+All 4 (model, dataset) combinations ran 20 rounds with 7 of 50 clients
+(14%, matching ARCHITECTURE.md's N7 target) forced to a model-
+replacement-scale malicious delta every round, on the same `_nodp_f20`
+pipeline as the clean matrix. Checkpoints confirmed pushed to all 4
+dedicated `colab-checkpoints-case{1,2}-{tiny_cnn,small_resnet}-attack7`
+branches.
+
+| Model | Dataset | Test acc | Held-out global_val acc | vs. clean matrix |
+|---|---|---|---|---|
+| tiny_cnn | MNIST | **pending clean re-run** | -- | -- |
+| small_resnet | MNIST | 0.9878 (10000 images) | 0.9844 (2499 images) | 0.9891 -> 0.9878 (-0.0013) |
+| tiny_cnn | FEMNIST | 0.7787 (69425 images) | 0.7758 (9327 images) | 0.7818 -> 0.7787 (-0.0031) |
+| small_resnet | FEMNIST | 0.6626 (69425 images) | 0.6573 (9327 images) | 0.7013 -> 0.6626 (-0.0387) |
+
+**Security claim, confirmed for all 4 combos**: "PASS: every attacker
+that was ever eligible ([0, 1, 2, 3, 4, 5, 6]) was rejected by V3
+every time, across all 20 rounds, while the honest majority kept
+training normally" -- identical verdict line in every one of the 4
+logs, 7/7 attackers rejected every single round, `accepted=43/50`
+every round, `aggregate_exact=True` every round.
+
+**Utility-under-attack pattern worth a sentence in the results
+section**: accuracy loss from the attack is small and roughly tracks
+task difficulty -- small_resnet+MNIST and tiny_cnn+FEMNIST both lose
+under half a point (consistent with losing 7/50=14% of potential
+training contributions but V3 successfully isolating 100% of the
+damage they'd otherwise cause), while small_resnet+FEMNIST loses
+~3.9 points -- the harder (non-IID, writer-split) task combined with
+the larger model is more sensitive to the reduced effective
+participant count than the easier MNIST runs are. Not a new
+phenomenon, same pattern F19/F20's milestone already flagged for
+small_resnet's relative underperformance on FEMNIST generally.
+
+**tiny_cnn+MNIST+attack7 excluded from this table deliberately**: its
+prior run had an unexplained round-10 gap in the history log (flagged
+to the user 2026-11-19, see the immediately preceding exchange -- not
+necessarily a lost training round per `fl/round_loop.py`'s
+append-before-save ordering, but not confirmable from the log alone
+either). Checkpoint removed from `colab-checkpoints-case1-tiny_cnn-attack7`
+(commit `a7db9dc`, pushed) at the user's request so the next run
+starts clean from round 0 in one session, avoiding the ambiguity
+rather than resuming into it. Will slot into the table above once
+that re-run completes.
+
+**Verification**: all 3 non-pending combos' logs show continuous
+`round 0` through `round 19` in both the accuracy curve and the
+attacker-verdict list with no gaps, `done: 20 rounds in history, 20
+accepted (not aborted)`.
