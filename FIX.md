@@ -2429,3 +2429,25 @@ that re-run completes.
 `round 0` through `round 19` in both the accuracy curve and the
 attacker-verdict list with no gaps, `done: 20 rounds in history, 20
 accepted (not aborted)`.
+
+## Traceability demo confirmed on real libsodium backend (2026-11-19)
+
+User ran `notebooks/traceability_demo/TRACEABILITY_DEMO.ipynb` on
+Colab. `ristretto255 backend: rbcl` -- the real backend, not the
+local sandbox's pure-Python fallback this was first validated
+against. Every result matches exactly what was checked locally:
+
+- Case A (all 10 of 10 key holders): `opened: True`, recovered
+  identity matches the accused client's real pk: `True`.
+- Case B (holders 1-4 missing, 6 of 10 present): `opened: False`,
+  `reason: only 6 valid partials, need t=7`.
+- Sweep: boundary flips exactly at 7 present holders (10 through 7 ->
+  opened=True; 6 through 0 -> opened=False).
+- Revocation: ring 50 -> 49; `residual_anonymity_bits`: `H(T) =
+  log2(50-0) = 5.644` bits before, `log2(50-1) = 5.615` bits after.
+
+Closes the one open item noted in this notebook's own docstring ("not
+yet done: not run on Colab with rbcl"). Same algebra, same outcome,
+real backend -- the opening protocol, the DKG, and the H(T) helper
+are now validated against both the test-only pure-Python group and
+the real libsodium-backed one.
