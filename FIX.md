@@ -2626,7 +2626,9 @@ notebooks re-checked as valid JSON; every non-magic code cell
 `ast.parse` -- including the 2 newly-inserted opening-handler cells
 and both patched run cells. 159 passed, 6 skipped locally (one more
 than the last entry -- a new `EpochEvidenceState.certificate` property
-test). **Not yet run on Colab.**
+test); separately re-ran the full suite against the real pure-Python
+EC backend after touching `fl/round_loop.py` again -- 233 passed, 0
+failed, in ~4m14s. **Not yet run on Colab.**
 
 **Expected result once run** (not yet observed -- a prediction worth
 recording before it's confirmed, so a surprising outcome is visible as
