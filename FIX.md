@@ -2736,3 +2736,69 @@ blocks (`tiny_cnn+MNIST`, `tiny_cnn+FEMNIST`, `small_resnet+MNIST`,
 by printing every generated cell's values, not just asserted) and from
 the standalone notebook's branch. 159 passed, 6 skipped (generator-only
 change). **Not yet run on Colab.**
+
+## A1 malicious-fraction grid + clean-run traceability confirmation notebooks (2026-11-20)
+
+Two new notebooks, both decided after a direct investigation into what
+LEFT.md §1.6's "attack-type x fraction grid" and the attack7-combo
+notebook's "traceability confirmed" claim actually cover, surfaced to
+the user before building anything.
+
+**1. `RUN_MVP_A1_FRACTION_GRID.ipynb`** (via new
+`notebooks/_build_attack_fraction_grid_notebook.py`). LEFT.md §1.6
+originally scoped {A1, A3, A4-replay, A5} x {10%, 20%, 30%} malicious
+clients. Checked what the real per-round pipeline actually supports
+before building: only A1 (model-replacement scaling) has real
+per-round integration (`fl/client.py`'s `_force_delta`, exercised by
+every attack7 notebook). A3 (sybil), A4-replay, and A5 (splice) attack
+the ring-signature/VRF/key-image layer at the submission-construction
+step, not the trained delta -- they are deliberately tested in
+isolation instead (`RUN_ATTACKS.ipynb`, 8/8 caught, F10/F11's own
+writeup already argues this is correct scope, not a gap). Wiring them
+into real per-round submissions would be new, materially riskier
+engineering in `fl/round_loop.py`/`fl/client.py`, not a notebook
+addition. Put to the user directly; decided: **A1-only** grid. Built:
+3 cells, 10%/20%/30% malicious of 50 (5/10/15 clients), 5 rounds each
+(short on purpose -- the per-round V3-rejection claim doesn't need a
+long run), same tiny_cnn+MNIST base case as LEFT.md item #1, each cell
+on its own dedicated checkpoint branch
+(`colab-checkpoints-case1-tiny_cnn-fracgrid-{10,20,30}pct`) and clone
+directory, no §6.2 traceability wiring (out of scope for this grid --
+pure V3 defense-trigger-rate table). Final cell prints a combined
+fraction-vs-(completed/aborted/rejected/accepted) summary table.
+Reuses every shared cell from `_build_mvp_run_notebooks.py` verbatim
+except the new parametrized `fraction_grid_run_cell`.
+
+**2. `RUN_MVP_CLEAN_TRACEABILITY_CONFIRM.ipynb`** (via new
+`notebooks/_build_clean_traceability_confirm_notebook.py`). User asked
+directly whether the attack7-combo notebook covers the "zero false
+positives" half of the traceability claim -- it does not: it only
+ever runs all-attacker combos. Every existing CLEAN checkpoint in this
+repo predates §6 traceability wiring (2026-11-19), so there is no log
+anywhere showing an honest run producing zero flags; this is a real,
+previously-unflagged gap, not something already covered under another
+name. Built the same way the attack7-combo notebook was: all 4 clean
+model/dataset combos, each run FRESH from round 0 (resuming a finished
+clean checkpoint would produce zero rounds, same reasoning as the
+attack-combo notebook), each on its own new `-clean-traceability`
+checkpoint branch and clone directory so no existing final clean
+result is ever touched. Reuses `_build_mvp_run_notebooks.py`'s own
+`run_cell` (already threads `on_pseudonym_flagged` into
+`run_training_loop`) verbatim -- no new attack/eval logic, only the
+combo-assembly structure (copied from the attack7-combo notebook's own
+pattern) and a `tiny_cnn+MNIST` case1 config block (that combo's clean
+notebook predates `RUN_CONFIGS` and was never folded into it). Final
+cell reports, per combo, how many pseudonyms were flagged (expected:
+0) and prints a plain-language verdict either way -- a nonzero result
+would be a real limitations-section finding, not something to hide.
+
+**Verification (both notebooks)**: valid JSON; every real code cell's
+Python syntax parses cleanly (`ast.parse`, Jupyter magic/shell lines
+replaced with `pass` rather than blanked, which an earlier pass of
+this same check got wrong and had to be corrected before trusting the
+result); all checkpoint branches/clone directories confirmed pairwise
+distinct from each other and from every other notebook's branches in
+this repo (grid: 3, clean-traceability: 4, both new); 159 passed/6
+skipped, unchanged (notebook-only change, no `fl/`/`crypto/` touched).
+**Not yet run on Colab** -- same limitation as every notebook in this
+repo built in this sandbox.
