@@ -3019,3 +3019,75 @@ Re-validated: 92 cells, valid JSON, every code cell's syntax parses,
 clone-dir names unchanged from the earlier distinctness check (round
 count doesn't affect naming); `pytest tests/ -q`: 174 passed/7 skipped,
 unchanged. **Not yet run on Colab.**
+
+## Split `RUN_MVP_BASELINE_ATTACK_GRID.ipynb` into 5 parallel-runnable parts (2026-11-20)
+
+User wanted the ~60-hour total runtime spread across 5 separate
+Colab/Kaggle sessions rather than one long sequential one, and asked
+to preserve the git-checkpoint cells exactly as they already had them
+set up (a real GitHub PAT filled in, plus `/content` repo-dir paths
+changed to `/kaggle/working` to run on Kaggle) rather than regenerate
+them with a placeholder.
+
+**New generator**: `notebooks/_build_baseline_attack_grid_split_notebooks.py`
+-> `RUN_MVP_BASELINE_ATTACK_GRID_PART{1..5}.ipynb`. Split by original
+grid index (0-11, unchanged from the single notebook's own `GRID_CELLS`
+order), 3/3/2/2/2 cells per part:
+- Part 1: sign-flip, all 3 fractions.
+- Part 2: Gaussian noise, all 3 fractions.
+- Part 3: scale-to-threshold @ 10%/20%.
+- Part 4: scale-to-threshold @ 30% + low-and-slow @ 10% -- the one
+  part that straddles an attack-type boundary, unavoidable splitting
+  12 cells into 5 roughly-even parts; flagged in that part's own
+  title markdown, not silently done.
+- Part 5: low-and-slow @ 20%/30%.
+
+Each part is fully standalone (its own clone/install/sanity/config/
+dataset cells) and keeps every cell's ORIGINAL checkpoint branch and
+clone-dir name unchanged -- a checkpoint started in a split part is
+the exact same branch the single notebook would have used for that
+cell, so the single notebook and the 5 parts can never collide with
+each other, and nothing about a cell's identity changes by which file
+it ended up in. Each part ends with its own summary cell scoped to
+only the slugs it actually contains (not the original's all-12-slug
+summary, which would `NameError` on any part missing a slug) --
+the low-and-slow epoch-length caveat note is included only in the
+parts that actually contain a low-and-slow cell (parts 4 and 5).
+
+**Live-credential handling, flagged plainly rather than acted on
+silently**: the user's uploaded working copy had a real GitHub PAT
+(`ghp_...`) hardcoded in all 12 git-checkpoint cells (replacing this
+project's own placeholder comment), plus `CKPT_REPO_DIR` changed from
+`/content/...` to `/kaggle/working/...`. Diffed the upload against the
+already-committed single notebook first: confirmed the ONLY cells
+that differ are exactly those 12 checkpoint cells -- everything else
+(dataset/model/RING/opening-handler/run cells) is byte-identical to
+what's already on GitHub, so nothing else needed reconciling.
+
+Two separate outputs, deliberately not mixed:
+1. **Committed to this repo**: the 5 split notebooks built with this
+   project's normal PLACEHOLDER checkpoint cells (via
+   `gen.git_checkpoint_cell`, same template every other grid notebook
+   uses) -- no real token anywhere in git history.
+2. **Delivered to the user directly (NOT committed)**: 5 "personalized"
+   copies with the user's own real token + `/kaggle/working` paths
+   patched back in (by matching each cell's `CKPT_BRANCH` string, not
+   by positional guessing), byte-for-byte identical to their own
+   working checkpoint cells, split across the same 5 files. A live
+   PAT embedded in a notebook file is a real exposure if that file is
+   ever made public, forked, or uploaded somewhere else -- it was not
+   committed to git for that reason, and the user was told so plainly
+   in this session (not silently decided).
+
+**Verification**: all 5 placeholder parts and all 5 personalized
+copies -- valid JSON, every code cell's syntax parses cleanly
+(magic/shell lines blanked to `pass` first); total cells 29+29+22+22+22
+= 124 across the 5 parts (expected, since each part repeats the 7
+shared setup cells, unlike the single 92-cell notebook which has them
+once); all 12 checkpoint branches and all 12 clone-dirs across the 5
+parts match the single notebook's own 12 EXACTLY (set equality
+confirmed programmatically), zero collisions among the 5 parts or
+with the single notebook or any other notebook in this repo.
+`pytest tests/ -q`: 174 passed/7 skipped, unchanged (notebook-only
+change). **Not yet run on Colab/Kaggle** -- these are an alternate
+way to run the same 12 cells, not a new result.
