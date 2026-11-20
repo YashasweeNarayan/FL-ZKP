@@ -2379,7 +2379,7 @@ Updated `notebooks/traceability_demo/TRACEABILITY_DEMO.ipynb`'s revocation cell 
 
 **Verification**: 147 passed (141+6), 6 skipped (5+1, the opening-protocol file skips without a backend) with no backend set; 13/13 of the two new files' tests pass against the pure-Python backend (`JANUS_ALLOW_PURE_PYTHON_GROUP=1`); full suite re-confirmed against the real backend: 221 passed, 0 failed, in ~4m35s (no `fl/round_loop.py`/`fl/server.py`/`fl/client.py` touched, so this is purely the new tests plus the pre-existing crypto/e2e suite, all green).
 
-## Milestone (2026-11-19): attack-matrix (attack7) results -- 3 of 4 final, 1 pending a clean re-run
+## Milestone (2026-11-19/20): attack-matrix (attack7) results -- all 4 final
 
 All 4 (model, dataset) combinations ran 20 rounds with 7 of 50 clients
 (14%, matching ARCHITECTURE.md's N7 target) forced to a model-
@@ -2390,7 +2390,7 @@ branches.
 
 | Model | Dataset | Test acc | Held-out global_val acc | vs. clean matrix |
 |---|---|---|---|---|
-| tiny_cnn | MNIST | **pending clean re-run** | -- | -- |
+| tiny_cnn | MNIST | 0.9830 (10000 images) | 0.9804 (2499 images) | 0.9852 -> 0.9830 (-0.0022) |
 | small_resnet | MNIST | 0.9878 (10000 images) | 0.9844 (2499 images) | 0.9891 -> 0.9878 (-0.0013) |
 | tiny_cnn | FEMNIST | 0.7787 (69425 images) | 0.7758 (9327 images) | 0.7818 -> 0.7787 (-0.0031) |
 | small_resnet | FEMNIST | 0.6626 (69425 images) | 0.6573 (9327 images) | 0.7013 -> 0.6626 (-0.0387) |
@@ -2414,21 +2414,31 @@ participant count than the easier MNIST runs are. Not a new
 phenomenon, same pattern F19/F20's milestone already flagged for
 small_resnet's relative underperformance on FEMNIST generally.
 
-**tiny_cnn+MNIST+attack7 excluded from this table deliberately**: its
-prior run had an unexplained round-10 gap in the history log (flagged
-to the user 2026-11-19, see the immediately preceding exchange -- not
-necessarily a lost training round per `fl/round_loop.py`'s
-append-before-save ordering, but not confirmable from the log alone
-either). Checkpoint removed from `colab-checkpoints-case1-tiny_cnn-attack7`
-(commit `a7db9dc`, pushed) at the user's request so the next run
-starts clean from round 0 in one session, avoiding the ambiguity
-rather than resuming into it. Will slot into the table above once
-that re-run completes.
+**tiny_cnn+MNIST+attack7 re-run completed clean (2026-11-20).** The
+prior run's unexplained round-10 history gap (flagged to the user
+2026-11-19) did not recur: this run's log shows continuous `round 0`
+through `round 19` in both the accuracy curve and the attacker-verdict
+list with no gaps, `done: 20 rounds in history, 20 accepted (not
+aborted)`, `accepted=43/50`/`aggregate_exact=True` every round, and the
+same `PASS: every attacker that was ever eligible ([0, 1, 2, 3, 4, 5,
+6]) was rejected by V3 every time, across all 20 rounds` verdict the
+other 3 combos already had. Slotted into the table above -- all 4
+attack7 combos are now final.
 
-**Verification**: all 3 non-pending combos' logs show continuous
-`round 0` through `round 19` in both the accuracy curve and the
-attacker-verdict list with no gaps, `done: 20 rounds in history, 20
-accepted (not aborted)`.
+**Traceability result for this combo (first real §6.2 confirmation on
+an attack run)**: `round 0: §6.2 TRACEABILITY -- 7 pseudonym(s) crossed
+theta=9.680 this epoch (epoch 0)` -- exactly the 7 injected attackers
+([0, 1, 2, 3, 4, 5, 6]), flagged in the very first epoch. This matches
+the prediction recorded in the TWENTY-NINTH item before this run: clean
+runs should show zero traceability events, attack7 runs should show all
+7 attackers opened very early. First empirical confirmation of that
+prediction on a real run (this notebook -- `RUN_MVP_TINY_CNN_MNIST_WITH_ATTACK.ipynb`,
+run standalone by the user, not the combo notebook -- already had the
+§6.2 opening-protocol wiring from the TWENTY-NINTH item).
+
+**Verification**: all 4 combos' logs show continuous `round 0` through
+`round 19` in both the accuracy curve and the attacker-verdict list
+with no gaps, `done: 20 rounds in history, 20 accepted (not aborted)`.
 
 ## Traceability demo confirmed on real libsodium backend (2026-11-19)
 
