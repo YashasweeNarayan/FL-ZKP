@@ -299,7 +299,8 @@ def run_training_loop(
     spill_dir: str = None,
     suspect_tracker: "SuspectTracker" = None,  # FIX.md F7f: what happens to a suspect group. None -> fresh tracker (no history from a previous call to this function). Pass the SAME instance across multiple run_training_loop calls to keep ban/quarantine state across them.
     cheater_client_idx: "int | list[int] | set[int] | None" = None,  # ATTACK SIMULATION ONLY (FIX.md F7e/F7f Colab gate) -- see round_step_phase2's _cheat_zero_sketch docstring. Never set this for a real round. None -> no cheater, the honest default. FIX.md 2026-11-16: generalized from a single int to also accept a list/set of indices, for a malicious-FRACTION run (e.g. 7 of 50 clients) rather than one lone cheater -- a bare int still works exactly as before (every existing call site, F11's gate included, is unaffected), it's just normalized to a one-element set internally. Every named index gets the SAME cheater_force_delta (see below) and the SAME _cheat_zero_sketch treatment; there is currently no way to give different indices different attacks in one call -- for that, call this function with disjoint index sets across SEPARATE attack-type notebooks/cells, not by composing it here.
-    cheater_force_delta: "np.ndarray | None" = None,  # ATTACK SIMULATION ONLY (FIX.md F10's follow-up, attacks/a1_scaling.py run through a real round). Only takes effect when cheater_client_idx is also set -- EVERY index named by cheater_client_idx gets round_step_phase1's _force_delta=cheater_force_delta instead of its real (trained-or-zero) delta, so a crafted model-replacement-scale update goes through the REAL masking/sketching/range-proof pipeline alongside genuinely honest clients in the same round, rather than a hand-built submission tested in isolation. None -> no override (default; also a no-op if cheater_client_idx is None).
+    cheater_force_delta: "np.ndarray | None" = None,  # ATTACK SIMULATION ONLY (FIX.md F10's follow-up, attacks/a1_scaling.py run through a real round). Only takes effect when cheater_client_idx is also set -- EVERY index named by cheater_client_idx gets round_step_phase1's _force_delta=cheater_force_delta instead of its real (trained-or-zero) delta, so a crafted model-replacement-scale update goes through the REAL masking/sketching/range-proof pipeline alongside genuinely honest clients in the same round, rather than a hand-built submission tested in isolation. None -> no override (default; also a no-op if cheater_client_idx is None). Mutually exclusive with `cheater_delta_transform` (asserted below) -- set at most one.
+    cheater_delta_transform: "Callable[[np.ndarray, float], np.ndarray] | None" = None,  # ATTACK SIMULATION ONLY (2026-11-20, alongside the baseline-attack craft functions in attacks/baseline_norm_attacks.py). For an attack that needs this round's REAL trained delta and/or this round's active norm bound rather than a hand-picked replacement (sign-flip, noise injection, scale-to-threshold, low-and-slow evidence evasion) -- unlike cheater_force_delta, which replaces Step 1's output outright. Called as `cheater_delta_transform(real_delta, threshold.B_t)` for every index named by cheater_client_idx, where `real_delta` is that client's actual Step-1 output (trained, or zero if not VRF-sampled this round) and `threshold.B_t` is THIS round's active R_norm bound (as it stood before this round's own update, same timing `fl/trace_wiring.py`'s per-round evidence uses) -- plumbed down to `round_step_phase1`'s `_delta_transform` as a single-argument closure over `threshold.B_t`, so `fl/client.py` itself never needs to know what B_t means. None -> no transform (default; also a no-op if cheater_client_idx is None). Mutually exclusive with `cheater_force_delta` (asserted below) -- set at most one.
     eval_fn: "callable | None" = None,  # FIX.md F21 (2026-11-17): optional (round_idx, w_t) -> dict|float callback, called once per successfully-completed round, right after this round's w_t is applied -- result stored under history[-1]["eval"]. Lets a caller get an accuracy-vs-round curve (the standard convergence-curve benchmark expected of an FL paper) without this module importing torch/eval logic itself: the caller's notebook already has evaluate_accuracy + model_shapes + the test set, so it closes over those and passes a thin wrapper. None -> no eval, no extra cost, existing callers (tests, attack notebooks that don't pass this) are unaffected. An exception from eval_fn is caught and logged, never allowed to abort training -- an eval bug must not cost a round of already-paid-for GPU + crypto work.
     f7f_share_threshold: int = 4,  # FIX.md F7f (2026-11-15): a SEPARATE, low Shamir threshold for F7f's subgroup reconstruction during bisection -- NEVER the main secagg_share_threshold. The main threshold (default (2n/3)+1, a super-majority chosen for the WHOLE round's dropout/collusion resistance) is almost always bigger than any bisection-floor-sized subgroup, so reusing it for F7f made every leaf group unverifiable and therefore automatically "suspect" regardless of guilt (Gate E caught this: an innocent client got banned, the real cheater never did). This threshold governs a SECOND, independent Shamir sharing of each client's secrets, used ONLY during F7f's subgroup checks -- the main round's security is untouched by this value.
     checkpoint_path: str = None,  # 2026-11-15, scaling to real multi-hour Colab free-tier runs: if given, save {w_t, threshold, history, suspect_tracker, round} to this path after EVERY round -- a run that spans hours on a free-tier runtime that can disconnect at any time otherwise loses everything on a disconnect. None -> no checkpointing (matches every prior call site's behavior exactly).
@@ -380,6 +381,10 @@ def run_training_loop(
         _cheater_indices = {cheater_client_idx}
     else:
         _cheater_indices = set(cheater_client_idx)
+    assert cheater_force_delta is None or cheater_delta_transform is None, (
+        "cheater_force_delta and cheater_delta_transform are mutually exclusive -- "
+        "pass at most one (see either parameter's docstring above)."
+    )
     if suspect_tracker is None:
         suspect_tracker = SuspectTracker()
     # FIX.md F6: local-training hyperparameters now come from CFG's
@@ -559,6 +564,11 @@ def run_training_loop(
                     _sim_pairwise_mask_cache=pairwise_mask_cache_this_round,
                     vector_sink=_sink,
                     _force_delta=(cheater_force_delta if client_idx in _cheater_indices else None),
+                    _delta_transform=(
+                        (lambda d, _bt=threshold.B_t: cheater_delta_transform(d, _bt))
+                        if (client_idx in _cheater_indices and cheater_delta_transform is not None)
+                        else None
+                    ),
                 )
             _t_phase1 = time.time() - _t_phase1_start
 
@@ -592,8 +602,17 @@ def run_training_loop(
                     # masked vector" cross-check, which is a different (true,
                     # but not the intended) finding. Only cheat-zero-sketch
                     # when no cheater_force_delta is given, so the two cheater
-                    # mechanisms stay independent.
-                    _cheat_zero_sketch=(client_idx in _cheater_indices and cheater_force_delta is None),
+                    # mechanisms stay independent. 2026-11-20: same reasoning
+                    # extends to cheater_delta_transform -- those clients also
+                    # submit a genuinely, honestly-sketched crafted delta (just
+                    # built from THEIR OWN real training output rather than a
+                    # hand-picked replacement), so they must not get the lying
+                    # zero-sketch treatment either.
+                    _cheat_zero_sketch=(
+                        client_idx in _cheater_indices
+                        and cheater_force_delta is None
+                        and cheater_delta_transform is None
+                    ),
                 )
             _t_phase2 = time.time() - _t_phase2_start
 

@@ -328,6 +328,7 @@ def round_step_phase1(
     _sim_pairwise_mask_cache: dict | None = None,
     vector_sink=None,
     _force_delta: np.ndarray | None = None,
+    _delta_transform: "Callable[[np.ndarray], np.ndarray] | None" = None,
 ) -> ClientSubmissionPhase1:
     """Steps 0-7 of ARCHITECTURE.md §4's round protocol.
 
@@ -361,6 +362,25 @@ def round_step_phase1(
     this exercises V3's rejection of a genuinely oversized update
     inside a real round's full pipeline, not a hand-built
     substitute for it. `None` -> no override, the honest default.
+
+    `_delta_transform`: ATTACK SIMULATION ONLY (2026-11-20, added
+    alongside `_force_delta` for a different class of attacks that
+    need Step 1's REAL output, not a hand-picked replacement for it --
+    sign-flip (`g_m = -g_b`), noise injection, and norm-adaptive
+    attacks like scale-to-threshold all start from "whatever this
+    client's real local training actually produced" and transform it,
+    rather than ignoring it outright the way `_force_delta`'s A1
+    model-replacement attack does. When given (and `_force_delta` is
+    `None` -- the two are mutually exclusive, see `run_training_loop`'s
+    assertion), called as `_delta_transform(delta)` on Step 1's real
+    `delta`, and its return value is what's submitted; everything
+    downstream (DP noise, quantize, masking, sketching, the real range
+    proof) still runs exactly as it would for an honest client's
+    delta, same as `_force_delta`. `None` -> no transform, the honest
+    default. If BOTH `_force_delta` and `_delta_transform` are given,
+    `_force_delta` wins (checked first, below) -- but
+    `run_training_loop` asserts against passing both, so a caller
+    should never actually hit that fallback.
     """
     # Step 0: VRF self-sampling.
     vrf_out = vrf_evaluate(ctx.keys.sk, ctx.keys.pk, vrf_alpha)
@@ -377,6 +397,8 @@ def round_step_phase1(
 
     if _force_delta is not None:
         delta = _force_delta  # ATTACK SIMULATION ONLY -- see this function's docstring.
+    elif _delta_transform is not None:
+        delta = _delta_transform(delta)  # ATTACK SIMULATION ONLY -- see this function's docstring.
 
     # Step 2: DP noise share.
     #

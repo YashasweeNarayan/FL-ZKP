@@ -2802,3 +2802,121 @@ this repo (grid: 3, clean-traceability: 4, both new); 159 passed/6
 skipped, unchanged (notebook-only change, no `fl/`/`crypto/` touched).
 **Not yet run on Colab** -- same limitation as every notebook in this
 repo built in this sandbox.
+
+## Benchmarked baseline attacks (sign-flip, Gaussian noise, scale-to-threshold, low-and-slow) + `cheater_delta_transform` hook (2026-11-20)
+
+User asked, after a rigorous web search (3 `WebSearch` calls, ~30
+sources) for recent Byzantine-FL benchmark attacks, to build the ones
+that are both standard-enough that a reviewer would expect them and
+safe to run without touching the paper's own threat model -- then
+merge them into a combined grid notebook alongside the already-built
+A1 fraction grid, with §6.2 traceability wired in.
+
+**Why A1's existing `_force_delta` couldn't carry these.** `_force_delta`
+*replaces* a client's real trained delta outright with a hand-picked
+vector -- right for A1's model-replacement attack, wrong for sign-flip
+(`g_m = -g_b`), additive noise, or any norm-adaptive attack (scale to
+just under `B_t`, or well under it) -- all of these need the client's
+*own real* Step-1 output (or, for the norm-adaptive pair, this round's
+active `B_t`) as an input, not a value chosen in advance. Negating or
+scaling a hand-picked replacement would not be the attack the
+literature defines.
+
+**New engineering (purely additive, `_force_delta` untouched):**
+- `fl/client.py::round_step_phase1` gained `_delta_transform:
+  Callable[[np.ndarray], np.ndarray] | None` -- applied to Step 1's
+  real `delta` (trained, or zero if not VRF-sampled) only when
+  `_force_delta is None` (checked first; `_force_delta` wins if both
+  are somehow given, though that combination is asserted against one
+  level up).
+- `fl/round_loop.py::run_training_loop` gained `cheater_delta_transform:
+  Callable[[np.ndarray, float], np.ndarray] | None`, called as
+  `cheater_delta_transform(real_delta, threshold.B_t)` for every index
+  in `cheater_client_idx`, plumbed down via a closure over
+  `threshold.B_t` so `fl/client.py` itself stays `B_t`-agnostic. A new
+  assertion (`cheater_force_delta is None or cheater_delta_transform is
+  None`) fires immediately after normalizing `cheater_client_idx`,
+  before `suspect_tracker` is created -- the two are mutually
+  exclusive by construction, not just by convention.
+- The existing `_cheat_zero_sketch` condition (round_step_phase2 call
+  site) was extended to also require `cheater_delta_transform is None`
+  -- a `cheater_delta_transform` client submits a genuinely,
+  honestly-sketched crafted delta and must not get the
+  lying-zero-sketch treatment A1's clients get.
+
+**New module, `attacks/baseline_norm_attacks.py`** (4 craft functions,
+full citations in its own docstring):
+- `craft_sign_flip`: `g_m = -g_b` (Shi et al. 2021).
+- `craft_gaussian_noise`: `g_m = g_b + N(0, sigma^2 I)` (Shi et al. 2021's
+  "Noise Attack", distinct from their delta-replacing "Random Attack").
+- `craft_scale_to_threshold`: rescale the real delta to
+  `safety_margin * B_t` (default 0.95), just under this round's R_norm
+  bound rather than wildly past it like A1's `gamma=100` -- the
+  realistic version of a scaling attack per Lycklama et al. 2025
+  ("Hammer and Anvil"), which shows a single adaptive client scaled to
+  exactly a norm-bounding defense's threshold breaks norm-bounding
+  outright, for any functional threshold.
+- `craft_low_and_slow`: this project's own extension (not from any
+  paper) -- rescale to `target_ratio * B_t` (default 0.3), deliberately
+  smaller, testing whether staying well under B_t also keeps the §6.1
+  evidence term small enough to evade the epoch-accumulated theta
+  check too, i.e. whether patience beats both defenses at once.
+- Shared `_scale_to_norm` helper; both scale-based attacks fall back to
+  a random unit direction (then scaled to the target norm) when the
+  real delta is exactly zero (not VRF-sampled), rather than silently
+  submitting zero -- a strictly stronger adversarial assumption.
+
+**Deliberately excluded** (and why, so this isn't re-litigated later):
+true LIE/Min-Max/Min-Sum (Baruch et al.; Shejwalkar & Houmansadr) all
+require the attacker to observe *other* clients' real raw gradients
+each round -- directly contradicts this project's own secure-
+aggregation/masking/sketching threat model, which exists specifically
+to deny that visibility. Building them would mean breaking the
+paper's own privacy guarantee to attack it. Backdoor-objective attacks
+(BackFed, RING) are a genuinely different attack goal (targeted
+misclassification via trigger) and out of scope for this round.
+
+**Tests** (new, this session): `tests/test_baseline_norm_attacks.py`
+-- 15 pure-NumPy unit tests (shape preservation, sign-flip negation,
+exact-norm correctness post-scaling via `_scale_to_norm`, the
+zero-real-delta fallback path, and that `craft_scale_to_threshold` and
+`craft_low_and_slow` produce different norms at their different
+defaults) -- run unconditionally, no EC backend needed.
+`tests/test_cheater_delta_transform.py` -- 7 integration tests of the
+real `_delta_transform`/`cheater_delta_transform` wiring, gated like
+`test_round_end_to_end.py` (skips cleanly with no group backend;
+`JANUS_ALLOW_PURE_PYTHON_GROUP=1` enables the pure-Python backend used
+to run them here). Confirms: `_delta_transform` is called with Step
+1's real (zero, since `sampling_rate=0.0` forces `b_k=False`) delta
+and its result reaches a real commitment/signature; the honest
+no-transform default is unaffected; `_force_delta` wins when both are
+given directly to `round_step_phase1` (the one caller-level escape
+hatch the docstring documents, unreachable via `run_training_loop`);
+a transform producing a genuinely non-zero vector survives the full
+real crypto pipeline; and `run_training_loop`'s mutual-exclusivity
+assertion fires for the forbidden combination but not for either
+argument alone (confirmed by getting past it to `fl/models.py`'s
+`_require_torch()` RuntimeError instead, since torch genuinely isn't
+installed in this sandbox -- that RuntimeError, not an AssertionError,
+is itself the proof the assert didn't fire). Discovered along the way:
+`fl.client`/`fl.round_loop` import successfully under
+`JANUS_ALLOW_PURE_PYTHON_GROUP=1` in this sandbox, contrary to
+`test_eval_fn_hook.py`'s own docstring precedent (written before this
+env var's test-only pure-Python backend existed) -- real integration
+tests of this new wiring are therefore possible here, not just code
+review.
+
+**Verification**: `pytest tests/ -q` -- 174 passed/7 skipped without
+the env var (up from 159/6: +15 unconditional tests, +1 newly-skipped
+module), 255 passed with `JANUS_ALLOW_PURE_PYTHON_GROUP=1` set (every
+previously-skipped test, including the new integration file, runs and
+passes). Zero regressions either way.
+
+**Not yet done**: the combined grid notebook itself (sign-flip/noise/
+scale-to-threshold/low-and-slow x 10%/20%/30% malicious, tiny_cnn+MNIST,
+§6.2 traceability wired in) -- this entry covers the engineering and
+tests it depends on, not the notebook. Also pending: the user's prior
+ICIST Byzantine-robust conference paper's own attack list, asked for
+but not yet provided (checked memory: only submission-status metadata
+on file, no attack definitions) -- to be folded in once supplied, if
+it passes the same buildability/safety filter applied above.
