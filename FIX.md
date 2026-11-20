@@ -2920,3 +2920,85 @@ ICIST Byzantine-robust conference paper's own attack list, asked for
 but not yet provided (checked memory: only submission-status metadata
 on file, no attack definitions) -- to be folded in once supplied, if
 it passes the same buildability/safety filter applied above.
+
+## `RUN_MVP_BASELINE_ATTACK_GRID.ipynb`: combined baseline-attack grid, §6.2 traceability wired in (2026-11-20)
+
+The notebook the previous entry's engineering (`cheater_delta_transform`,
+`attacks/baseline_norm_attacks.py`) was built for. Via new
+`notebooks/_build_baseline_attack_grid_notebook.py`: 4 attacks
+(sign-flip, Gaussian noise, scale-to-threshold, low-and-slow) x
+{10%, 20%, 30%} malicious of 50 clients = 12 cells, `tiny_cnn`+MNIST
+(same base case as the A1 fraction grid and every attack7 notebook),
+10 rounds each, each cell on its own dedicated checkpoint branch
+(`colab-checkpoints-case1-tiny_cnn-baselinegrid-<attack>-<fraction>`)
+and clone directory.
+
+**Does NOT replace `RUN_MVP_A1_FRACTION_GRID.ipynb`** -- per the
+"never delete, always add" convention and the user's own "keep all
+existing results" decision, this is an ADDITIONAL notebook covering
+the 4 new attacks the A1 grid was never scoped for (that one is
+A1-only, no traceability, already committed/final).
+
+**§6.2 traceability wired in** (the A1 grid deliberately left this
+out as out of scope for its own pure V3 defense-trigger-rate table) --
+each of the 12 cells builds its own real DKG committee (`RING_CELL`)
+and real opening-protocol handler (`OPENING_HANDLER_CELL`), exactly
+like the attack7-traceability combo notebook, so a real evidence-theta
+crossing triggers a real identity opening against real escrow
+ciphertexts, not a simulated one.
+
+**Attack-to-transform mapping** (each via the new `cheater_delta_transform`
+hook, not `cheater_force_delta`):
+- sign-flip: `craft_sign_flip(d)`.
+- Gaussian noise: `craft_gaussian_noise(d, sigma=0.5*B_t)` -- sigma
+  scaled to half the round's active norm bound rather than a fixed
+  constant, so the perturbation is comparably sized across rounds/
+  cells regardless of the real delta's own magnitude.
+- scale-to-threshold / low-and-slow: `craft_scale_to_threshold(d, B_t)`
+  / `craft_low_and_slow(d, B_t)` at their module defaults (0.95 and
+  0.3 respectively).
+- A per-cell `_attack_rng = np.random.default_rng(CFG['seed'] + 1000 + i)`
+  seeds each attack's own randomness (noise draws; the zero-real-delta
+  fallback direction) deterministically, on a separate stream from
+  `root_norms`' own bootstrap RNG.
+
+**Honest limitation, called out in the notebook's own title markdown
+and its final summary cell, not just here**: 10 rounds settles
+sign-flip/noise/scale-to-threshold's claim (does V3 catch it, does it
+get traced) the same way the A1 grid's 5 rounds did, but low-and-slow
+is a DIFFERENT kind of claim -- it is specifically a patience attack
+testing whether staying under both V3's bound and the accumulating
+§6.1 evidence threshold `theta` survives a WHOLE epoch
+(`configs/mvp_3day.yaml`'s `epoch_rounds: 25`). 10 rounds shows the
+evidence accumulating but is not a definitive epoch-length answer for
+that one attack specifically -- a dedicated >=25-round run of just
+that cell would be needed before citing a "survives" or "caught"
+verdict for low-and-slow in the paper. The other 3 attacks' claims do
+not have this limitation.
+
+**Verification**: valid JSON (92 cells); every real code cell's Python
+syntax parses cleanly (`ast.parse`, magic/shell lines replaced with
+`pass`); all 12 new checkpoint branches and all 12 new clone
+directories confirmed pairwise distinct from each other and from
+every other notebook's branches/dirs in the repo (31 distinct branches
+total across the whole repo, zero collisions; clone-dir collisions
+found are pre-existing and shared only among the 4 clean/4 attack
+notebooks respectively per the existing convention, untouched by this
+notebook). One bug caught and fixed before this check passed: the
+final summary cell's low-and-slow caveat line had a nested-quote
+f-string/plain-string concatenation error (an unescaped `"` broke the
+generated cell's own syntax) -- fixed by making the whole line one
+proper f-string in the generator. `pytest tests/ -q`: 174 passed/7
+skipped, unchanged (notebook-only change, no `fl/`/`crypto/`/`attacks/`
+touched since the previous entry). **Not yet run on Colab.**
+
+**Notebooks the user needs to run now** (per the original "give me the
+list of notebooks i have to run" ask): this new
+`RUN_MVP_BASELINE_ATTACK_GRID.ipynb`; the already-committed
+`RUN_MVP_A1_FRACTION_GRID.ipynb` and
+`RUN_MVP_CLEAN_TRACEABILITY_CONFIRM.ipynb`; the already-committed
+`RUN_MVP_ATTACK7_TRACEABILITY_COMBO.ipynb` (covers the remaining 3
+attack7 combos' traceability, plus a redundant-but-harmless 4th);
+and whichever of the user's own already-running standalone notebooks
+(the tiny_cnn+MNIST+attack7 traceability run) they still want results
+from.
