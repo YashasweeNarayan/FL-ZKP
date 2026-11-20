@@ -33,23 +33,23 @@ every other multi-cell notebook in this repo (`git_checkpoint_cell`'s
 branch-checkout logic only has a "clone+checkout" or "reuse exactly
 what's checked out" branch, never "same clone, different branch").
 
-**10 rounds per cell** (not 5 like the A1 fraction grid, not the full
-20/45 of a real accuracy run): sign-flip/noise/scale-to-threshold's
-claim ("does V3 catch this, and/or does it get traced") is decided
-within a handful of rounds, same reasoning as the A1 grid. Low-and-
-slow's claim is different -- it is SPECIFICALLY a patience attack
-staying under both V3's per-round bound and the accumulating \u00a76.1
-evidence threshold theta, and whether it ever crosses theta is an
-EPOCH-length question (`configs/mvp_3day.yaml`'s `protocol.epoch_rounds:
-25`). 10 rounds is a deliberate middle ground, not a definitive
-answer for low-and-slow specifically: enough to show the evidence
-accumulating round over round, too short to claim "survives a full
-epoch." **This is flagged explicitly in this notebook's own summary
-cell and in FIX.md, not glossed over** -- a reviewer-safe low-and-slow
-result needs a 25-round (or longer) run of that one cell, not done
-here under deadline pressure; the 10-round number here still answers
-V3's immediate per-round question for all 4 attacks and is directly
-comparable to the A1 grid's own existing numbers.
+**20 rounds per cell** (2026-11-20, raised from an initial 10 --
+user asked to match the 20-round length every attack7 notebook
+already uses, rather than the A1 fraction grid's shorter 5). Sign-
+flip/noise/scale-to-threshold's claim ("does V3 catch this, and/or
+does it get traced") is decided within a handful of rounds regardless,
+so this mainly brings the new grid's numbers onto the same footing as
+the existing attack7 results. Low-and-slow's claim is different -- it
+is SPECIFICALLY a patience attack staying under both V3's per-round
+bound and the accumulating \u00a76.1 evidence threshold theta, and
+whether it ever crosses theta is an EPOCH-length question
+(`configs/mvp_3day.yaml`'s `protocol.epoch_rounds: 25`). 20 rounds is
+closer to that epoch length than the original 10 was, but still one
+short of it -- **this is flagged explicitly in this notebook's own
+summary cell and in FIX.md, not glossed over**: a reviewer-safe
+low-and-slow result needs a run of at least `epoch_rounds=25` for
+that one cell specifically to see a complete epoch's worth of
+accumulation, not just "close to it."
 
 Reuses every shared cell-generator function from
 `notebooks/_build_mvp_run_notebooks.py` exactly like both the A1 grid
@@ -84,12 +84,12 @@ ATTACKS = [
     ("signflip", "Sign-flip", "g_m = -g_b -- Shi et al. 2021. Expected to be caught easily by V3 (a negated real delta is usually still a large-norm outlier); included for completeness."),
     ("noise", "Gaussian noise", "g_m = g_b + N(0, (0.5*B_t)^2 I) -- Shi et al. 2021's Noise Attack. sigma scaled to half this round's active norm bound so the perturbation is comparably sized across rounds/cells rather than a fixed constant that means something different depending on the real delta's own magnitude."),
     ("scale_to_threshold", "Scale-to-threshold", "rescale the real delta to 0.95*B_t, just under this round's R_norm bound -- Lycklama et al. 2025 'Hammer and Anvil': the realistic version of a scaling attack, unlike A1's deliberately-naive gamma=100 which overshoots the bound so far V3 catches it trivially."),
-    ("low_and_slow", "Low-and-slow", "rescale the real delta to 0.3*B_t, well under the bound -- this project's own extension, testing whether staying small evades BOTH V3 and the accumulating \u00a76.1 evidence threshold through patience rather than size. See this file's own module docstring for why 10 rounds is not a definitive answer for this one attack specifically."),
+    ("low_and_slow", "Low-and-slow", "rescale the real delta to 0.3*B_t, well under the bound -- this project's own extension, testing whether staying small evades BOTH V3 and the accumulating \u00a76.1 evidence threshold through patience rather than size. See this file's own module docstring for why 20 rounds is not a definitive answer for this one attack specifically."),
 ]
 
 # (label, n_cheaters, pct) -- 10%/20%/30% of 50 clients, same as the A1 grid.
 FRACTIONS = [("10pct", 5, 10), ("20pct", 10, 20), ("30pct", 15, 30)]
-REAL_ROUNDS = 10
+REAL_ROUNDS = 20
 
 GRID_CELLS = [
     (attack_key, attack_label, frac_label, n_cheaters, pct)

@@ -3002,3 +3002,20 @@ attack7 combos' traceability, plus a redundant-but-harmless 4th);
 and whichever of the user's own already-running standalone notebooks
 (the tiny_cnn+MNIST+attack7 traceability run) they still want results
 from.
+
+**Follow-up, same day: rounds raised from 10 to 20.** User asked to
+match the 20-round length every attack7 notebook already uses,
+instead of the shorter length this grid started with. `REAL_ROUNDS`
+changed in `notebooks/_build_baseline_attack_grid_notebook.py`
+(generator) only -- no change to `fl/`/`crypto/`/`attacks/`, the
+attack-to-transform mapping, the checkpoint branch/clone-dir names, or
+the cell structure. Low-and-slow's epoch-length caveat is UPDATED, not
+removed: 20 rounds is closer to `epoch_rounds=25` than 10 was, but
+still one short of a complete epoch, so the notebook's own markdown
+and this entry still say a reviewer-safe low-and-slow verdict needs a
+dedicated run of at least 25 rounds for that cell specifically.
+Re-validated: 92 cells, valid JSON, every code cell's syntax parses,
+`REAL_ROUNDS = 20` confirmed present in the generated notebook; branch/
+clone-dir names unchanged from the earlier distinctness check (round
+count doesn't affect naming); `pytest tests/ -q`: 174 passed/7 skipped,
+unchanged. **Not yet run on Colab.**
