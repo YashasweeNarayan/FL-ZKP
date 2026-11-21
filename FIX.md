@@ -3207,3 +3207,81 @@ than tiny_cnn+MNIST at 50 clients.
 blanking magic/shell lines), and cell order checked. Neither has been
 run on Colab yet -- that run is still owed, same as every other
 pending MVP notebook.
+
+## Brutal-review gap #4 extended to tiny_cnn+FEMNIST: new baseline-attack grid + 5-way split (2026-11-22)
+
+**Request**: "create #4 for tiny_CNN+FMINST, and split it in 5, while
+keeping the same token value as you kept in tinyCNN+MNIST" -- extends
+gap #4 ("the baseline-attack grid only covers ONE combo") to a second
+combo, same 4 attacks x 3 fractions grid, now on `tiny_cnn`+FEMNIST
+instead of MNIST.
+
+**Scope, stated plainly**: this adds ONE more combo, not the full
+remaining 2x2 matrix. `small_resnet+MNIST` and `small_resnet+FEMNIST`
+remain unaddressed for this gap -- a scoping choice matching the
+original brainstorm's own recommendation (one additional combo is
+enough to show the grid isn't cherry-picked to the easiest case), not
+an oversight.
+
+**What's identical to the already-committed MNIST grid**: the 4
+attacks (sign-flip, Gaussian noise, scale-to-threshold, low-and-slow),
+the 3 fractions (10%/20%/30% of 50 clients), 20 rounds/cell, §6.2
+traceability wiring, the `cheater_delta_transform` hook. New
+`notebooks/_build_baseline_attack_grid_femnist_notebook.py` imports
+`ATTACKS`/`FRACTIONS`/`GRID_CELLS`/`_TRANSFORM_EXPR` directly from the
+MNIST grid's own generator module rather than redefining them, so the
+two grids' attack/fraction definitions can never drift apart.
+
+**What's different**: a new `CASE2_CFG` (`case_prefix="case2"`,
+`num_classes=62`, `ckpt_branch="colab-checkpoints-case2-tiny_cnn-
+baselinegrid"`); `case2_data` in place of `case1_data`; the headline
+eval split is `case2_data['unseen_test']`, a `FemnistClientDataset`
+**dataclass** (`.images`/`.labels` attributes), not a plain tuple --
+same two-line unpack fix (`_eval_ds = case2_data['unseen_test'];
+_eval_images, _eval_labels = _eval_ds.images, _eval_ds.labels`)
+`_build_mvp_run_notebooks.py::run_cell` already uses for every other
+FEMNIST notebook in this repo, replacing the MNIST grid's plain
+`case1_data['test']` tuple unpack. New checkpoint-branch suffix
+(`-baselinegrid`) distinguishes these 12 branches both from the
+already-completed plain `colab-checkpoints-case2-tiny_cnn` branch and
+from every `case1-...-baselinegrid-*` branch the MNIST grid uses; new
+clone-dir prefix (`/content/FL-ZKP-checkpoints-baselinegrid-femnist-
+{i}`) likewise distinct from the MNIST grid's own `-baselinegrid-{i}`
+dirs. Confirmed via a full-repo regex scan of every `.ipynb`/`.py`
+file: zero collisions anywhere.
+
+**5-way split**: new `notebooks/_build_baseline_attack_grid_femnist_
+split_notebooks.py`, same `PART_SPLIT = [[0,1,2],[3,4,5],[6,7],[8,9],
+[10,11]]` grouping as the MNIST split (sign-flip/noise/scale-to-
+threshold-10-20/scale-to-threshold-30+low-and-slow-10/low-and-slow-
+20-30), each part fully standalone with its own scoped summary cell,
+each cell keeping its ORIGINAL grid index in its branch/dir name so
+split vs. single-notebook checkpoints never diverge.
+
+**Validation**: generated `RUN_MVP_BASELINE_ATTACK_GRID_FEMNIST.ipynb`
+(92 cells) and `..._PART{1..5}.ipynb` (29/29/22/22/22 cells). All 6
+valid JSON; every code cell's syntax confirmed clean via `ast.parse`
+after blanking magic/shell lines to `pass` (the naive all-blank
+approach used earlier this session falsely flags the shared
+`CLONE_CELL`'s `if/else` body on EVERY notebook in this repo,
+including the already-working MNIST grid -- confirmed by running the
+same check against it before trusting the result; the `pass`-based
+check is the correct one and found zero real syntax errors across all
+6 new files). Full-repo branch/dir collision scan: zero collisions.
+`pytest -q`: 188 passed/9 skipped, unchanged (notebook-generator-only
+change, no library code touched).
+
+**Live-credential handling, same rule as every prior personalized
+copy**: the single notebook and 5 split parts committed to this repo
+use the normal `getpass()`-based placeholder checkpoint cell -- no
+real token anywhere in git history. Five separate "personalized"
+copies (real GitHub PAT, `/kaggle/working` paths, same transform
+diffed from the cached MNIST personalized files: add `import os`,
+drop the `getpass` import, hardcode `_token = "ghp_...``" in place of
+the `getpass(...)` call) are delivered directly to the user via file
+transfer, never committed.
+
+**Status**: both notebooks are valid JSON, `ast.parse`-clean, cell
+order checked, zero branch/dir collisions. Not yet run on Colab/
+Kaggle -- that run is still owed, same as every other pending MVP
+notebook.
