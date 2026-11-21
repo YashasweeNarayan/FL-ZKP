@@ -296,14 +296,34 @@ real trained delta while every other step of its submission -- ring
 signature, VRF, masking, sketching, the real range proof -- runs exactly
 as it would for an honest client.
 
-A3 (Sybil) and A4-replay are also genuinely per-round attacks and belong
-here too in a future pass; A4-false-claim and A5 are proof-forgery tests
-that the honest pipeline has no code path to produce on its own (there is
-no "lie about my VRF output" branch to inject into), so the isolated
-result above is already the right shape for those. A7 is correctly
-out-of-band (it targets `fl/trace.py`'s identity-opening protocol, which
-runs on accumulated evidence between rounds, not inside one) -- isolated
-testing is also already the right shape for it.
+A3 (Sybil) and A4-replay are genuinely per-round attacks too -- closed
+below via `tests/test_a3_sybil_real_round.py` and
+`tests/test_a4_replay_real_round.py` (2026-11-21), run directly against
+`fl/server.py::run_round` (same real-crypto, torch-free entry point
+`tests/test_round_end_to_end.py` already exercises) rather than through
+`run_training_loop`: a genuine SECOND submission from the SAME client in
+the SAME round (A3) or a genuine submission REUSED across two different
+rounds (A4-replay) has no slot in `run_training_loop`'s one-entry-per-
+client-index dict structure without restructuring that 900-line
+orchestration file, which this deliberately does not do. Unlike A1, A3
+and A4-replay have no accuracy dimension to show either way: a
+correctly-caught duplicate or replay never reaches aggregation, so it
+cannot move the model one way or the other -- their real-round claim is
+"the round completes normally for honest clients while the violation is
+caught," which the pytest files below confirm with real other
+participants and real (non-mocked) crypto, same rigor as the A1 gate.
+
+A4-false-claim and A5 are proof-forgery tests that the honest pipeline
+has no code path to produce on its own (there is no "lie about my VRF
+output" branch to inject into, and no delta/signature content to vary
+either -- these attack the signature/proof algebra directly, independent
+of any round's training content), so the isolated result above is
+already the right, and complete, shape for those -- not a lesser
+confirmation, a different one for a genuinely different threat. A7 is
+correctly out-of-band (it targets `fl/trace.py`'s identity-opening
+protocol, which runs on accumulated evidence between rounds, not inside
+one) -- isolated testing against the real crypto is also already the
+right shape for it.
 """),
 
 ("code", """from fl.models import build_model, flatten_state_dict
@@ -388,6 +408,48 @@ elif cheater_ever_rejected:
     print(f"\\nPASS: cheater {CHEATER_IDX}'s scaled update was rejected by V3 every round it was eligible, while the round still completed normally for honest clients.")
 else:
     print(f"\\nINCONCLUSIVE: cheater {CHEATER_IDX} was never sampled/eligible in any of these {GATE_A1_ROUNDS} rounds -- re-run with more rounds or check sampling_rate.")
+"""),
+
+("md", """## Gate — A3 (Sybil) and A4-replay injected into a REAL round
+
+Both run directly here (not just imported for inspection) so this
+notebook's own execution IS the confirmation, same as the standalone
+pytest files -- `tests/test_a3_sybil_real_round.py` and
+`tests/test_a4_replay_real_round.py` -- which this cell mirrors exactly
+(8-9 genuinely distinct honest clients, real CLSAG/Pedersen/sketch/range-
+proof crypto, torch-free, built directly against `fl/server.py::run_round`
+rather than `run_training_loop` -- see the markdown above for why).
+
+**A3 (Sybil)**: a 9th real client (same signing key, same ring position,
+same round nonce) submits TWICE in the same round with different crafted
+content. The key image `I_t = sk*H_p(rho_t)` is identical across both --
+V2 (`check_V2_no_double_submission`) must accept exactly one.
+
+**A4-replay**: a 9th real client's submission is NOT fresh -- it is the
+exact object that client genuinely produced for the PREVIOUS round,
+resubmitted verbatim at this round's (different) `rho_t`. V1's ring-
+signature verification, which recomputes `H_p(rho_t)` from whatever
+`rho_t` is passed to it, must reject it.
+"""),
+
+("code", """import subprocess, sys as _sys
+
+_result = subprocess.run(
+    [_sys.executable, "-m", "pytest", "-v",
+     "tests/test_a3_sybil_real_round.py", "tests/test_a4_replay_real_round.py"],
+    cwd="/content/FL-ZKP", capture_output=True, text=True,
+)
+print(_result.stdout[-4000:])
+if _result.returncode != 0:
+    print(_result.stderr[-2000:])
+    raise AssertionError(
+        "A3/A4-replay real-round gate FAILED -- see pytest output above. "
+        "This is a real defense failure or a harness bug, not a formatting issue."
+    )
+print("\\nPASS: A3's Sybil duplicate and A4's replayed submission were both "
+      "rejected by the real protocol (V2 and V1 respectively), inside a real "
+      "multi-client round, while every genuinely honest/fresh client was "
+      "accepted normally -- same rigor as the A1 gate above.")
 """),
 
 ("md", "## Save the results table (optional, for the paper)"),
