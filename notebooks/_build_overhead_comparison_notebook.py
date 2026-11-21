@@ -84,6 +84,7 @@ affect the real pipeline's own already-confirmed results.
 
 CRYPTO_LOOP_CELL = """\
 import time
+import numpy as np
 from fl.round_loop import run_training_loop, bootstrap_norms_from_model_dim, release_gpu_memory
 
 # Reuses `model`/`dim`/`model_shapes` the model cell above already
@@ -119,6 +120,7 @@ print("per-round accepted counts (sanity, not an accuracy claim):",
 
 COMM_SIZE_CELL = """\
 import pickle
+import numpy as np
 from fl.client import ClientRoundContext, ClientKeys, round_step_phase1, round_step_phase2
 from crypto.secagg import new_self_mask_secret
 
@@ -140,7 +142,7 @@ comm_phase1 = round_step_phase1(
     comm_ctx, comm_w_t, rho_t=b"comm-size-rho-t", rho_e=b"comm-size-rho-e",
     vrf_alpha=b"comm-size-vrf-alpha", sampling_rate=1.0, sigma_dp=0.0,
     n_clients=n_clients, local_data=case1_data['client_train'][0], model=model,
-    lr=CFG['local_training']['lr'], epochs=CFG['local_training']['epochs'],
+    lr=CFG['local_training']['lr'], epochs=CFG['local_training']['local_epochs'],
     batch_size=CFG['local_training']['batch_size'], pk_trace=PK_trace,
 )
 comm_phase2 = round_step_phase2(
@@ -180,7 +182,7 @@ plain_result = run_plain_fedavg_loop(
     client_datasets=case1_data['client_train'][:n_clients],
     rounds={rounds},
     lr=CFG['local_training']['lr'],
-    epochs=CFG['local_training']['epochs'],
+    epochs=CFG['local_training']['local_epochs'],
     batch_size=CFG['local_training']['batch_size'],
     aggregator=mean_aggregate,
     seed=CFG['seed'],

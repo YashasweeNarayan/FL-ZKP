@@ -3285,3 +3285,61 @@ transfer, never committed.
 order checked, zero branch/dir collisions. Not yet run on Colab/
 Kaggle -- that run is still owed, same as every other pending MVP
 notebook.
+
+## Two real bugs caught on Kaggle: both gap-#1/#3 notebooks fixed (2026-11-22)
+
+**User ran both notebooks for real on Kaggle and both failed on their
+first real code cell** -- caught exactly the kind of bug that can only
+surface on a real run, not from `ast.parse`-only validation.
+
+**Bug 1 -- `RUN_MVP_OVERHEAD_COMPARISON.ipynb`: `NameError: name 'np'
+is not defined`.** `CRYPTO_LOOP_CELL` calls `np.random.default_rng(...)`
+and `COMM_SIZE_CELL` calls `np.float64`/`np.random.default_rng(...)`,
+but neither cell ever imports `numpy` -- every other cell in this
+notebook gets `np` from an EARLIER cell's import in the real Colab/
+Kaggle kernel, but `ast.parse`-per-cell validation checks each cell's
+syntax in isolation and has no way to catch a missing import that only
+breaks at actual execution time. Fixed: added `import numpy as np` to
+both `CRYPTO_LOOP_CELL` and `COMM_SIZE_CELL` in
+`notebooks/_build_overhead_comparison_notebook.py`.
+
+**Bug 2 -- both notebooks: `KeyError: 'epochs'`.** Both
+`_build_overhead_comparison_notebook.py` (COMM_SIZE_CELL,
+PLAIN_LOOP_CELL) and `_build_baseline_defenses_comparison_notebook.py`
+(RUN_GRID_CELL) read `CFG['local_training']['epochs']` -- but
+`configs/mvp_3day.yaml`'s actual key (confirmed from the user's own
+pasted log output, which printed the loaded `CFG` dict in full) is
+`local_epochs`, not `epochs`. `run_plain_fedavg_loop`'s own PARAMETER
+is named `epochs` (matching `fl/client.py::local_train_delta`'s own
+parameter name) -- the bug was purely in the CFG dict LOOKUP key, not
+the function signature. Every other MVP run notebook
+(`_build_mvp_run_notebooks.py::run_cell`) already reads
+`CFG['local_training']['local_epochs']` correctly; these two new
+generators were the only place this typo was introduced. Fixed: all
+3 occurrences across both generator files now read
+`CFG['local_training']['local_epochs']`.
+
+**Why `ast.parse`-only validation missed both**: `ast.parse` only
+confirms a cell's Python is syntactically well-formed, not that every
+name is defined or every dict key exists -- that is a real limitation
+of the validation this project has been using for every notebook, not
+specific to these two. Neither bug could have been caught without
+either a real run or a line-by-line cross-check against the actual
+`CFG` dict and every cell's own import list -- done here for both
+fixes by reading the generator source directly and checking every
+`np.`/`CFG[...]` use against what the cell actually imports/against
+`configs/mvp_3day.yaml`'s real keys, not by guessing.
+
+**Verification**: regenerated both notebooks, confirmed (a) zero
+`ast.parse` syntax errors (same magic-line-blanking method as every
+other notebook check this project does), (b) no cell uses `np.`
+without importing it, (c) no cell reads the old `['epochs']` key
+anywhere, (d) `pytest -q`: 188 passed/9 skipped, unchanged (notebook-
+generator-only fix, no library code touched).
+
+**Not yet re-run on Kaggle/Colab** -- both notebooks need re-running
+end to end to confirm these were the ONLY two bugs; flagging plainly
+that a `KeyError`/`NameError` this early (both failed on roughly the
+9th real code cell, before any of the grid's own 12-15 result cells
+ran) means nothing past that point in either notebook has been
+exercised yet even once.

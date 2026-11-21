@@ -178,7 +178,7 @@ for rule_name, rule_fn in AGGREGATION_RULES.items():
             client_datasets=case1_data['client_train'][:n_clients],
             rounds={rounds},
             lr=CFG['local_training']['lr'],
-            epochs=CFG['local_training']['epochs'],
+            epochs=CFG['local_training']['local_epochs'],
             batch_size=CFG['local_training']['batch_size'],
             aggregator=rule_fn,
             n_byzantine=N_BYZANTINE,
