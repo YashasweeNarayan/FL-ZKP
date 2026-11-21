@@ -3119,3 +3119,91 @@ way to run the same 12 cells, not a new result.
 **`RUN_ATTACKS.ipynb` updated** (via `notebooks/_build_attacks_notebook.py`): the A1-gate markdown's "future pass" note is now resolved with an honest account of exactly what was and wasn't extended, and a new "Gate -- A3 (Sybil) and A4-replay injected into a REAL round" section that literally runs both new pytest files as part of the notebook's own execution (subprocess, not a reimplementation) and raises loudly if either fails. The notebook generator had drifted from the live `.ipynb` (a hand-patched trace-opening-protocol gate, added 2026-11-18/19, was never folded back into the `.py` generator) -- regenerated carefully by capturing those 2 live cells first, regenerating from the updated generator, then splicing the captured cells back in at the same relative position, rather than naively overwriting and losing them. Final notebook: 31 cells (was 29), valid JSON, zero syntax errors, cell order confirmed correct.
 
 **What this does NOT claim, stated plainly**: A4-false-claim, A5, and A7 are not "upgraded" to a round-loop treatment, and will not be -- the honest answer, given to the user directly, is that doing so would misrepresent what those attacks threaten (none of them affect model content or round acceptance in a way a round-loop wrapper would meaningfully exercise). They remain confirmed via direct, real (non-mocked) cryptographic verification, which is the correct and complete standard of rigor for that category of attack, not a lesser one.
+
+## Gaps #1 and #3 closed: baseline robust-aggregation comparison and quantified overhead vs. plain FedAvg (2026-11-21)
+
+**Context**: the brutal-reviewer self-assessment flagged 5 gaps that
+would survive even after every pending Colab notebook finishes.
+Gaps #1 and #3 are addressed in this entry (per the user's explicit
+"do 3 AND 1" instruction, followed by an explicit safety-scoped green
+light: "go for it, if you feel it's safe and won't hinder the system
+or make our framework weak").
+
+**Engineering constraint honored throughout**: everything below lives
+in a brand-new, standalone `baselines/` package. Nothing in `fl/`,
+`crypto/`, or `attacks/` was modified -- every import from those
+modules is read-only. This was a deliberate choice to satisfy the
+user's stated safety concern: new work that cannot regress or weaken
+the already-tested pipeline, by construction, not by promise.
+
+**`baselines/aggregation_rules.py`** -- `mean_aggregate`,
+`coordinate_median`, `trimmed_mean`, `krum`, `multi_krum`
+(Blanchard et al. 2017 / Yin et al. 2018), plus an `AGGREGATION_RULES`
+registry dict. 14 new tests in `tests/test_aggregation_rules.py`, pure
+NumPy, run unconditionally (no torch/EC backend required). **Bug
+found and fixed during testing**: `multi_krum`'s bound check (`m >
+len(deltas) - n_byzantine`) didn't account for each successive
+internal `krum()` call needing `remaining >= 2*n_byzantine + 3`
+candidates -- failed at n=10/n_byz=1 by the 6th-7th iteration of the
+selection loop. Fixed to `max_m = n - 2*n_byzantine - 2`, matching the
+registry's own default `m`. All 14 tests pass after the fix.
+
+**`baselines/plain_fedavg_loop.py`** -- `run_plain_fedavg_loop`: a
+standalone plaintext FedAvg loop that reuses `fl/client.py`'s real,
+unmodified `local_train_delta` for every client's local step (so the
+ONLY thing that ever differs between this loop and the real pipeline
+is the aggregation/security layer, never the training procedure).
+Syntax-checked via `py_compile` only -- torch isn't installed in this
+sandbox, same limitation as every other torch-dependent module here;
+not yet run end-to-end outside Colab.
+
+**Gap #3 -- `notebooks/_build_overhead_comparison_notebook.py` ->
+`RUN_MVP_OVERHEAD_COMPARISON.ipynb`** (19 cells): at tiny_cnn+MNIST,
+50 clients, 3 rounds, MEASURES (never estimates) two numbers: (1)
+wall-clock via `time.perf_counter()` around `run_plain_fedavg_loop`'s
+plain-mean loop vs. `fl/round_loop.py::run_training_loop`'s real
+masked pipeline, both completely unmodified; (2) one real client's
+actual pickled `ClientSubmissionPhase1`+`ClientSubmissionPhase2`
+objects (built via `fl/client.py`'s real `round_step_phase1`/
+`round_step_phase2`, same ring/committee the run already built) vs.
+the same client's raw delta, pickled the same way. 3 rounds is stated
+explicitly, in the notebook's own markdown, as enough for a stable
+timing average and NOT a substitute for the already-confirmed
+20-round accuracy numbers (STATUS.md's TWENTY-FOURTH item) -- no
+accuracy number from either loop in this notebook is a result in its
+own right.
+
+**Gap #1 -- `notebooks/_build_baseline_defenses_comparison_notebook.py`
+-> `RUN_MVP_BASELINE_DEFENSES_COMPARISON.ipynb`** (16 cells): a grid of
+5 aggregation rules (mean/coordinate_median/trimmed_mean/krum/multi_krum)
+x 3 attack conditions (none, sign-flip, Gaussian-noise) at
+tiny_cnn+MNIST, 50 clients, 20% Byzantine fraction (10 cheaters), 15
+rounds per cell, final-round test accuracy recorded for every cell and
+saved to a CSV. **Deliberately scoped to sign-flip and Gaussian-noise
+only, not scale-to-threshold or low-and-slow**: those latter two
+attacks are specifically built to evade JANUS-FL's OWN R_norm
+adaptive threshold (`fl/trace_wiring.py`), which a plaintext comparison
+loop has no equivalent of at all -- forcing them in would fabricate a
+connection to a defense mechanism this grid doesn't have. Sign-flip
+and Gaussian-noise are the two classic unbounded-magnitude attacks the
+Krum/Multi-Krum/trimmed-mean/median literature itself benchmarks
+against, so the grid still answers the reviewer's actual question with
+real, standard attacks.
+
+**What this does NOT claim, stated plainly**: every rule in the gap-#1
+grid runs over PLAINTEXT deltas, never through JANUS-FL's own secure-
+aggregation layer -- coordinate-median and Krum both need plaintext
+visibility to compute order statistics/pairwise distances, which
+secure aggregation specifically hides from the server. That tension is
+real and is stated in `baselines/aggregation_rules.py`'s own module
+docstring, not papered over. This work answers "how does JANUS-FL's
+rejection-based defense compare to the field's standard toolkit, under
+the same attacks and scale" -- it is not a claim that any of these
+rules could be substituted into the real secure pipeline unmodified,
+nor is the gap-#3 timing number a claim about any model/scale other
+than tiny_cnn+MNIST at 50 clients.
+
+**Status**: both notebooks are valid JSON, `ast.parse`-clean (after
+blanking magic/shell lines), and cell order checked. Neither has been
+run on Colab yet -- that run is still owed, same as every other
+pending MVP notebook.
