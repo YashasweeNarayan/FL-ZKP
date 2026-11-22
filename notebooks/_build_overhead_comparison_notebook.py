@@ -166,7 +166,7 @@ import time
 import sys
 sys.path.insert(0, '/content/FL-ZKP')
 from baselines.plain_fedavg_loop import run_plain_fedavg_loop
-from baselines.aggregation_rules import mean_aggregate
+from baselines.aggregation_rules import AGGREGATION_RULES
 
 # A SEPARATE, freshly-initialized model -- the crypto loop above has
 # already trained `model` in place, so this loop gets its own
@@ -184,7 +184,15 @@ plain_result = run_plain_fedavg_loop(
     lr=CFG['local_training']['lr'],
     epochs=CFG['local_training']['local_epochs'],
     batch_size=CFG['local_training']['batch_size'],
-    aggregator=mean_aggregate,
+    # run_plain_fedavg_loop always calls aggregator(deltas, n_byzantine)
+    # (2 args) -- the raw mean_aggregate(deltas) (1 arg) would raise
+    # TypeError the moment round 0 tries to aggregate. Caught by
+    # re-reading this cell against run_plain_fedavg_loop's own
+    # documented contract, 2026-11-23, before this cell ever ran for
+    # real: the baseline-defenses notebook's own grid already used the
+    # correct AGGREGATION_RULES[...] wrapper, this cell was the only
+    # place the raw function slipped through.
+    aggregator=AGGREGATION_RULES["mean_no_defense"],
     seed=CFG['seed'],
 )
 plain_round_times = [r.wall_clock_seconds for r in plain_result.history]

@@ -205,3 +205,61 @@ def test_run_plain_fedavg_loop_eval_fn_also_receives_a_tensor(monkeypatch):
     )
     assert result.history[0].test_acc == 0.5
     assert result.history[0].val_acc == 0.4
+
+
+def test_run_plain_fedavg_loop_rejects_raw_aggregation_rule_arity(monkeypatch):
+    """Regression test for a 2026-11-23 bug caught by re-reading
+    notebooks/_build_overhead_comparison_notebook.py's PLAIN_LOOP_CELL
+    against run_plain_fedavg_loop's own documented contract (never run
+    live -- caught before the cell ever executed, by a line-by-line
+    cross-check, the same method the prior two fixes this day used).
+
+    run_plain_fedavg_loop always calls `aggregator(deltas, n_byzantine)`
+    -- a 2-ARGUMENT contract matching every
+    `baselines/aggregation_rules.py::AGGREGATION_RULES` dict entry (each
+    of which is a `lambda deltas, n_byz: ...` wrapper). The raw rule
+    functions underneath (`mean_aggregate`, `coordinate_median`,
+    `trimmed_mean`) are NOT all 2-argument -- `mean_aggregate(deltas)`
+    takes exactly one. The overhead-comparison notebook's PLAIN_LOOP_CELL
+    imported and passed `mean_aggregate` directly instead of going
+    through `AGGREGATION_RULES["mean_no_defense"]`, which would have
+    raised `TypeError: mean_aggregate() takes 1 positional argument but
+    2 were given` on round 0's very first aggregation call. Fixed by
+    switching that cell to `AGGREGATION_RULES["mean_no_defense"]`.
+
+    This test pins the contract down two ways: the raw function raises
+    when called the way run_plain_fedavg_loop calls its aggregator, and
+    the correct AGGREGATION_RULES wrapper does not.
+    """
+    import pytest as _pytest
+    from baselines.aggregation_rules import mean_aggregate, AGGREGATION_RULES
+
+    dim = 5
+    deltas = [np.zeros(dim) for _ in range(3)]
+
+    with _pytest.raises(TypeError):
+        mean_aggregate(deltas, 0)  # the exact call run_plain_fedavg_loop makes
+
+    # The correct, 2-argument wrapper every grid cell in this repo
+    # should use instead -- must NOT raise.
+    agg = AGGREGATION_RULES["mean_no_defense"](deltas, 0)
+    assert agg.shape == (dim,)
+
+    dim = 6
+    recorded = []
+    _install_fakes(monkeypatch, dim, recorded)
+    sys.modules.pop("baselines.plain_fedavg_loop", None)
+    from baselines.plain_fedavg_loop import run_plain_fedavg_loop
+
+    model = _FakeModel()
+    with _pytest.raises(TypeError):
+        run_plain_fedavg_loop(
+            model=model,
+            model_dim=dim,
+            client_datasets=[object(), object()],
+            rounds=1,
+            lr=0.01,
+            epochs=1,
+            batch_size=8,
+            aggregator=mean_aggregate,  # the exact bug: raw, 1-arg function
+        )

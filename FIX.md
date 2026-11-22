@@ -3436,3 +3436,77 @@ first two fixes, that this is the FIRST real cell of the grid to
 execute even once; anything further into the 15-cell grid (or the
 overhead-comparison notebook's own cells, which share this same
 `run_plain_fedavg_loop` call) is still unexercised.
+
+## Fourth bug, caught by a full line-by-line audit before another live run: aggregator arity mismatch (2026-11-23)
+
+**User asked to "check all the cells & verify the fix"** -- rather than
+wait for a fourth Kaggle failure, re-read every cell of both
+`RUN_MVP_OVERHEAD_COMPARISON.ipynb` and
+`RUN_MVP_BASELINE_DEFENSES_COMPARISON.ipynb` line by line against the
+real function signatures they call (`run_training_loop`,
+`bootstrap_norms_from_model_dim`, `round_step_phase1`/`phase2`,
+`ClientRoundContext`/`ClientKeys`, `run_plain_fedavg_loop`,
+`AGGREGATION_RULES`, `craft_sign_flip`/`craft_gaussian_noise`), not
+just re-running `ast.parse`.
+
+**Found**: `notebooks/_build_overhead_comparison_notebook.py`'s
+`PLAIN_LOOP_CELL` imported `mean_aggregate` directly
+(`from baselines.aggregation_rules import mean_aggregate`) and passed
+it as `aggregator=mean_aggregate`. But `run_plain_fedavg_loop` always
+calls `aggregator(deltas, n_byzantine)` -- a 2-argument contract that
+every `AGGREGATION_RULES` dict entry wraps around the raw rule
+functions (`"mean_no_defense": lambda deltas, n_byz:
+mean_aggregate(deltas)`), precisely because `mean_aggregate(deltas)`
+itself only takes ONE argument. This would have raised `TypeError:
+mean_aggregate() takes 1 positional argument but 2 were given` the
+instant round 0 tried to aggregate -- never actually hit yet, because
+this cell runs AFTER `COMM_SIZE_CELL`, which is where the overhead
+notebook's run failed earlier today (the missing-`numpy`-import bug).
+The baseline-defenses notebook's own grid already used the correct
+`AGGREGATION_RULES[rule_name]` wrapper (via `AGGREGATION_RULES.items()`)
+-- this one cell in the OTHER notebook was the only place the raw
+function slipped through.
+
+**Fix**: `PLAIN_LOOP_CELL` now imports `AGGREGATION_RULES` instead of
+the raw `mean_aggregate`, and passes
+`aggregator=AGGREGATION_RULES["mean_no_defense"]`.
+
+**Everything else audited and confirmed correct** (no further bugs
+found): `CRYPTO_LOOP_CELL`'s `bootstrap_norms_from_model_dim(...)` and
+`run_training_loop(...)` calls match `fl/round_loop.py`'s real
+signatures argument-for-argument, including `on_pseudonym_flagged`
+(supplied by the shared `OPENING_HANDLER_CELL`, already included).
+`COMM_SIZE_CELL`'s `ClientRoundContext`/`ClientKeys` construction and
+`round_step_phase1`/`round_step_phase2` calls match `fl/client.py`'s
+real dataclass fields and function signatures exactly. The baseline-
+defenses notebook's `EVAL_FN_CELL`'s `_eval_fn(model) -> (acc, None)`
+matches `run_plain_fedavg_loop`'s `eval_fn(model)` two-tuple-unpack
+contract; `craft_sign_flip(delta)`/`craft_gaussian_noise(delta,
+sigma=..., rng=...)` match `attacks/baseline_norm_attacks.py`'s real
+signatures; `result.history[-1].test_acc` matches
+`PlainRoundRecord`'s real field. Brace-escaping (the earlier-session
+bug class) re-checked in both files: no `{x}` vs `{{x}}` mismatches
+remain.
+
+**New regression test**: `tests/test_plain_fedavg_loop.py` gained a
+third test, `test_run_plain_fedavg_loop_rejects_raw_aggregation_rule_arity`,
+pinning down the exact contract both ways -- the raw `mean_aggregate(deltas,
+0)` call raises `TypeError` (confirmed), the `AGGREGATION_RULES["mean_no_defense"]`
+wrapper does not, and `run_plain_fedavg_loop(..., aggregator=mean_aggregate)`
+itself raises `TypeError` end-to-end through the same fake-torch/fl.client
+harness the prior fix's tests use.
+
+**Verification**: regenerated `RUN_MVP_OVERHEAD_COMPARISON.ipynb`;
+confirmed no remaining reference to the raw `mean_aggregate` import
+anywhere in the generated notebook; `ast.parse`-clean, valid JSON,
+19 cells (unchanged count). `pytest -q`: 191 passed (188+3)/9 skipped.
+
+**Fourth distinct bug found in this one module/notebook pair in 24
+hours** (missing `numpy` import, `epochs`/`local_epochs` CFG-key typo,
+`w_t` numpy-vs-tensor mismatch, now this aggregator-arity mismatch) --
+all four are now fixed and test-covered to the extent this sandbox
+allows (no torch/rbcl/network here, same documented limitation).
+Genuinely not yet re-run end-to-end on Kaggle/Colab for either
+notebook -- this audit found the fourth bug by static cross-checking
+alone, before a live run reached it; a live run is still the only way
+to confirm there isn't a fifth.
