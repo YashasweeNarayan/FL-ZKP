@@ -3343,3 +3343,96 @@ that a `KeyError`/`NameError` this early (both failed on roughly the
 9th real code cell, before any of the grid's own 12-15 result cells
 ran) means nothing past that point in either notebook has been
 exercised yet even once.
+
+## Third real bug from the same Kaggle run: w_t reached local_train_delta as numpy, not torch.Tensor (2026-11-22)
+
+**Error, from the grid's very first cell x attack combination**:
+```
+RuntimeError: Error(s) in loading state_dict for Sequential:
+    While copying the parameter named "0.weight", expected
+    torch.Tensor or Tensor-like object from checkpoint but received
+    <class 'numpy.ndarray'>
+```
+(and the same for every other parameter: `0.bias`, `1.weight`,
+`1.bias`, `4.weight`, `4.bias`, `5.weight`, `5.bias`, `9.weight`,
+`9.bias` -- i.e. every single layer of `tiny_cnn`, on every single
+client, for every rule x attack cell: this is not an edge case, it is
+the main path failing on its very first call.)
+
+**Root cause**: `baselines/plain_fedavg_loop.py::run_plain_fedavg_loop`
+keeps `w_t` as a raw `numpy.ndarray` across rounds (deliberately --
+every aggregation rule in `baselines/aggregation_rules.py` operates on
+plain numpy deltas, by design, since that's what a plaintext
+robust-aggregation comparison needs). But it then passed that SAME
+numpy array straight into `fl/client.py::local_train_delta`, which
+does `unflatten_to_state_dict(w_t, shapes)` then
+`model.load_state_dict(state_dict)` -- `unflatten_to_state_dict` is a
+pure reshape/slice operation that preserves whatever type `w_t`
+already is, so passing it a numpy array produces a state_dict of numpy
+array views, and `torch.nn.Module.load_state_dict` rejects those
+outright. The `eval_fn` branch a few lines below this exact call
+already converted `w_t` to a `torch.tensor(...)` correctly before its
+own `unflatten_to_state_dict`/`load_state_dict` call -- the bug was
+that the per-client training call, a few lines above, never got the
+same treatment.
+
+**Why pytest's 188/190 passing tests never caught this**: there was no
+test anywhere in this repo that exercised
+`run_plain_fedavg_loop`'s actual integration with
+`fl.client.local_train_delta` end-to-end -- `tests/test_aggregation_rules.py`
+tests the aggregation rules themselves in isolation (plain numpy in,
+plain numpy out, no model/training involved at all), and this sandbox
+cannot import `fl.client` or `torch` at all (no `rbcl`, no `torch`, no
+network to install either -- same limitation
+`tests/test_f6_batching_logic.py`'s own docstring already documents),
+so a real end-to-end test literally cannot run here. This is a real
+gap in test coverage, not a typo this time -- a numpy/tensor type
+mismatch that only a real run, or a test that specifically asserts on
+the TYPE crossing a module boundary, would ever catch.
+
+**Fix**: `run_plain_fedavg_loop` now re-converts `w_t` to a
+`torch.tensor(w_t, dtype=model_dtype)` at the top of every round,
+immediately before the per-client training loop -- `w_t` itself stays
+a numpy array for the aggregator call right after (unchanged), only
+the COPY handed to `local_train_delta` is a tensor. Added `import
+torch` to the function (previously only pulled in ad hoc inside the
+`eval_fn` branch via `__import__("torch")`, replaced with a normal
+import used consistently in both places).
+
+**New test coverage added, closing the actual gap**: new
+`tests/test_plain_fedavg_loop.py`, two tests. Since this sandbox can't
+import the real `torch`/`fl.client`/`fl.models` (documented above),
+both tests install minimal fakes via `sys.modules` injection -- a fake
+`torch.tensor(...)` that produces a tagged wrapper type, and a fake
+`local_train_delta` whose own `model.load_state_dict` mirrors the
+REAL one's exact contract (raises on a raw `numpy.ndarray`, same error
+shape as production) -- then run `run_plain_fedavg_loop`'s real,
+unmodified control flow end-to-end and assert the type crossing into
+`local_train_delta` is never a bare `numpy.ndarray`. **Verified this
+test actually catches the regression**: temporarily reverted the fix,
+confirmed both new tests fail with the identical error signature
+(`RuntimeError: load_state_dict expected torch.Tensor or Tensor-like
+object but received <class 'numpy.ndarray'>`) the real Kaggle run
+produced, then restored the fix and confirmed they pass again. This
+cannot prove the real torch accepts the real tensor end to end (that
+still needs a live Colab/Kaggle run, like every other torch-dependent
+path in this repo) -- but it does pin the exact type confusion down
+permanently in a test this sandbox CAN run, so a future refactor that
+reintroduces "pass w_t through as whatever type it already is" fails
+immediately instead of waiting for the next live run to find it.
+
+**Verification**: `pytest -q`: 190 passed (188 + 2 new)/9 skipped.
+Only `baselines/plain_fedavg_loop.py` changed -- `fl/client.py` and
+every other already-tested module untouched, consistent with both
+notebooks' own "deliberately NOT touching fl/, crypto/, or attacks/"
+scoping.
+
+**Third bug from the same batch of live runs** -- after the missing
+`numpy` import and the `epochs`/`local_epochs` CFG-key typo fixed
+earlier today, this is now the third distinct real bug this one
+Kaggle session surfaced, all in the same two new notebooks/module. Not
+yet re-run past this point on Kaggle -- flagging again, as with the
+first two fixes, that this is the FIRST real cell of the grid to
+execute even once; anything further into the 15-cell grid (or the
+overhead-comparison notebook's own cells, which share this same
+`run_plain_fedavg_loop` call) is still unexercised.

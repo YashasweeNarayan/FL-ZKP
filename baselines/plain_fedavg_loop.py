@@ -76,6 +76,8 @@ def run_plain_fedavg_loop(
     `eval_fn(model) -> (test_acc, val_acc)`, called after every round if
     given.
     """
+    import torch
+
     from fl.client import local_train_delta
     from fl.models import flatten_state_dict, unflatten_to_state_dict
 
@@ -83,13 +85,30 @@ def run_plain_fedavg_loop(
     result = PlainLoopResult()
     w_t, shapes = flatten_state_dict(model)
     w_t = w_t.detach().cpu().numpy().astype(np.float64)
+    model_dtype = next(model.parameters()).dtype
 
     for r in range(rounds):
         t0 = time.perf_counter()
+        # local_train_delta (fl/client.py) loads w_t straight into the
+        # model via unflatten_to_state_dict + load_state_dict, which
+        # requires an actual torch.Tensor -- w_t itself stays a numpy
+        # array across rounds (the aggregators in
+        # baselines/aggregation_rules.py operate on plain numpy deltas),
+        # so it must be re-converted to a tensor on every round before
+        # being handed to local_train_delta. Caught live on Kaggle,
+        # 2026-11-22: without this conversion, load_state_dict raises
+        # "expected torch.Tensor or Tensor-like object from checkpoint
+        # but received <class 'numpy.ndarray'>" on every single client,
+        # for every rule x attack grid cell -- this ran all the way
+        # through the overhead-comparison and baseline-defenses fixes
+        # committed just before this one without being caught, because
+        # neither of those earlier fixes (missing numpy import, the
+        # local_epochs CFG-key typo) touched this code path.
+        w_t_tensor = torch.tensor(w_t, dtype=model_dtype)
         deltas = []
         for k, ds in enumerate(client_datasets):
             delta = local_train_delta(
-                model, w_t, ds, lr=lr, epochs=epochs, batch_size=batch_size, seed=seed * 1000 + r * 50 + k,
+                model, w_t_tensor, ds, lr=lr, epochs=epochs, batch_size=batch_size, seed=seed * 1000 + r * 50 + k,
             )
             if k in cheater_indices and craft_fn is not None:
                 delta = craft_fn(delta)
@@ -103,7 +122,7 @@ def run_plain_fedavg_loop(
 
         if eval_fn is not None:
             state_dict = unflatten_to_state_dict(
-                __import__("torch").tensor(w_t, dtype=next(model.parameters()).dtype), shapes,
+                torch.tensor(w_t, dtype=model_dtype), shapes,
             )
             model.load_state_dict(state_dict)
             rec.test_acc, rec.val_acc = eval_fn(model)
