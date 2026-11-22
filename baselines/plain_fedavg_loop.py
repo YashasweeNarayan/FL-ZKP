@@ -86,6 +86,19 @@ def run_plain_fedavg_loop(
     w_t, shapes = flatten_state_dict(model)
     w_t = w_t.detach().cpu().numpy().astype(np.float64)
     model_dtype = next(model.parameters()).dtype
+    # Caught live on Kaggle, 2026-11-23: the model lives on whatever
+    # device the notebook moved it to (`grid_model.to(device)` --
+    # cuda:0 on a GPU runtime), but a tensor built from a plain numpy
+    # array with no `device=` kwarg always lands on CPU. local_train_delta
+    # (fl/client.py) accepts that fine for loading INTO the model
+    # (load_state_dict copies data across devices), but at the end of
+    # training it computes `new_flat - w_t` where `new_flat` comes from
+    # flatten_state_dict(model) -- i.e. lives on model_device. Subtracting
+    # a CPU tensor from that raised "Expected all tensors to be on the
+    # same device, but found at least two devices, cuda:0 and cpu!" on
+    # every client in every grid cell. Must build w_t_tensor on
+    # model_device explicitly, every round.
+    model_device = next(model.parameters()).device
 
     for r in range(rounds):
         t0 = time.perf_counter()
@@ -104,7 +117,7 @@ def run_plain_fedavg_loop(
         # committed just before this one without being caught, because
         # neither of those earlier fixes (missing numpy import, the
         # local_epochs CFG-key typo) touched this code path.
-        w_t_tensor = torch.tensor(w_t, dtype=model_dtype)
+        w_t_tensor = torch.tensor(w_t, dtype=model_dtype, device=model_device)
         deltas = []
         for k, ds in enumerate(client_datasets):
             delta = local_train_delta(
@@ -122,7 +135,7 @@ def run_plain_fedavg_loop(
 
         if eval_fn is not None:
             state_dict = unflatten_to_state_dict(
-                torch.tensor(w_t, dtype=model_dtype), shapes,
+                torch.tensor(w_t, dtype=model_dtype, device=model_device), shapes,
             )
             model.load_state_dict(state_dict)
             rec.test_acc, rec.val_acc = eval_fn(model)

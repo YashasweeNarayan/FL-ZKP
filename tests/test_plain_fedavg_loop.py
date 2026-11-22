@@ -51,28 +51,48 @@ import numpy as np
 
 class _FakeTensor:
     """Minimal stand-in for torch.Tensor -- tags itself so the test can
-    tell a real conversion happened, distinct from a bare numpy array."""
+    tell a real conversion happened, distinct from a bare numpy array.
+    Also tracks a fake `device` string and mirrors real torch's refusal
+    to combine tensors on different devices, so a regression that drops
+    `device=` from a `torch.tensor(...)` call site is caught here
+    instead of only on a live GPU Kaggle/Colab run."""
 
-    def __init__(self, data, dtype=None):
+    def __init__(self, data, dtype=None, device="cpu"):
         self._data = np.asarray(data, dtype=np.float64)
         self.dtype = dtype
+        self.device = device
 
     def detach(self):
         return self
 
     def cpu(self):
-        return self
+        return _FakeTensor(self._data, dtype=self.dtype, device="cpu")
 
     def numpy(self):
         return self._data.copy()
 
     def __sub__(self, other):
+        if isinstance(other, _FakeTensor) and other.device != self.device:
+            # The exact 2026-11-23 Kaggle bug: `new_flat` (from
+            # flatten_state_dict(model), on model_device) minus `w_t`
+            # (built with no device= kwarg, defaulting to CPU) raised
+            # "Expected all tensors to be on the same device, but found
+            # at least two devices, cuda:0 and cpu!" on every client.
+            raise RuntimeError(
+                "Expected all tensors to be on the same device, but found "
+                f"at least two devices, {self.device} and {other.device}!"
+            )
         other_arr = other._data if isinstance(other, _FakeTensor) else np.asarray(other)
-        return _FakeTensor(self._data - other_arr)
+        return _FakeTensor(self._data - other_arr, dtype=self.dtype, device=self.device)
 
 
 class _FakeParam:
     dtype = "float64"
+    # The real model lives on cuda:0 on a GPU runtime (`grid_model.to(device)`
+    # in the notebook) -- fake that here so a w_t tensor built without
+    # `device=` (defaulting to "cpu") triggers the same device-mismatch
+    # this test exists to catch.
+    device = "cuda:0"
 
 
 class _FakeModel:
@@ -97,21 +117,31 @@ class _FakeModel:
         self.last_state_dict = state_dict
 
 
-def _install_fakes(monkeypatch, dim, recorded_w_t_types):
+def _install_fakes(monkeypatch, dim, recorded_w_t_types, recorded_w_t_devices=None):
     fake_torch = types.ModuleType("torch")
     fake_torch.float64 = "float64"
-    fake_torch.tensor = lambda data, dtype=None: _FakeTensor(data, dtype=dtype)
+    fake_torch.tensor = lambda data, dtype=None, device="cpu": _FakeTensor(data, dtype=dtype, device=device)
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
 
     fake_fl_client = types.ModuleType("fl.client")
 
     def _fake_local_train_delta(model, w_t, local_data, lr, epochs, batch_size, seed=None):
         recorded_w_t_types.append(type(w_t))
+        if recorded_w_t_devices is not None:
+            recorded_w_t_devices.append(getattr(w_t, "device", None))
         # Exercise the same contract the real model.load_state_dict
         # enforces, via the fake model -- raises if w_t ever regresses
         # back to a raw numpy array.
         model.load_state_dict({"weight": w_t})
-        return np.full(dim, 0.01, dtype=np.float64)
+        # Mirror the real local_train_delta's final line:
+        # `(new_flat - w_t)` where new_flat comes from
+        # flatten_state_dict(model) -- i.e. lives on model_device.
+        # This is what actually raised the device-mismatch error on
+        # Kaggle; reproduce that same subtraction here.
+        model_device = next(model.parameters()).device
+        new_flat = _FakeTensor(np.zeros(dim, dtype=np.float64), device=model_device)
+        delta_tensor = new_flat - w_t
+        return delta_tensor.numpy()
 
     fake_fl_client.local_train_delta = _fake_local_train_delta
     monkeypatch.setitem(sys.modules, "fl.client", fake_fl_client)
@@ -119,7 +149,8 @@ def _install_fakes(monkeypatch, dim, recorded_w_t_types):
     fake_fl_models = types.ModuleType("fl.models")
 
     def _fake_flatten_state_dict(model):
-        return _FakeTensor(np.zeros(dim, dtype=np.float64)), {"shape": (dim,)}
+        model_device = next(model.parameters()).device
+        return _FakeTensor(np.zeros(dim, dtype=np.float64), device=model_device), {"shape": (dim,)}
 
     def _fake_unflatten_to_state_dict(w_t, shapes):
         return {"weight": w_t}
@@ -205,6 +236,61 @@ def test_run_plain_fedavg_loop_eval_fn_also_receives_a_tensor(monkeypatch):
     )
     assert result.history[0].test_acc == 0.5
     assert result.history[0].val_acc == 0.4
+
+
+def test_run_plain_fedavg_loop_builds_w_t_tensor_on_model_device(monkeypatch):
+    """Regression test for a 2026-11-23 Kaggle bug: `w_t_tensor =
+    torch.tensor(w_t, dtype=model_dtype)` built a CPU tensor (no
+    `device=` kwarg) every round, but the model lives on cuda:0 on a
+    GPU runtime (`grid_model.to(device)` in the baseline-defense-grid
+    notebook). local_train_delta's final line, `new_flat - w_t`, then
+    subtracted a cuda:0 tensor (`new_flat`, from
+    flatten_state_dict(model)) and a CPU tensor (`w_t`), raising:
+
+        RuntimeError: Expected all tensors to be on the same device,
+        but found at least two devices, cuda:0 and cpu!
+
+    on every single client, in every rule x attack grid cell. Fixed by
+    building `model_device = next(model.parameters()).device` once and
+    passing `device=model_device` to every `torch.tensor(w_t, ...)`
+    call site (the per-round w_t_tensor, and the eval_fn branch).
+
+    This test's fakes model device explicitly (_FakeParam.device =
+    "cuda:0", _FakeTensor.__sub__ raises on a device mismatch exactly
+    like real torch) so this reproduces the real failure mode, not
+    just a type check.
+    """
+    dim = 5
+    recorded_types = []
+    recorded_devices = []
+    _install_fakes(monkeypatch, dim, recorded_types, recorded_devices)
+
+    sys.modules.pop("baselines.plain_fedavg_loop", None)
+    from baselines.plain_fedavg_loop import run_plain_fedavg_loop
+    from baselines.aggregation_rules import AGGREGATION_RULES
+
+    model = _FakeModel()
+    result = run_plain_fedavg_loop(
+        model=model,
+        model_dim=dim,
+        client_datasets=[object(), object()],
+        rounds=2,
+        lr=0.01,
+        epochs=1,
+        batch_size=8,
+        aggregator=AGGREGATION_RULES["mean_no_defense"],
+    )
+
+    assert len(result.history) == 2
+    assert len(recorded_devices) == 4  # 2 rounds x 2 clients
+    for d in recorded_devices:
+        assert d == "cuda:0", (
+            f"w_t reached local_train_delta on device {d!r}, not the "
+            "model's own device 'cuda:0' -- this is the exact "
+            "2026-11-23 device-mismatch bug (RuntimeError: Expected "
+            "all tensors to be on the same device, but found at least "
+            "two devices, cuda:0 and cpu!) regressing."
+        )
 
 
 def test_run_plain_fedavg_loop_rejects_raw_aggregation_rule_arity(monkeypatch):

@@ -3583,3 +3583,52 @@ notebook has still never been run past this exact cell on a live GPU
 runtime -- everything past `COMM_SIZE_CELL` (the `PLAIN_LOOP_CELL` and
 `SUMMARY_CELL`) remains completely unexercised by any real run to
 date.
+
+## Sixth bug, same notebook pair, a DIFFERENT class this time: device mismatch, not type (2026-11-23)
+
+Caught live on Kaggle, running `RUN_MVP_BASELINE_DEFENSES_COMPARISON.ipynb`'s
+15-round grid cell (5 aggregation rules x 3 attacks):
+
+```
+RuntimeError: Expected all tensors to be on the same device, but found
+at least two devices, cuda:0 and cpu!
+```
+
+Traceback bottomed out in `fl/client.py::local_train_delta`'s final line,
+`delta = (new_flat - w_t).detach().cpu().numpy().astype(np.float64)`.
+
+**Root cause**: `baselines/plain_fedavg_loop.py::run_plain_fedavg_loop` built
+`w_t_tensor = torch.tensor(w_t, dtype=model_dtype)` fresh every round (the
+item-41 fix, two bugs ago) -- but with no `device=` kwarg, `torch.tensor(...)`
+from a plain numpy array always lands on CPU. The grid cell's model was moved
+to `cuda:0` (`grid_model = build_model(...).to(device)`), so `new_flat`
+(`flatten_state_dict(model)`, inside `local_train_delta`) lives on cuda:0.
+`model.load_state_dict` tolerates the mismatch (it's a data copy), but the
+final `new_flat - w_t` subtraction does not. Same root class of bug as item
+41 (w_t reaching `local_train_delta` in the wrong representation) but a
+different axis of "wrong" -- device, not type -- so item 41's own fix (and
+its test) didn't cover it.
+
+**Fixed**: added `model_device = next(model.parameters()).device` once, and
+pass `device=model_device` to both `torch.tensor(w_t, ...)` call sites
+(the per-round `w_t_tensor`, and the `eval_fn` branch's own conversion).
+
+**Caught by this same audit process missing it twice is itself the lesson
+repeated**: item 42/43 established that signature-matching misses type
+mismatches with no type hints; this is the same point one level further --
+even checking *type* (`torch.Tensor` vs `numpy.ndarray`) isn't the full
+contract when the callee also has an implicit device requirement. Neither
+of the sandbox's existing fakes modeled device at all, so this bug could
+not have been caught by any test written before today even in principle --
+upgraded `tests/test_plain_fedavg_loop.py`'s fakes to track a fake `device`
+string and raise on mismatch (mirroring real torch's own error) before
+writing the new regression test, rather than writing a test that could
+only ever pass.
+
+**Verification**: reverted the fix, confirmed the new test (and, as a
+side effect of the now device-aware fakes, the two pre-existing tests
+in the same file) fail with the exact real error message, restored the
+fix, confirmed all pass. `pytest -q`: 194 passed (193+1 new)/9 skipped.
+
+Sixth distinct bug in this notebook pair in ~24 hours. Still never run
+past the grid's per-round training step on a live GPU runtime.
