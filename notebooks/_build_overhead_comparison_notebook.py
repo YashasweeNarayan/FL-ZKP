@@ -136,7 +136,18 @@ comm_ctx = ClientRoundContext(
     model_dim=dim,
 )
 comm_w_t, _ = flatten_state_dict(model)
-comm_w_t = comm_w_t.detach().cpu().numpy().astype(np.float64)
+# w_t stays a torch.Tensor here -- the exact type flatten_state_dict
+# already returns, and the exact type every real call site
+# (fl/round_loop.py::run_training_loop's own `w_t, model_shapes =
+# flatten_state_dict(model)`, never converted afterward) passes to
+# round_step_phase1. round_step_phase1 calls local_train_delta(model,
+# w_t, ...) internally, which does model.load_state_dict(...) and
+# requires a real tensor -- converting comm_w_t to numpy here (as this
+# cell did before) broke on a live Kaggle run with the exact same
+# RuntimeError the plain_fedavg_loop.py fix (2026-11-22) already
+# diagnosed, but at a DIFFERENT call site: this cell builds its own
+# standalone client submission outside of run_training_loop, so it
+# never benefited from that fix. Caught live on Kaggle, 2026-11-23.
 
 comm_phase1 = round_step_phase1(
     comm_ctx, comm_w_t, rho_t=b"comm-size-rho-t", rho_e=b"comm-size-rho-e",

@@ -3510,3 +3510,76 @@ Genuinely not yet re-run end-to-end on Kaggle/Colab for either
 notebook -- this audit found the fourth bug by static cross-checking
 alone, before a live run reached it; a live run is still the only way
 to confirm there isn't a fifth.
+
+## Fifth bug, same numpy-vs-tensor class, DIFFERENT call site missed by the prior audit (2026-11-23)
+
+**The prior "full audit" (this same day, a few hours earlier) was
+incomplete.** It checked `CRYPTO_LOOP_CELL`'s and `COMM_SIZE_CELL`'s
+calls against the real signatures of `run_training_loop`,
+`bootstrap_norms_from_model_dim`, `round_step_phase1`/`phase2`,
+`ClientRoundContext`/`ClientKeys` -- correctly, as far as argument
+names and dataclass fields go -- but did NOT re-check `comm_w_t`'s
+TYPE against what `round_step_phase1` actually does with it
+internally (calls `local_train_delta`, which needs a real
+`torch.Tensor` for `model.load_state_dict`). That is exactly the same
+root confusion the `plain_fedavg_loop.py` fix diagnosed the day
+before, at a DIFFERENT call site this cell independently reintroduced,
+and the earlier audit's signature-matching pass missed it because
+`round_step_phase1`'s own parameter is typed as plain `w_t` (no type
+hint), so a signature match alone cannot catch a type mismatch -- only
+checking against the ACTUAL CALLING CONVENTION every real call site
+(`run_training_loop`'s own `w_t, model_shapes = flatten_state_dict(model)`,
+never converted) uses would catch it.
+
+**Error, live on Kaggle**, identical signature to the already-fixed
+`plain_fedavg_loop.py` bug:
+```
+RuntimeError: Error(s) in loading state_dict for Sequential:
+    expected torch.Tensor or Tensor-like object from checkpoint but
+    received <class 'numpy.ndarray'>
+```
+
+**Root cause**: `COMM_SIZE_CELL` built `comm_w_t, _ =
+flatten_state_dict(model)` (a tensor, correct) and then immediately
+reassigned it: `comm_w_t = comm_w_t.detach().cpu().numpy().astype(np.float64)`
+-- a leftover habit from writing `baselines/plain_fedavg_loop.py`
+(which DOES need `w_t` as numpy, for its own aggregation rules) in the
+SAME session, carried over into a cell that calls the REAL protocol's
+`round_step_phase1` instead, which does not.
+
+**Fix**: removed the numpy conversion entirely. `comm_w_t` now stays
+exactly the tensor `flatten_state_dict` returns, matching
+`run_training_loop`'s own untouched `w_t` all the way through.
+
+**New regression test**: `tests/test_overhead_notebook_generator_static.py`
+-- a static source check (this sandbox still has no torch/rbcl to
+actually call `round_step_phase1`, same documented limitation as
+every other torch-dependent test here) asserting the generated
+`COMM_SIZE_CELL` text never reassigns `comm_w_t` from itself and that
+`round_step_phase1` is called with the bare `comm_w_t` name, not a
+converted copy. **Verified it catches the regression**: reintroduced
+the exact buggy line, confirmed the test fails with the right
+assertion message, restored the fix, confirmed it passes again. Also
+added a matching static check for the aggregator-arity fix from
+earlier today, in the same file, for the same reason (nothing
+previously pinned that one down outside the live-call-based
+`test_plain_fedavg_loop.py` tests).
+
+**Verification**: regenerated the notebook; `ast.parse`-clean, valid
+JSON, 19 cells (unchanged). `pytest -q`: 193 passed (191+2 new)/9
+skipped.
+
+**Being direct about what this means**: this is the FIFTH distinct bug
+from this one notebook pair in roughly 24 hours, and the second time a
+"full audit" claimed completeness and then missed something a live
+run caught minutes later. The honest lesson, stated plainly rather
+than glossed over: signature-matching (argument names, dataclass
+fields, parameter counts) is necessary but not sufficient -- it cannot
+catch a TYPE mismatch when the callee has no type hints, which is the
+exact shape of bug #3 (plain_fedavg_loop.py's w_t) and bug #5
+(COMM_SIZE_CELL's comm_w_t) both. Both are now fixed and
+regression-tested to the extent a torch-less sandbox allows. This
+notebook has still never been run past this exact cell on a live GPU
+runtime -- everything past `COMM_SIZE_CELL` (the `PLAIN_LOOP_CELL` and
+`SUMMARY_CELL`) remains completely unexercised by any real run to
+date.
