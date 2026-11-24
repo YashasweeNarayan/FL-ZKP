@@ -3632,3 +3632,57 @@ fix, confirmed all pass. `pytest -q`: 194 passed (193+1 new)/9 skipped.
 
 Sixth distinct bug in this notebook pair in ~24 hours. Still never run
 past the grid's per-round training step on a live GPU runtime.
+
+## Brutal-review gap #4, second combo: small_resnet+MNIST baseline-attack grid + 5-way split (2026-11-25)
+
+Per the user's request: "now give me resnet mnist in 5 splits with the
+checkpoints with TOKEN ID attacked to it." Closes the second of the
+three combos gap #4 originally flagged (tiny_cnn+FEMNIST closed
+2026-11-22; small_resnet+FEMNIST remains open -- stated plainly, a
+scoping choice not an oversight).
+
+New `notebooks/_build_baseline_attack_grid_resnet_mnist_notebook.py`
+mirrors the already-committed tiny_cnn+MNIST grid exactly (same 4
+attacks x 3 fractions, 20 rounds/cell, §6.2 traceability),
+importing its `ATTACKS`/`FRACTIONS`/`GRID_CELLS`/`_TRANSFORM_EXPR`
+directly so all three grids can't drift apart; only the model differs
+-- new `CASE1_RESNET_CFG` (`model="small_resnet"`, ~263K params per
+`build_small_resnet`'s own docstring) in place of `tiny_cnn`, same
+`case1_data` (MNIST, IID) reused unchanged -- no FEMNIST-style
+dataclass unpack needed here, since MNIST's `case1_data['test']` was
+always a plain tuple. New `-baselinegrid-resnet-mnist-{i}` clone-dir
+prefix and `colab-checkpoints-case1-small_resnet-baselinegrid-*`
+branch prefix, confirmed distinct from every other branch/dir in the
+repo via a full regex scan across every committed `.ipynb`/`.py` file
+(the only shared string is the generic default
+`/content/FL-ZKP-checkpoints` base path that appears in every
+notebook's own boilerplate, not a real per-cell target -- same
+harmless artifact the FEMNIST grid's own collision scan hit).
+
+New `notebooks/_build_baseline_attack_grid_resnet_mnist_split_notebooks.py`
+splits it into 5 parts with the identical `PART_SPLIT` grouping both
+prior grids' splits already use, each cell keeping its ORIGINAL grid
+index in branch/dir names so split vs. single-notebook checkpoints
+never diverge.
+
+All 6 new notebooks (1 single + 5 parts) valid JSON, zero syntax
+errors (`ast.parse`-clean using the established `pass`-based magic-line
+blanking check), 194 passed/9 skipped unchanged (notebook-only change,
+no library code touched).
+
+**"with the checkpoints with TOKEN ID attacked to it"**: five
+personalized (real-PAT, `/kaggle/working`) copies of the 5 split parts
+built by the same established transform (replace `from getpass import
+getpass` -> `import os`; replace `CKPT_REPO_DIR = "/content/..."` ->
+`"/kaggle/working/..."`; replace each cell's `getpass(...)` call with
+the hardcoded token) -- same real token reused across every prior
+personalized copy this project has delivered. Verified: valid JSON,
+token count matches grid-cell count per part (3/3/2/2/2), `getpass(`
+count is zero in every personalized file, token confirmed ABSENT from
+both committed repo clones via `grep -rl "ghp_U1H8" fl-zkp FL-ZKP`.
+Delivered directly to the user via file transfer -- NOT committed to
+git, same live-credential-handling rule as every prior personalized
+copy.
+
+**Still open**: small_resnet+FEMNIST, the third and last combo gap #4
+originally flagged. Not addressed in this pass.
