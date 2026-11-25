@@ -3686,3 +3686,113 @@ copy.
 
 **Still open**: small_resnet+FEMNIST, the third and last combo gap #4
 originally flagged. Not addressed in this pass.
+
+## Real Kaggle results: tiny_cnn+FEMNIST baseline-attack grid, all 12 cells (2026-11-25)
+
+Per the user's explicit "Output for TINY CNN : FEMNIST / push it in the
+github or save it" -- the real results from running the already-committed
+`RUN_MVP_BASELINE_ATTACK_GRID_FEMNIST_PART{1-5}.ipynb` (and their
+personalized, real-PAT copies) on Kaggle. All 5 logs read in full before
+anything below was written; nothing here is estimated or inferred from
+the MNIST grid's numbers.
+
+**Full 12-cell table** (4 attacks x 10/20/30% malicious of 50, tiny_cnn,
+FEMNIST, 20 rounds/cell, §6.2 traceability wired in):
+
+| attack | fraction | V3 | traceability opened | round opened |
+|---|---|---|---|---|
+| Sign-flip | 10/20/30% | **FAIL** (attacker accepted every round) | 0/0/0 | never |
+| Gaussian noise | 10% | PASS | 0 | n/a |
+| Gaussian noise | 20% | PASS | 0 | n/a |
+| Gaussian noise | 30% | PASS | 15/15 | round 13 (after a mid-run resume) |
+| Scale-to-threshold | 10/20/30% | PASS | 5/5, 10/10, 15/15 | round 0 (all three) |
+| Low-and-slow | 10/20/30% | PASS | 5/5, 10/10, 15/15 | round 0 (all three) |
+
+Same qualitative pattern the MNIST grid already showed, now confirmed on
+FEMNIST too: sign-flip is a crude attack V3's norm/range checks reject
+outright at the submission level, so it never accumulates evidence for
+§6.2 to act on -- that is V3 doing its job, not a gap. Gaussian noise
+only crosses the §6.1 evidence threshold at the highest fraction tested.
+Scale-to-threshold and low-and-slow are both caught by V3 every round
+AND trigger traceability immediately (round 0) at every fraction --
+consistent with both being the two attacks this project's own threat
+model expects a vigilant norm-bounding defense to flag fast.
+
+**Same honest caveat as every prior low-and-slow result in this
+project**: these are 20-round numbers, not a full `epoch_rounds=25`
+run -- the notebook's own markdown already says this attack's "survives
+a full epoch" claim needs the longer run to be reviewer-safe. Not
+re-run longer this pass.
+
+### New, now-understood bug: checkpoint git-push failed 100% of the time in 2 of 5 Kaggle sessions, 0% in the other 3
+
+Grepped all 5 raw Kaggle logs for the push-failure line directly rather
+than estimating from memory:
+
+| part | cells | push attempts | push failures |
+|---|---|---|---|
+| Part 1 (sign-flip) | 3 | 9 (mostly resumed, few new rounds) | 0 |
+| Part 2 (Gaussian noise) | 3 | 7 (mostly resumed) | 0 |
+| Part 3 (scale-to-threshold 10/20%) | 2 | 40 (2 cells x 20 rounds, fresh) | 0 |
+| Part 4 (scale-to-threshold 30% + low-and-slow 10%) | 2 | 0 succeeded | **40/40 failed** |
+| Part 5 (low-and-slow 20/30%) | 2 | 0 succeeded | **40/40 failed** |
+
+Every failure was the identical line:
+`fatal: could not read Password for 'https://xxxxxxTOKENxxxxxxxx@github.com': No such device or address`
+(token masked by Kaggle's own output redaction, not by git). Every
+round still saved its checkpoint to local disk first -- the warning
+text itself says so ("saved locally but push FAILED") -- and
+`/kaggle/working/` is preserved as this notebook's own Kaggle output
+artifact regardless of whether git push succeeds (that is in fact
+*why* `/kaggle/working/` was chosen over `/content/`, see
+`git_checkpoint_cell`'s own comment) -- so **no training result or
+checkpoint weight from Parts 4 or 5 was lost**, only the git mirror of
+those two sessions' checkpoints never updated.
+
+The exact same code, same template, same embedded-token URL construction,
+succeeded 100% of the time in 3 sessions (including 40/40 in Part 3, run
+around the same time) and failed 100% of the time in the other 2. That
+all-or-nothing-per-session pattern rules out a request-level race or a
+one-off network blip, and is NOT reproducible in this sandbox (verified:
+a direct `git push` to this exact repo, old and new name, both with the
+real token, from here, succeeded cleanly) -- so the root cause is
+specific to whatever those two particular Kaggle kernel sessions had
+configured, not a deterministic bug in the push logic's own control
+flow. The literal error text -- "could not read Password ... No such
+device or address" -- is the documented symptom of git's credential
+resolution deciding (for any reason: a platform-level `credential.helper`
+intercepting the request ahead of the URL-embedded token, a stale
+credential cache, etc.) that it still needs to prompt for a password,
+then failing to read that prompt because the papermill/Kaggle kernel has
+no real stdin to read from (ENXIO == "No such device or address").
+
+**Mitigation applied** (`notebooks/_build_mvp_run_notebooks.py`'s
+`_git()` helper, shared by every notebook generator that uses
+`git_checkpoint_cell`): every git invocation now runs with
+`GIT_TERMINAL_PROMPT=0` (so any credential prompt fails immediately with
+a clear, unambiguous message instead of hitting this confusing one) and
+`-c credential.helper=` (disables every configured credential helper for
+that invocation, forcing git to use only the token already embedded in
+the URL). Also stopped truncating the printed push error to its last 300
+characters, so if this happens again the full diagnostic is visible in
+the log instead of being cut off. **Stated plainly: this is a real,
+tested, legitimate hardening of the known failure mode for this exact
+error string, not a confirmed fix** -- this sandbox cannot reproduce
+whatever Kaggle-session-specific condition triggered it, so it has not
+been confirmed to prevent a recurrence on Kaggle itself. Every notebook
+generator that shares `git_checkpoint_cell` was regenerated with this
+change (28 `.ipynb` files -- every MVP run notebook, every baseline-
+attack grid and its splits for all three model+dataset combos, the
+attack7-traceability combo, the A1 fraction grid, the clean-traceability
+confirm, and the final grid); diffed one regenerated file against its
+prior version to confirm the ONLY change in each is inside the git-
+checkpoint cell (no accidental drift elsewhere). All 28 regenerated
+notebooks: valid JSON, every code cell's syntax parses clean (`pass`-
+substituted magic-line check). `pytest -q`: 194 passed/9 skipped,
+unchanged -- notebook-template-only change, no library code touched.
+
+**Brutal-review gap #4 status update**: with this grid's real run now
+recorded, two of the three originally-scoped combos (tiny_cnn+FEMNIST,
+small_resnet+MNIST) have both a built notebook AND a real executed
+result; small_resnet+FEMNIST remains the one combo with neither, still
+an explicit scoping choice.

@@ -295,7 +295,28 @@ CKPT_REPO_DIR = "__CKPT_REPO_DIR_PLACEHOLDER__"
 CKPT_BRANCH = "__CKPT_BRANCH_PLACEHOLDER__"
 
 def _git(args, cwd=CKPT_REPO_DIR, check=True):
-    r = subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True)
+    # 2026-11-25: caught live on Kaggle -- every push in a long multi-hour
+    # grid cell failed every round with "fatal: could not read Password
+    # for 'https://TOKEN@github.com': No such device or address", even
+    # though the SAME embedded-token URL just cloned/fetched fine moments
+    # earlier. That exact error string is the documented symptom of a
+    # platform-level git credential.helper (or a stale credential cache)
+    # intercepting the request ahead of the URL-embedded token, then
+    # itself trying to prompt for a password on a kernel with no real
+    # stdin (Kaggle/papermill) -- the read fails with ENXIO ("No such
+    # device or address"), not a real GitHub auth rejection. Forcing
+    # GIT_TERMINAL_PROMPT=0 makes any such prompt fail IMMEDIATELY with a
+    # clear "terminal prompts disabled" message instead of this confusing
+    # one, and -c credential.helper= (empty) disables every configured
+    # helper for this invocation so only the URL's own embedded token is
+    # ever used. Not yet confirmed fixed on Kaggle itself (this sandbox
+    # has no way to reproduce the platform-level credential helper that
+    # triggers it) -- flagged honestly in FIX.md.
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    r = subprocess.run(
+        ["git", "-c", "credential.helper="] + args,
+        cwd=cwd, capture_output=True, text=True, env=env,
+    )
     if check and r.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed:\\n{r.stdout}\\n{r.stderr}")
     return r
@@ -363,7 +384,7 @@ def push_checkpoint_to_git(ckpt_path, round_idx):
             else:
                 _git(["rebase", "--abort"], check=False)
             print(f"  [checkpoint push WARNING] round {round_idx} saved locally but push FAILED even after rebase retry "
-                  f"(will retry next round): {push.stderr.strip()[-300:]}")
+                  f"(will retry next round): {push.stderr.strip()}")
         else:
             print(f"  [checkpoint] round {round_idx} pushed to '{CKPT_BRANCH}' -- safe against a disconnect now.")
     except Exception as e:
