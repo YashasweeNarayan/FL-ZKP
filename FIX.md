@@ -3796,3 +3796,57 @@ recorded, two of the three originally-scoped combos (tiny_cnn+FEMNIST,
 small_resnet+MNIST) have both a built notebook AND a real executed
 result; small_resnet+FEMNIST remains the one combo with neither, still
 an explicit scoping choice.
+
+## Real Kaggle result: brutal-review gap #1 (baseline-defenses comparison), run to completion (2026-11-25/26)
+
+`RUN_MVP_BASELINE_DEFENSES_COMPARISON.ipynb` (5 aggregation rules x
+3 attacks -- `no_attack`, `sign_flip`, `gaussian_noise(sigma=1.0)` --
+tiny_cnn+MNIST, 10/50 = 20% Byzantine, 15 rounds/cell) finished
+end-to-end on Kaggle for the first time -- every prior mention of this
+notebook in STATUS.md said "not yet run past its earlier failure
+point"; this run completed all 15 cells and saved
+`baseline_defenses_results.csv`.
+
+| aggregation rule | no_attack | sign_flip | gaussian_noise |
+|---|---|---|---|
+| mean (no defense) | 0.9844 | 0.9796 | **0.1996** |
+| coordinate_median | 0.9834 | 0.9797 | 0.9802 |
+| trimmed_mean | 0.9826 | 0.9799 | 0.9799 |
+| krum | 0.9604 | 0.9617 | 0.9555 |
+| multi_krum | 0.9810 | 0.9804 | 0.9827 |
+
+**What this does and does not show, stated precisely** (this notebook
+measures final test accuracy only -- it has no detection/false-positive
+machinery, unlike this paper's own V3+§6.1 evidence+§6.2 traceability
+stack, which is a different, complementary question):
+
+- Plain mean already tolerates sign-flip reasonably well at 20%
+  Byzantine (0.9796 vs 0.9844 clean) -- at this fraction, averaging in
+  a flipped-but-same-norm update from only 1 in 5 clients isn't enough
+  to wreck the aggregate. This is a genuinely different number from "V3
+  catches sign-flip" (it doesn't, see the earlier entry on that) --
+  it says plain FedAvg's own accuracy is fairly tolerant of it at this
+  fraction, a separate and weaker claim.
+- Plain mean is **destroyed** by Gaussian noise at sigma=1.0 (0.1996 --
+  essentially chance-level on 10 classes), because an additive-noise
+  delta at that scale is a large-magnitude outlier relative to a real
+  trained gradient step, and unweighted averaging lets one such client
+  dominate the aggregate.
+- Every one of the four robust-aggregation rules (median, trimmed-mean,
+  krum, multi-krum) fully recovers clean-level accuracy under BOTH
+  attacks -- confirming they do the job a norm-bounding ZK defense
+  structurally cannot (rejecting/down-weighting an update by its
+  position relative to the whole cohort, not by its own norm).
+
+This is the real number that completes the answer to "is V3 failing on
+sign-flip bad for the paper": no -- framed correctly, gap #1's own
+comparison (this notebook) is exactly the piece that shows the
+complementary defense family handles what V3 by design cannot, and
+krum/multi_krum/median/trimmed_mean all do so cleanly. The honest
+remaining caveat: this comparison hasn't yet been run against
+scale-to-threshold or low-and-slow (deliberately out of scope for this
+notebook from the start -- see its own `_build_baseline_defenses_
+comparison_notebook.py` docstring -- those two specifically target
+JANUS-FL's own R_norm threshold, which plain-aggregation rules have no
+equivalent of, so including them here would compare apples to oranges,
+not extend the result).
