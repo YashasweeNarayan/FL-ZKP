@@ -3850,3 +3850,65 @@ comparison_notebook.py` docstring -- those two specifically target
 JANUS-FL's own R_norm threshold, which plain-aggregation rules have no
 equivalent of, so including them here would compare apples to oranges,
 not extend the result).
+
+## Brutal-review gap #4 closed: small_resnet+FEMNIST, the last of four combos (2026-11-27)
+
+Per the user's "now give me the 5 notebooks of resnet + FMNIST with the
+token values of github for checkpoints; and i guess this is the final
+run" -- built `RUN_MVP_BASELINE_ATTACK_GRID_RESNET_FEMNIST.ipynb` (92
+cells) and its 5-way split (`_PART1`-`_PART5`, 29/29/22/22/22 cells),
+mirroring every prior grid's own structure exactly: same 4 attacks x
+3 fractions = 12 cells, 20 rounds/cell, same `cheater_delta_transform`
+hook, same §6.2 traceability wiring, `ATTACKS`/`FRACTIONS`/`GRID_CELLS`/
+`_TRANSFORM_EXPR` imported unchanged from the MNIST tiny_cnn grid
+module so none of the four grids can drift on what an attack or
+fraction means. What's new here (the union of both prior
+differences): `model="small_resnet"` (from the resnet+MNIST grid) AND
+FEMNIST's `case2_data['unseen_test']` `FemnistClientDataset` dataclass
+unpack, `.images`/`.labels` not a plain tuple (from the tiny_cnn+FEMNIST
+grid) -- together in one notebook, since this is the one combo neither
+prior grid touched. New branch/dir prefixes
+(`colab-checkpoints-case2-small_resnet-baselinegrid-*` /
+`/content/FL-ZKP-checkpoints-baselinegrid-resnet-femnist-{i}`) and a
+`seed_offset` of `+2500 + i` (MNIST tiny_cnn: +1000..+1011, FEMNIST
+tiny_cnn: +1500..+1511, resnet+MNIST: +2000..+2011) so none of the four
+grids' 12 cells can ever collide.
+
+**All four model x dataset combos now have a built grid notebook**
+(tiny_cnn+MNIST, tiny_cnn+FEMNIST, small_resnet+MNIST,
+small_resnet+FEMNIST) -- gap #4's own combo-coverage scoping caveat,
+restated in every prior entry on this gap, no longer applies; nothing
+is left unaddressed on the "which combos have a notebook" axis.
+
+**Stated plainly, same honesty as every prior combo**: built and
+committed is NOT the same as run. **No real Kaggle result exists yet
+for small_resnet+FEMNIST** -- it is the single most expensive of the
+four grids to execute (biggest model x non-IID dataset x 12 cells x 20
+rounds x fresh DKG per cell each), and running it was not part of this
+request. Whatever this combo's real V3/traceability numbers turn out
+to be, they are not yet known and nothing in this entry or STATUS.md
+should be read as predicting them.
+
+Validated the same way as every prior grid: all 6 files (single +5
+parts) valid JSON, every code cell's syntax parses clean (`pass`-
+substituted magic-line check), zero genuine cross-family branch/dir
+collisions (collision-scan found only pre-existing collisions among
+unrelated, non-grid MVP run notebooks that predate this session --
+none involving any of the new resnet-femnist files). `pytest -q`: 194
+passed/9 skipped, unchanged (new notebook-only files, no library code
+touched). `git status --short` confirms the diff is scoped to exactly
+the 8 new files (2 generator scripts + 6 notebooks), nothing else
+modified.
+
+**Personalized (real-PAT, `/kaggle/working`) copies of the 5 part
+notebooks** built and delivered directly via file transfer, same
+transform as every prior personalized copy (replace `from getpass
+import getpass` -> `import os`; `/content/...` CKPT_REPO_DIR ->
+`/kaggle/working/...`; each `getpass(...)` call -> the hardcoded real
+token) -- verified token count per part matches that part's cell count
+exactly (3/3/2/2/2), zero remaining `getpass(` calls, zero `/content/`
+CKPT_REPO_DIR lines left. Confirmed the real token string is absent
+from both committed repo clones (`fl-zkp`, `FL-ZKP`) via a full-string
+grep, not just the short prefix used elsewhere in this file's own
+documentation. **Not committed to git**, per the standing
+live-credential-handling rule.
