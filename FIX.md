@@ -3791,11 +3791,19 @@ notebooks: valid JSON, every code cell's syntax parses clean (`pass`-
 substituted magic-line check). `pytest -q`: 194 passed/9 skipped,
 unchanged -- notebook-template-only change, no library code touched.
 
-**Brutal-review gap #4 status update**: with this grid's real run now
-recorded, two of the three originally-scoped combos (tiny_cnn+FEMNIST,
-small_resnet+MNIST) have both a built notebook AND a real executed
-result; small_resnet+FEMNIST remains the one combo with neither, still
-an explicit scoping choice.
+**Brutal-review gap #4 status update, corrected 2026-11-28**: the
+sentence that previously stood here overclaimed -- it said
+small_resnet+MNIST had "a real executed result" alongside
+tiny_cnn+FEMNIST. It does not. As of this grid's real run,
+tiny_cnn+FEMNIST is the ONLY one of the four combos with a real
+executed baseline-attack-grid result on file. tiny_cnn+MNIST's own
+grid (THIRTY-FOURTH item) and small_resnet+MNIST's grid (this file's
+"second combo" entry above) are both still build-only, never run on
+Colab/Kaggle -- STATUS.md's FORTY-FIFTH item already said this
+plainly ("Not yet run on Colab/Kaggle"); this entry's closing line
+just failed to match it. small_resnet+FEMNIST is likewise build-only.
+So: 4 of 4 combos have a built grid notebook, 1 of 4
+(tiny_cnn+FEMNIST) has a real result.
 
 ## Real Kaggle result: brutal-review gap #1 (baseline-defenses comparison), run to completion (2026-11-25/26)
 
