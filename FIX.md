@@ -3920,3 +3920,102 @@ from both committed repo clones (`fl-zkp`, `FL-ZKP`) via a full-string
 grep, not just the short prefix used elsewhere in this file's own
 documentation. **Not committed to git**, per the standing
 live-credential-handling rule.
+
+## Real Kaggle result found: tiny_cnn+MNIST baseline-attack grid WAS already run, all 12 cells (2026-11-28)
+
+User pushed back on the "never run" claim ("this was never run before? check the checkpoints please once in github") -- right to. Checked `git ls-remote` for the grid's 12 dedicated branches
+(`colab-checkpoints-case1-tiny_cnn-baselinegrid-<attack>-<fraction>`)
+directly against GitHub rather than trusting this file's own prior note: all 12 exist, and `git log` on each shows a `checkpoint: round 19` as
+its last commit -- i.e. every cell completed all 20 rounds. The
+THIRTY-FOURTH item in STATUS.md said "Not yet run on Colab" and was
+simply never updated once it actually ran; corrected there.
+
+**Extracted the real per-round results directly from the checkpoint
+files themselves, not from Kaggle stdout** (no log was ever pasted for
+this grid -- the checkpoints are the only record). Each `.pt` file is
+a torch zip archive; `fl/round_loop.py::save_checkpoint` stores the
+full `history` list used by the live notebook's own summary cell
+(`accepted_client_indices`, `rejected_reasons`, `evidence_newly_flagged`
+per round), so the real V3 pass/fail and evidence-flagging numbers are
+recoverable without re-running anything or needing torch installed:
+wrote a custom `pickle.Unpickler` that stubs out torch's tensor/storage
+classes (returns a dummy object instead of reconstructing `w_t`, which
+isn't needed for this) while importing the real `fl.suspect_tracker`
+module for the one project-defined class the pickle also references,
+cloned each of the 12 branches via `git fetch`, read each checkpoint
+blob via `git show`, and ran the exact same cheater-index-intersection
+logic the notebook's own summary cell uses
+(`CHEATER_CLIENT_IDX = range(n_cheaters)` vs. each round's
+`accepted_client_indices`/`rejected_reasons` keys).
+
+| attack | fraction | V3 | evidence first flagged | pseudonyms |
+|---|---|---|---|---|
+| Sign-flip | 10/20/30% | **FAIL** (cheaters 0..n_cheaters-1 all accepted at least once) | never | n/a |
+| Gaussian noise | 10% | PASS | round 0 | 5/5 |
+| Gaussian noise | 20% | PASS | round 0 | 10/10 |
+| Gaussian noise | 30% | PASS | round 0 | 15/15 |
+| Scale-to-threshold | 10/20/30% | PASS | round 0 (all three) | 5/5, 10/10, 15/15 |
+| Low-and-slow | 10/20/30% | PASS | round 0 (all three) | 5/5, 10/10, 15/15 |
+
+Same sign-flip blind spot as the FEMNIST grid, for the identical
+reason (norm-preserving by construction, no norm-bounding defense can
+catch it -- see the earlier sign-flip discussion in this file). One
+real, notable DIFFERENCE from the FEMNIST grid worth flagging for the
+paper: Gaussian noise triggers evidence-flagging at **all three
+fractions, round 0** here, versus FEMNIST where it only triggered at
+30% (round 13). Plausible explanation, not yet independently confirmed:
+MNIST's IID split means honest clients' updates are naturally more
+similar to each other and to the per-round median, so a noise outlier
+separates from that tighter baseline more easily via the evidence
+formula's cosine term; FEMNIST's non-IID writer split means honest
+updates are already more scattered, raising the natural "noise floor"
+the evidence formula has to beat before flagging a real attacker.
+
+**What this method does NOT give**: the checkpoint's `history` does not
+store whether `on_pseudonym_flagged` actually ran the real opening
+protocol (that lives only in the live notebook's own `traceability_log`
+variable, never persisted) -- but `evidence_newly_flagged` being
+non-empty is the exact condition that callback fires on, so for a
+notebook run with the real committee wired in (which is what the
+dedicated branch-per-cell grid always does), a non-empty round here
+means the identity was, in fact, opened. Also does not recover
+accuracy/eval numbers per round (`history` doesn't carry `eval`'s
+contents in a form this script inspected further) or wall-clock timing.
+
+**Corrected gap #4 status, fully updated now**: two of the four combos
+have a real baseline-attack-grid result on file --
+**tiny_cnn+MNIST (this entry) and tiny_cnn+FEMNIST**. small_resnet+MNIST
+and small_resnet+FEMNIST remain build-only, not yet run.
+
+### Also checked while here: small_resnet+MNIST baseline-attack grid is PARTIALLY run, not "never run" either
+
+Same correction needed for the other combo this file previously said
+"Not yet run on Colab/Kaggle" about. Checked its 12 dedicated branches
+(`colab-checkpoints-case1-small_resnet-baselinegrid-<attack>-<fraction>`)
+on GitHub directly: only 10 of 12 exist, and of those, only 8 reached
+`checkpoint: round 19` (fully complete). Real, per-cell status,
+extracted the same way as the tiny_cnn+MNIST entry above:
+
+| attack | fraction | status | V3 | evidence first flagged |
+|---|---|---|---|---|
+| Sign-flip | 10% | complete (round 19) | FAIL | never |
+| Sign-flip | 20% | **stalled at round 12 of 19** | FAIL (already, as of round 12) | never (so far) |
+| Sign-flip | 30% | **never started -- no branch exists** | n/a | n/a |
+| Gaussian noise | 10/20/30% | complete (round 19), all three | PASS | round 0, all three |
+| Scale-to-threshold | 10% | **stalled at round 14 of 19** | PASS (so far) | round 0 |
+| Scale-to-threshold | 20% | **never started -- no branch exists** | n/a | n/a |
+| Scale-to-threshold | 30% | complete (round 19) | PASS | round 0 |
+| Low-and-slow | 10/20/30% | complete (round 19), all three | PASS | round 0, all three |
+
+Same qualitative pattern as both other grids on the 8 complete cells
+(sign-flip never caught, everything else V3 PASS + flagged at round 0).
+**This combo is NOT closed** -- 2 cells never started
+(scale_to_threshold-20pct, signflip-30pct) and 2 more stopped partway
+(signflip-20pct at round 12, scale_to_threshold-10pct at round 14),
+most likely interrupted Kaggle sessions that were never resumed (the
+checkpoint-resume mechanism would pick these back up from their last
+saved round if a session resumes the same branch -- nothing suggests
+the runs failed, just that they stopped). **If the user wants this
+combo's table complete, those 4 cells need a resumed/fresh run** --
+flagging plainly rather than filling the gap with the pattern from the
+other 8, which would not be a real result.
