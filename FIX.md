@@ -4019,3 +4019,66 @@ the runs failed, just that they stopped). **If the user wants this
 combo's table complete, those 4 cells need a resumed/fresh run** --
 flagging plainly rather than filling the gap with the pattern from the
 other 8, which would not be a real result.
+
+## Real Kaggle/Colab result found: attack7-traceability-combo, clean-traceability-confirm, and A1 fraction grid were ALL already run to completion (2026-11-28)
+
+User challenged the same stale claim a third time, this time for three
+notebooks STATUS.md listed as "built but unrun": `RUN_MVP_ATTACK7_TRACEABILITY_COMBO.ipynb`,
+`RUN_MVP_CLEAN_TRACEABILITY_CONFIRM.ipynb`, and `RUN_MVP_A1_FRACTION_GRID.ipynb`.
+Same checkpoint-extraction method as the tiny_cnn+MNIST and small_resnet+MNIST
+entries above, applied to all of these notebooks' dedicated branches:
+
+- `git ls-remote` against each notebook's full expected branch set (4 branches
+  each for the two traceability-combo notebooks, 3 for the fraction grid) found
+  every single branch present -- 11/11, zero missing.
+- `git log -1` on each showed every branch at its own notebook's full target
+  round (`round 19` for the two 20-round notebooks, `round 4` for the
+  5-round A1 fraction grid, which is complete -- `REAL_ROUNDS = 5` means
+  rounds 0-4).
+- Full checkpoint extraction (reading `_checkpoints/<name>.pt` directly out
+  of each branch) confirmed real, complete results for all 11 cells:
+
+**Attack7-traceability-combo (7 of 50 malicious, all 4 model x dataset combos, 20 rounds each):**
+
+| combo | V3 | evidence first flagged |
+|---|---|---|
+| tiny_cnn + MNIST | PASS | round 0 |
+| tiny_cnn + FEMNIST | PASS | round 0 |
+| small_resnet + MNIST | PASS | round 0 |
+| small_resnet + FEMNIST | PASS | round 0 |
+
+**Clean-traceability-confirm (zero attackers, all 4 combos, 20 rounds each) -- the negative-control check that honest rounds never falsely trigger traceability:**
+
+| combo | V3 | evidence ever flagged |
+|---|---|---|
+| tiny_cnn + MNIST | PASS (no cheaters to reject) | never (correct -- no false positive) |
+| tiny_cnn + FEMNIST | PASS | never |
+| small_resnet + MNIST | PASS | never |
+| small_resnet + FEMNIST | PASS | never |
+
+**A1 fraction grid (tiny_cnn+MNIST, A1 model-replacement scaling attack, 5 rounds -- deliberately short, see the notebook's own markdown):**
+
+| fraction | V3 | evidence first flagged |
+|---|---|---|
+| 10% (5/50) | PASS | round 0 |
+| 20% (10/50) | PASS | round 0 |
+| 30% (15/50) | PASS | round 0 |
+
+All three notebooks are therefore DONE, not pending -- this closes out the
+last three items that STATUS.md's THIRTY-SIXTH/THIRTY-SECOND/THIRTIETH-era
+entries still listed as unrun. Combined with the tiny_cnn+MNIST and
+small_resnet+MNIST corrections above, the project's actual total real-result
+inventory as of 2026-11-28 is substantially larger than what STATUS.md's own
+running log reflected going into this review pass -- see the project-wide
+caveat below.
+
+**Project-wide note on this file's own reliability**: this is now the
+THIRD time in one review pass that a "not yet run" claim in STATUS.md/FIX.md
+turned out to be stale once actually checked against GitHub. The pattern each
+time is the same -- a run completed (often on Kaggle, sometimes across a
+resumed/interrupted session) without a corresponding STATUS.md update,
+because no stdout log happened to get pasted back into this conversation
+for that particular run. Going forward, any claim in either file about
+whether something has or hasn't been run should be treated as provisional
+until re-checked against actual branch/checkpoint state on GitHub, not
+repeated from the file text alone.
