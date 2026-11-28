@@ -4082,3 +4082,34 @@ for that particular run. Going forward, any claim in either file about
 whether something has or hasn't been run should be treated as provisional
 until re-checked against actual branch/checkpoint state on GitHub, not
 repeated from the file text alone.
+
+## Real Kaggle result: brutal-review gap #3 (overhead comparison), run to completion (2026-11-28)
+
+User pasted the full Kaggle log for `RUN_MVP_OVERHEAD_COMPARISON.ipynb`.
+Ran clean to completion (3 rounds, tiny_cnn+MNIST, 50 clients, 20586-dim
+model, CUDA): all prior bugs in this notebook (items 40/41/42/43 above)
+did NOT recur -- no `np` NameError, no `epochs`/`local_epochs` typo, no
+aggregator-arity error, no numpy-vs-tensor type error, no device
+mismatch. Real measured numbers:
+
+- JANUS-FL: 824.24s/round mean (phase1 train+crypto ~41s, phase2
+  sketch+rangeproof ~290s, verify ~493s -- verify dominates).
+- Plain FedAvg (same client training code, no crypto): 24.77s/round mean.
+- **Time overhead: 33.3x**.
+- Raw delta, pickled: 164,849 bytes. JANUS-FL submission (phase1+phase2),
+  pickled: 3,937,714 bytes.
+- **Communication overhead: 23.9x**.
+
+This is a genuine, measured (not estimated) cost number for the paper's
+overhead section -- exactly what gap #3 was asking for. As the notebook's
+own summary cell states, this is a timing/size measurement at 3 rounds
+for a stable average, not a replacement for the already-confirmed
+20-round accuracy numbers (STATUS.md TWENTY-FOURTH item) -- those are
+unaffected and still the source for accuracy claims; this result is
+purely the overhead-factor claim.
+
+Brutal-review gap #3 is now closed with a real number, alongside gap #1
+(FORTY-SEVENTH item). Remaining open items: small_resnet+MNIST's 4
+missing/stalled baseline-attack-grid cells (gap #4), small_resnet+FEMNIST's
+grid (gap #4, never run), and gap #2 (seed variance) -- gap #2 remains
+completely untouched.
