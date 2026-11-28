@@ -4113,3 +4113,39 @@ Brutal-review gap #3 is now closed with a real number, alongside gap #1
 missing/stalled baseline-attack-grid cells (gap #4), small_resnet+FEMNIST's
 grid (gap #4, never run), and gap #2 (seed variance) -- gap #2 remains
 completely untouched.
+
+## Sign-flip: real accuracy impact + corrected explanation of why it is never traced (2026-11-28)
+
+**Corrected explanation.** An earlier in-chat explanation said the §6.1
+cosine term "should catch sign-flip but doesn't in practice due to
+high-dimensional near-orthogonality." That was wrong. The live pipeline
+never computes the cosine or loss terms at all: `fl/trace_wiring.py`
+uses `fl/evidence.py::norm_only_evidence` (w1=w3=0), because the server
+never sees q_k in the clear. Evidence is therefore purely `||q||/B_t`,
+which is exactly invariant under negation -- sign-flip is structurally
+invisible to both V3 and §6.2 traceability, by design, not by tuning.
+
+**Real accuracy impact** (tiny_cnn+MNIST, 20 rounds, final `history[-1]["eval"]`
+extracted from the committed checkpoints, same method as above):
+
+| run | final acc |
+|---|---|
+| clean (clean-traceability branch) | 0.9839 |
+| sign-flip 10% | 0.9818 |
+| sign-flip 20% | 0.9783 |
+| sign-flip 30% | 0.9777 |
+
+At most ~0.6 pp drop at 30% malicious: the norm bound caps how much a
+sign-flipped update can move the model. Real, bounded harm -- but the
+attacker is never identified, which is a genuine limitation of the
+traceability claim and must be stated as such in the paper. (The clean
+reference is a separate branch, not a seed-matched control; treat the
+gap as approximate.)
+
+**Possible fix, not implemented:** a ZK direction check -- client proves
+<S q, S g_ref> >= tau against a server-published reference update g_ref
+from the root set, reusing the per-coordinate sketch commitments
+(`crypto/norm_proof.py::commit_sketch`), the existing homomorphic
+`_weighted_commitment_sum`, and the existing Bulletproofs range proof.
+Same idea as the cosine-similarity validation in LZKSA / BPFL / Vespa.
+Not started; see chat for the cost estimate.
